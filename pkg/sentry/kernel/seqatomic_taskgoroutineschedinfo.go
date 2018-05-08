@@ -1,12 +1,12 @@
 package kernel
 
 import (
+	"reflect"
+	"strings"
 	"unsafe"
 
 	"fmt"
 	ssync "gvisor.googlesource.com/gvisor/pkg/sync"
-	"reflect"
-	"strings"
 )
 
 // SeqAtomicLoad returns a copy of *ptr, ensuring that the read does not race
