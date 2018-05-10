@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,13 +16,23 @@ package cmd
 
 import (
 	"os"
+	"path/filepath"
 )
+
+// absPath turns the given path into an absolute path (if it is not already
+// absolute) by prepending the base path.
+func absPath(base, rel string) string {
+	if filepath.IsAbs(rel) {
+		return rel
+	}
+	return filepath.Join(base, rel)
+}
 
 // getwdOrDie returns the current working directory and dies if it cannot.
 func getwdOrDie() string {
 	wd, err := os.Getwd()
 	if err != nil {
-		Fatalf("getting current working directory: %v", err)
+		Fatalf("error getting current working directory: %v", err)
 	}
 	return wd
 }

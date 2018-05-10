@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -88,8 +88,6 @@ func (e Error) Error() string {
 }
 
 // Program is a BPF program that has been validated for consistency.
-//
-// +stateify savable
 type Program struct {
 	instructions []linux.BPFInstruction
 }

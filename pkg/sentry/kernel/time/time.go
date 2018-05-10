@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,8 +42,6 @@ const (
 //
 // Time may represent time with respect to any clock and may not have any
 // meaning in the real world.
-//
-// +stateify savable
 type Time struct {
 	ns int64
 }
@@ -288,8 +286,6 @@ type TimerListener interface {
 }
 
 // Setting contains user-controlled mutable Timer properties.
-//
-// +stateify savable
 type Setting struct {
 	// Enabled is true if the timer is running.
 	Enabled bool
@@ -307,12 +303,6 @@ type Setting struct {
 // SettingFromSpec converts a (value, interval) pair to a Setting based on a
 // reading from c. value is interpreted as a time relative to c.Now().
 func SettingFromSpec(value time.Duration, interval time.Duration, c Clock) (Setting, error) {
-	return SettingFromSpecAt(value, interval, c.Now())
-}
-
-// SettingFromSpecAt converts a (value, interval) pair to a Setting. value is
-// interpreted as a time relative to now.
-func SettingFromSpecAt(value time.Duration, interval time.Duration, now Time) (Setting, error) {
 	if value < 0 {
 		return Setting{}, syserror.EINVAL
 	}
@@ -321,13 +311,13 @@ func SettingFromSpecAt(value time.Duration, interval time.Duration, now Time) (S
 	}
 	return Setting{
 		Enabled: true,
-		Next:    now.Add(value),
+		Next:    c.Now().Add(value),
 		Period:  interval,
 	}, nil
 }
 
-// SettingFromAbsSpec converts a (value, interval) pair to a Setting. value is
-// interpreted as an absolute time.
+// SettingFromAbsSpec converts a (value, interval) pair to a Setting based on a
+// reading from c. value is interpreted as an absolute time.
 func SettingFromAbsSpec(value Time, interval time.Duration) (Setting, error) {
 	if value.Before(ZeroTime) {
 		return Setting{}, syserror.EINVAL
@@ -342,16 +332,6 @@ func SettingFromAbsSpec(value Time, interval time.Duration) (Setting, error) {
 	}, nil
 }
 
-// SettingFromItimerspec converts a linux.Itimerspec to a Setting. If abs is
-// true, its.Value is interpreted as an absolute time. Otherwise, it is
-// interpreted as a time relative to c.Now().
-func SettingFromItimerspec(its linux.Itimerspec, abs bool, c Clock) (Setting, error) {
-	if abs {
-		return SettingFromAbsSpec(FromTimespec(its.Value), its.Interval.ToDuration())
-	}
-	return SettingFromSpec(its.Value.ToDuration(), its.Interval.ToDuration(), c)
-}
-
 // SpecFromSetting converts a timestamp and a Setting to a (relative value,
 // interval) pair, as used by most Linux syscalls that return a struct
 // itimerval or struct itimerspec.
@@ -362,23 +342,14 @@ func SpecFromSetting(now Time, s Setting) (value, period time.Duration) {
 	return s.Next.Sub(now), s.Period
 }
 
-// ItimerspecFromSetting converts a Setting to a linux.Itimerspec.
-func ItimerspecFromSetting(now Time, s Setting) linux.Itimerspec {
-	val, iv := SpecFromSetting(now, s)
-	return linux.Itimerspec{
-		Interval: linux.DurationToTimespec(iv),
-		Value:    linux.DurationToTimespec(val),
-	}
-}
-
-// At returns an updated Setting and a number of expirations after the
-// associated Clock indicates a time of now.
+// advancedTo returns an updated Setting and a number of expirations after
+// the associated Clock indicates a time of now.
 //
-// Settings may be created by successive calls to At with decreasing
+// Settings may be created by successive calls to advancedTo with decreasing
 // values of now (i.e. time may appear to go backward). Supporting this is
 // required to support non-monotonic clocks, as well as allowing
 // Timer.clock.Now() to be called without holding Timer.mu.
-func (s Setting) At(now Time) (Setting, uint64) {
+func (s Setting) advancedTo(now Time) (Setting, uint64) {
 	if !s.Enabled {
 		return s, 0
 	}
@@ -400,8 +371,6 @@ func (s Setting) At(now Time) (Setting, uint64) {
 //
 // Timers should be created using NewTimer and must be cleaned up by calling
 // Timer.Destroy when no longer used.
-//
-// +stateify savable
 type Timer struct {
 	// clock is the time source. clock is immutable.
 	clock Clock
@@ -525,7 +494,7 @@ func (t *Timer) Tick() {
 	if t.paused {
 		return
 	}
-	s, exp := t.setting.At(now)
+	s, exp := t.setting.advancedTo(now)
 	t.setting = s
 	if exp > 0 {
 		t.listener.Notify(exp)
@@ -580,7 +549,7 @@ func (t *Timer) Get() (Time, Setting) {
 	if t.paused {
 		panic(fmt.Sprintf("Timer.Get called on paused Timer %p", t))
 	}
-	s, exp := t.setting.At(now)
+	s, exp := t.setting.advancedTo(now)
 	t.setting = s
 	if exp > 0 {
 		t.listener.Notify(exp)
@@ -613,31 +582,20 @@ func (t *Timer) SwapAnd(s Setting, f func()) (Time, Setting) {
 	if t.paused {
 		panic(fmt.Sprintf("Timer.SwapAnd called on paused Timer %p", t))
 	}
-	oldS, oldExp := t.setting.At(now)
+	oldS, oldExp := t.setting.advancedTo(now)
 	if oldExp > 0 {
 		t.listener.Notify(oldExp)
 	}
 	if f != nil {
 		f()
 	}
-	newS, newExp := s.At(now)
+	newS, newExp := s.advancedTo(now)
 	t.setting = newS
 	if newExp > 0 {
 		t.listener.Notify(newExp)
 	}
 	t.resetKickerLocked(now)
 	return now, oldS
-}
-
-// Atomically invokes f atomically with respect to expirations of t; that is, t
-// cannot generate expirations while f is being called.
-//
-// Preconditions: f cannot call any Timer methods since it is called with the
-// Timer mutex locked.
-func (t *Timer) Atomically(f func()) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	f()
 }
 
 // Preconditions: t.mu must be locked.

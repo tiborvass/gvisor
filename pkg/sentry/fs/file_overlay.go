@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ import (
 	"sync"
 
 	"gvisor.googlesource.com/gvisor/pkg/log"
-	"gvisor.googlesource.com/gvisor/pkg/refs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/memmap"
@@ -60,8 +59,6 @@ func overlayFile(ctx context.Context, inode *Inode, flags FileFlags) (*File, err
 }
 
 // overlayFileOperations implements FileOperations for a file in an overlay.
-//
-// +stateify savable
 type overlayFileOperations struct {
 	// upperMu protects upper below. In contrast lower is stable.
 	upperMu sync.Mutex `state:"nosave"`
@@ -82,13 +79,8 @@ type overlayFileOperations struct {
 	upper *File
 	lower *File
 
-	// dirCursor is a directory cursor for a directory in an overlay. It is
-	// protected by File.mu of the owning file, which is held during
-	// Readdir and Seek calls.
+	// dirCursor is a directory cursor for a directory in an overlay.
 	dirCursor string
-
-	// dirCacheMu protects dirCache.
-	dirCacheMu sync.RWMutex `state:"nosave"`
 
 	// dirCache is cache of DentAttrs from upper and lower Inodes.
 	dirCache *SortedDentryMap
@@ -168,55 +160,30 @@ func (f *overlayFileOperations) Seek(ctx context.Context, file *File, whence See
 
 // Readdir implements FileOperations.Readdir.
 func (f *overlayFileOperations) Readdir(ctx context.Context, file *File, serializer DentrySerializer) (int64, error) {
-	root := RootFromContext(ctx)
-	defer root.DecRef()
-	dirCtx := &DirCtx{
-		Serializer: serializer,
-		DirCursor:  &f.dirCursor,
-	}
-
-	// If the directory dirent is frozen, then DirentReaddir will calculate
-	// the children based off the frozen dirent tree. There is no need to
-	// call readdir on the upper/lower layers.
-	if file.Dirent.frozen {
-		return DirentReaddir(ctx, file.Dirent, f, root, dirCtx, file.Offset())
-	}
-
-	// Otherwise proceed with usual overlay readdir.
 	o := file.Dirent.Inode.overlay
 
-	// readdirEntries holds o.copyUpMu to ensure that copy-up does not
-	// occur while calculating the readir results.
-	//
-	// However, it is possible for a copy-up to occur after the call to
-	// readdirEntries, but before setting f.dirCache. This is OK, since
-	// copy-up only does not change the children in a way that would affect
-	// the children returned in dirCache. Copy-up only moves
-	// files/directories between layers in the overlay.
-	//
-	// It is also possible for Readdir to race with a Create operation
-	// (which may trigger a copy-up during it's execution). Depending on
-	// whether the Create happens before or after the readdirEntries call,
-	// the newly created file may or may not appear in the readdir results.
-	// But this can only be caused by a real race between readdir and
-	// create syscalls, so it's also OK.
-	dirCache, err := readdirEntries(ctx, o)
+	o.copyMu.RLock()
+	defer o.copyMu.RUnlock()
+
+	var err error
+	f.dirCache, err = readdirEntries(ctx, o)
 	if err != nil {
 		return file.Offset(), err
 	}
 
-	f.dirCacheMu.Lock()
-	f.dirCache = dirCache
-	f.dirCacheMu.Unlock()
+	root := RootFromContext(ctx)
+	defer root.DecRef()
 
+	dirCtx := &DirCtx{
+		Serializer: serializer,
+		DirCursor:  &f.dirCursor,
+	}
 	return DirentReaddir(ctx, file.Dirent, f, root, dirCtx, file.Offset())
 }
 
 // IterateDir implements DirIterator.IterateDir.
 func (f *overlayFileOperations) IterateDir(ctx context.Context, dirCtx *DirCtx, offset int) (int, error) {
-	f.dirCacheMu.RLock()
 	n, err := GenericReaddir(dirCtx, f.dirCache)
-	f.dirCacheMu.RUnlock()
 	return offset + n, err
 }
 
@@ -296,34 +263,6 @@ func (*overlayFileOperations) ConfigureMMap(ctx context.Context, file *File, opt
 	o.copyMu.RLock()
 	defer o.copyMu.RUnlock()
 
-	// If there is no lower inode, the overlay will never need to do a
-	// copy-up, and thus will never need to invalidate any mappings. We can
-	// call ConfigureMMap directly on the upper file.
-	if o.lower == nil {
-		f := file.FileOperations.(*overlayFileOperations)
-		if err := f.upper.ConfigureMMap(ctx, opts); err != nil {
-			return err
-		}
-
-		// ConfigureMMap will set the MappableIdentity to the upper
-		// file and take a reference on it, but we must also hold a
-		// reference to the overlay file during the lifetime of the
-		// Mappable. If we do not do this, the overlay file can be
-		// Released before the upper file is Released, and we will be
-		// unable to traverse to the upper file during Save, thus
-		// preventing us from saving a proper inode mapping for the
-		// file.
-		file.IncRef()
-		id := &overlayMappingIdentity{
-			id:          opts.MappingIdentity,
-			overlayFile: file,
-		}
-
-		// Swap out the old MappingIdentity for the wrapped one.
-		opts.MappingIdentity = id
-		return nil
-	}
-
 	if !o.isMappableLocked() {
 		return syserror.ENODEV
 	}
@@ -345,9 +284,6 @@ func (*overlayFileOperations) Ioctl(ctx context.Context, io usermem.IO, args arc
 // readdirEntries returns a sorted map of directory entries from the
 // upper and/or lower filesystem.
 func readdirEntries(ctx context.Context, o *overlayEntry) (*SortedDentryMap, error) {
-	o.copyMu.RLock()
-	defer o.copyMu.RUnlock()
-
 	// Assert that there is at least one upper or lower entry.
 	if o.upper == nil && o.lower == nil {
 		panic("invalid overlayEntry, needs at least one Inode")
@@ -406,45 +342,4 @@ func readdirOne(ctx context.Context, d *Dirent) (map[string]DentAttr, error) {
 	delete(stubSerializer.Entries, ".")
 	delete(stubSerializer.Entries, "..")
 	return stubSerializer.Entries, nil
-}
-
-// overlayMappingIdentity wraps a MappingIdentity, and also holds a reference
-// on a file during its lifetime.
-//
-// +stateify savable
-type overlayMappingIdentity struct {
-	refs.AtomicRefCount
-	id          memmap.MappingIdentity
-	overlayFile *File
-}
-
-// DecRef implements AtomicRefCount.DecRef.
-func (omi *overlayMappingIdentity) DecRef() {
-	omi.AtomicRefCount.DecRefWithDestructor(func() {
-		omi.overlayFile.DecRef()
-		omi.id.DecRef()
-	})
-}
-
-// DeviceID implements MappingIdentity.DeviceID using the device id from the
-// overlayFile.
-func (omi *overlayMappingIdentity) DeviceID() uint64 {
-	return omi.overlayFile.Dirent.Inode.StableAttr.DeviceID
-}
-
-// DeviceID implements MappingIdentity.InodeID using the inode id from the
-// overlayFile.
-func (omi *overlayMappingIdentity) InodeID() uint64 {
-	return omi.overlayFile.Dirent.Inode.StableAttr.InodeID
-}
-
-// MappedName implements MappingIdentity.MappedName.
-func (omi *overlayMappingIdentity) MappedName(ctx context.Context) string {
-	name, _ := omi.overlayFile.Dirent.FullName(RootFromContext(ctx))
-	return name
-}
-
-// Msync implements MappingIdentity.Msync.
-func (omi *overlayMappingIdentity) Msync(ctx context.Context, mr memmap.MappableRange) error {
-	return omi.id.Msync(ctx, mr)
 }

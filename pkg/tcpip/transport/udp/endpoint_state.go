@@ -1,16 +1,6 @@
-// Copyright 2018 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Netstack Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 package udp
 
@@ -82,7 +72,7 @@ func (e *endpoint) afterLoad() {
 
 	var err *tcpip.Error
 	if e.state == stateConnected {
-		e.route, err = e.stack.FindRoute(e.regNICID, e.id.LocalAddress, e.id.RemoteAddress, netProto)
+		e.route, err = e.stack.FindRoute(e.regNICID, e.bindAddr, e.id.RemoteAddress, netProto)
 		if err != nil {
 			panic(*err)
 		}
@@ -94,12 +84,7 @@ func (e *endpoint) afterLoad() {
 		}
 	}
 
-	// Our saved state had a port, but we don't actually have a
-	// reservation. We need to remove the port from our state, but still
-	// pass it to the reservation machinery.
-	id := e.id
-	e.id.LocalPort = 0
-	e.id, err = e.registerWithStack(e.regNICID, e.effectiveNetProtos, id)
+	e.id, err = e.registerWithStack(e.regNICID, e.effectiveNetProtos, e.id)
 	if err != nil {
 		panic(*err)
 	}

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,15 +18,13 @@ package filter
 
 import (
 	"syscall"
-
-	"gvisor.googlesource.com/gvisor/pkg/seccomp"
 )
 
 // instrumentationFilters returns additional filters for syscalls used by MSAN.
-func instrumentationFilters() seccomp.SyscallRules {
+func instrumentationFilters() []uintptr {
 	Report("MSAN is enabled: syscall filters less restrictive!")
-	return seccomp.SyscallRules{
-		syscall.SYS_SCHED_GETAFFINITY: {},
-		syscall.SYS_SET_ROBUST_LIST:   {},
+	return []uintptr{
+		syscall.SYS_SCHED_GETAFFINITY,
+		syscall.SYS_SET_ROBUST_LIST,
 	}
 }

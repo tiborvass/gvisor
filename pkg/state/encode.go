@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -119,10 +119,9 @@ func (es *encodeState) register(obj reflect.Value) uint64 {
 		if size := typ.Size(); size > 0 {
 			r := addrRange{addr, addr + size}
 			if !es.values.IsEmptyRange(r) {
-				old := es.values.LowerBoundSegment(addr).Value().Interface().(recoverable)
-				panic(fmt.Errorf("overlapping objects: [new object] %#v [existing object path] %s", obj.Interface(), old.path()))
+				panic(fmt.Errorf("overlapping objects: [new object] %#v [existing object] %#v", obj.Interface(), es.values.FindSegment(addr).Value().Elem().Interface()))
 			}
-			es.values.Add(r, reflect.ValueOf(es.recoverable.copy()))
+			es.values.Add(r, obj)
 		}
 	} else {
 		// Push back the map itself; when maps are encoded from the
@@ -242,7 +241,6 @@ func (es *encodeState) encodeInterface(obj reflect.Value) *pb.Interface {
 // If mapAsValue is true, then a map will be encoded directly.
 func (es *encodeState) encodeObject(obj reflect.Value, mapAsValue bool, format string, param interface{}) (object *pb.Object) {
 	es.push(false, format, param)
-	es.stats.Add(obj)
 	es.stats.Start(obj)
 
 	switch obj.Kind() {
@@ -336,12 +334,6 @@ func (es *encodeState) encodeObject(obj reflect.Value, mapAsValue bool, format s
 			object = &pb.Object{Value: &pb.Object_MapValue{es.encodeMap(obj)}}
 		} else {
 			// Encode a reference to the map.
-			//
-			// Remove the map object count here to avoid double
-			// counting, as this object will be counted again when
-			// it gets processed later. We do not add a reference
-			// count as the reference is artificial.
-			es.stats.Remove(obj)
 			object = &pb.Object{Value: &pb.Object_RefValue{es.register(obj)}}
 		}
 	default:
@@ -362,13 +354,10 @@ func (es *encodeState) Serialize(obj reflect.Value) {
 	// Pop off the list until we're done.
 	for es.pending.Len() > 0 {
 		e := es.pending.Front()
+		es.pending.Remove(e)
 
 		// Extract the queued object.
 		qo := e.Value.(queuedObject)
-		es.stats.Start(qo.obj)
-
-		es.pending.Remove(e)
-
 		es.from = &qo.path
 		o := es.encodeObject(qo.obj, true, "", nil)
 
@@ -379,7 +368,6 @@ func (es *encodeState) Serialize(obj reflect.Value) {
 
 		// Mark as done.
 		es.done.PushBack(e)
-		es.stats.Done()
 	}
 
 	// Write a zero-length terminal at the end; this is a sanity check

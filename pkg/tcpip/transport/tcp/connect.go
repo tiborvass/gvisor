@@ -1,24 +1,15 @@
-// Copyright 2018 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Netstack Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 package tcp
 
 import (
+	"crypto/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"gvisor.googlesource.com/gvisor/pkg/rand"
 	"gvisor.googlesource.com/gvisor/pkg/sleep"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip/buffer"
@@ -86,15 +77,18 @@ type handshake struct {
 	rcvWndScale int
 }
 
-func newHandshake(ep *endpoint, rcvWnd seqnum.Size) handshake {
+func newHandshake(ep *endpoint, rcvWnd seqnum.Size) (handshake, *tcpip.Error) {
 	h := handshake{
 		ep:          ep,
 		active:      true,
 		rcvWnd:      rcvWnd,
 		rcvWndScale: FindWndScale(rcvWnd),
 	}
-	h.resetState()
-	return h
+	if err := h.resetState(); err != nil {
+		return handshake{}, err
+	}
+
+	return h, nil
 }
 
 // FindWndScale determines the window scale to use for the given maximum window
@@ -116,7 +110,7 @@ func FindWndScale(wnd seqnum.Size) int {
 
 // resetState resets the state of the handshake object such that it becomes
 // ready for a new 3-way handshake.
-func (h *handshake) resetState() {
+func (h *handshake) resetState() *tcpip.Error {
 	b := make([]byte, 4)
 	if _, err := rand.Read(b); err != nil {
 		panic(err)
@@ -127,6 +121,8 @@ func (h *handshake) resetState() {
 	h.ackNum = 0
 	h.mss = 0
 	h.iss = seqnum.Value(uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24)
+
+	return nil
 }
 
 // effectiveRcvWndScale returns the effective receive window scale to be used.
@@ -161,7 +157,7 @@ func (h *handshake) checkAck(s *segment) bool {
 		// incoming segment acknowledges something not yet sent. The
 		// connection remains in the same state.
 		ack := s.sequenceNumber.Add(s.logicalLen())
-		h.ep.sendRaw(buffer.VectorisedView{}, flagRst|flagAck, s.ackNumber, ack, 0)
+		h.ep.sendRaw(nil, flagRst|flagAck, s.ackNumber, ack, 0)
 		return false
 	}
 
@@ -209,7 +205,7 @@ func (h *handshake) synSentState(s *segment) *tcpip.Error {
 	// and the handshake is completed.
 	if s.flagIsSet(flagAck) {
 		h.state = handshakeCompleted
-		h.ep.sendRaw(buffer.VectorisedView{}, flagAck, h.iss+1, h.ackNum, h.rcvWnd>>h.effectiveRcvWndScale())
+		h.ep.sendRaw(nil, flagAck, h.iss+1, h.ackNum, h.rcvWnd>>h.effectiveRcvWndScale())
 		return nil
 	}
 
@@ -258,13 +254,15 @@ func (h *handshake) synRcvdState(s *segment) *tcpip.Error {
 		if s.flagIsSet(flagAck) {
 			seq = s.ackNumber
 		}
-		h.ep.sendRaw(buffer.VectorisedView{}, flagRst|flagAck, seq, ack, 0)
+		h.ep.sendRaw(nil, flagRst|flagAck, seq, ack, 0)
 
 		if !h.active {
 			return tcpip.ErrInvalidEndpointState
 		}
 
-		h.resetState()
+		if err := h.resetState(); err != nil {
+			return err
+		}
 		synOpts := header.TCPSynOptions{
 			WS:            h.rcvWndScale,
 			TS:            h.ep.sendTSOk,
@@ -284,7 +282,7 @@ func (h *handshake) synRcvdState(s *segment) *tcpip.Error {
 		// not carry a timestamp option then the segment must be dropped
 		// as per https://tools.ietf.org/html/rfc7323#section-3.2.
 		if h.ep.sendTSOk && !s.parsedOptions.TS {
-			h.ep.stack.Stats().DroppedPackets.Increment()
+			atomic.AddUint64(&h.ep.stack.MutableStats().DroppedPackets, 1)
 			return nil
 		}
 
@@ -298,21 +296,6 @@ func (h *handshake) synRcvdState(s *segment) *tcpip.Error {
 	return nil
 }
 
-func (h *handshake) handleSegment(s *segment) *tcpip.Error {
-	h.sndWnd = s.window
-	if !s.flagIsSet(flagSyn) && h.sndWndScale > 0 {
-		h.sndWnd <<= uint8(h.sndWndScale)
-	}
-
-	switch h.state {
-	case handshakeSynRcvd:
-		return h.synRcvdState(s)
-	case handshakeSynSent:
-		return h.synSentState(s)
-	}
-	return nil
-}
-
 // processSegments goes through the segment queue and processes up to
 // maxSegmentsPerWake (if they're available).
 func (h *handshake) processSegments() *tcpip.Error {
@@ -322,7 +305,18 @@ func (h *handshake) processSegments() *tcpip.Error {
 			return nil
 		}
 
-		err := h.handleSegment(s)
+		h.sndWnd = s.window
+		if !s.flagIsSet(flagSyn) && h.sndWndScale > 0 {
+			h.sndWnd <<= uint8(h.sndWndScale)
+		}
+
+		var err *tcpip.Error
+		switch h.state {
+		case handshakeSynRcvd:
+			err = h.synRcvdState(s)
+		case handshakeSynSent:
+			err = h.synSentState(s)
+		}
 		s.decRef()
 		if err != nil {
 			return err
@@ -358,7 +352,7 @@ func (h *handshake) resolveRoute() *tcpip.Error {
 	for {
 		switch index {
 		case wakerForResolution:
-			if _, err := h.ep.route.Resolve(resolutionWaker); err != tcpip.ErrWouldBlock {
+			if err := h.ep.route.Resolve(resolutionWaker); err != tcpip.ErrWouldBlock {
 				// Either success (err == nil) or failure.
 				return err
 			}
@@ -369,10 +363,6 @@ func (h *handshake) resolveRoute() *tcpip.Error {
 			if n&notifyClose != 0 {
 				h.ep.route.RemoveWaker(resolutionWaker)
 				return tcpip.ErrAborted
-			}
-			if n&notifyDrain != 0 {
-				close(h.ep.drainDone)
-				<-h.ep.undrain
 			}
 		}
 
@@ -443,21 +433,6 @@ func (h *handshake) execute() *tcpip.Error {
 			n := h.ep.fetchNotifications()
 			if n&notifyClose != 0 {
 				return tcpip.ErrAborted
-			}
-			if n&notifyDrain != 0 {
-				for !h.ep.segmentQueue.empty() {
-					s := h.ep.segmentQueue.dequeue()
-					err := h.handleSegment(s)
-					s.decRef()
-					if err != nil {
-						return err
-					}
-					if h.state == handshakeCompleted {
-						return nil
-					}
-				}
-				close(h.ep.drainDone)
-				<-h.ep.undrain
 			}
 
 		case wakerForNewSegment:
@@ -556,14 +531,14 @@ func sendSynTCP(r *stack.Route, id stack.TransportEndpointID, flags byte, seq, a
 	}
 
 	options := makeSynOptions(opts)
-	err := sendTCP(r, id, buffer.VectorisedView{}, r.DefaultTTL(), flags, seq, ack, rcvWnd, options)
+	err := sendTCPWithOptions(r, id, nil, flags, seq, ack, rcvWnd, options)
 	putOptions(options)
 	return err
 }
 
-// sendTCP sends a TCP segment with the provided options via the provided
-// network endpoint and under the provided identity.
-func sendTCP(r *stack.Route, id stack.TransportEndpointID, data buffer.VectorisedView, ttl uint8, flags byte, seq, ack seqnum.Value, rcvWnd seqnum.Size, opts []byte) *tcpip.Error {
+// sendTCPWithOptions sends a TCP segment with the provided options via the
+// provided network endpoint and under the provided identity.
+func sendTCPWithOptions(r *stack.Route, id stack.TransportEndpointID, data buffer.View, flags byte, seq, ack seqnum.Value, rcvWnd seqnum.Size, opts []byte) *tcpip.Error {
 	optLen := len(opts)
 	// Allocate a buffer for the TCP header.
 	hdr := buffer.NewPrependable(header.TCPMinimumSize + int(r.MaxHeaderLength()) + optLen)
@@ -587,19 +562,54 @@ func sendTCP(r *stack.Route, id stack.TransportEndpointID, data buffer.Vectorise
 
 	// Only calculate the checksum if offloading isn't supported.
 	if r.Capabilities()&stack.CapabilityChecksumOffload == 0 {
-		length := uint16(hdr.UsedLength() + data.Size())
+		length := uint16(hdr.UsedLength())
 		xsum := r.PseudoHeaderChecksum(ProtocolNumber)
-		xsum = header.ChecksumVV(data, xsum)
+		if data != nil {
+			length += uint16(len(data))
+			xsum = header.Checksum(data, xsum)
+		}
 
 		tcp.SetChecksum(^tcp.CalculateChecksum(xsum, length))
 	}
 
-	r.Stats().TCP.SegmentsSent.Increment()
-	if (flags & flagRst) != 0 {
-		r.Stats().TCP.ResetsSent.Increment()
+	return r.WritePacket(&hdr, data, ProtocolNumber)
+}
+
+// sendTCP sends a TCP segment via the provided network endpoint and under the
+// provided identity.
+func sendTCP(r *stack.Route, id stack.TransportEndpointID, data buffer.View, flags byte, seq, ack seqnum.Value, rcvWnd seqnum.Size) *tcpip.Error {
+	// Allocate a buffer for the TCP header.
+	hdr := buffer.NewPrependable(header.TCPMinimumSize + int(r.MaxHeaderLength()))
+
+	if rcvWnd > 0xffff {
+		rcvWnd = 0xffff
 	}
 
-	return r.WritePacket(hdr, data, ProtocolNumber, ttl)
+	// Initialize the header.
+	tcp := header.TCP(hdr.Prepend(header.TCPMinimumSize))
+	tcp.Encode(&header.TCPFields{
+		SrcPort:    id.LocalPort,
+		DstPort:    id.RemotePort,
+		SeqNum:     uint32(seq),
+		AckNum:     uint32(ack),
+		DataOffset: header.TCPMinimumSize,
+		Flags:      flags,
+		WindowSize: uint16(rcvWnd),
+	})
+
+	// Only calculate the checksum if offloading isn't supported.
+	if r.Capabilities()&stack.CapabilityChecksumOffload == 0 {
+		length := uint16(hdr.UsedLength())
+		xsum := r.PseudoHeaderChecksum(ProtocolNumber)
+		if data != nil {
+			length += uint16(len(data))
+			xsum = header.Checksum(data, xsum)
+		}
+
+		tcp.SetChecksum(^tcp.CalculateChecksum(xsum, length))
+	}
+
+	return r.WritePacket(&hdr, data, ProtocolNumber)
 }
 
 // makeOptions makes an options slice.
@@ -642,18 +652,23 @@ func (e *endpoint) makeOptions(sackBlocks []header.SACKBlock) []byte {
 }
 
 // sendRaw sends a TCP segment to the endpoint's peer.
-func (e *endpoint) sendRaw(data buffer.VectorisedView, flags byte, seq, ack seqnum.Value, rcvWnd seqnum.Size) *tcpip.Error {
+func (e *endpoint) sendRaw(data buffer.View, flags byte, seq, ack seqnum.Value, rcvWnd seqnum.Size) *tcpip.Error {
 	var sackBlocks []header.SACKBlock
 	if e.state == stateConnected && e.rcv.pendingBufSize > 0 && (flags&flagAck != 0) {
 		sackBlocks = e.sack.Blocks[:e.sack.NumBlocks]
 	}
 	options := e.makeOptions(sackBlocks)
-	err := sendTCP(&e.route, e.id, data, e.route.DefaultTTL(), flags, seq, ack, rcvWnd, options)
+	if len(options) > 0 {
+		err := sendTCPWithOptions(&e.route, e.id, data, flags, seq, ack, rcvWnd, options)
+		putOptions(options)
+		return err
+	}
+	err := sendTCP(&e.route, e.id, data, flags, seq, ack, rcvWnd)
 	putOptions(options)
 	return err
 }
 
-func (e *endpoint) handleWrite() *tcpip.Error {
+func (e *endpoint) handleWrite() bool {
 	// Move packets from send queue to send list. The queue is accessible
 	// from other goroutines and protected by the send mutex, while the send
 	// list is only accessible from the handler goroutine, so it needs no
@@ -677,42 +692,47 @@ func (e *endpoint) handleWrite() *tcpip.Error {
 	// Push out any new packets.
 	e.snd.sendData()
 
-	return nil
+	return true
 }
 
-func (e *endpoint) handleClose() *tcpip.Error {
+func (e *endpoint) handleClose() bool {
 	// Drain the send queue.
 	e.handleWrite()
 
 	// Mark send side as closed.
 	e.snd.closed = true
 
-	return nil
+	return true
 }
 
-// resetConnectionLocked sends a RST segment and puts the endpoint in an error
-// state with the given error code. This method must only be called from the
-// protocol goroutine.
-func (e *endpoint) resetConnectionLocked(err *tcpip.Error) {
-	e.sendRaw(buffer.VectorisedView{}, flagAck|flagRst, e.snd.sndUna, e.rcv.rcvNxt, 0)
+// resetConnection sends a RST segment and puts the endpoint in an error state
+// with the given error code.
+// This method must only be called from the protocol goroutine.
+func (e *endpoint) resetConnection(err *tcpip.Error) {
+	e.sendRaw(nil, flagAck|flagRst, e.snd.sndUna, e.rcv.rcvNxt, 0)
 
+	e.mu.Lock()
 	e.state = stateError
 	e.hardError = err
+	e.mu.Unlock()
 }
 
-// completeWorkerLocked is called by the worker goroutine when it's about to
-// exit. It marks the worker as completed and performs cleanup work if requested
-// by Close().
-func (e *endpoint) completeWorkerLocked() {
+// completeWorker is called by the worker goroutine when it's about to exit. It
+// marks the worker as completed and performs cleanup work if requested by
+// Close().
+func (e *endpoint) completeWorker() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	e.workerRunning = false
 	if e.workerCleanup {
-		e.cleanupLocked()
+		e.cleanup()
 	}
 }
 
 // handleSegments pulls segments from the queue and processes them. It returns
-// no error if the protocol loop should continue, an error otherwise.
-func (e *endpoint) handleSegments() *tcpip.Error {
+// true if the protocol loop should continue, false otherwise.
+func (e *endpoint) handleSegments() bool {
 	checkRequeue := true
 	for i := 0; i < maxSegmentsPerWake; i++ {
 		s := e.segmentQueue.dequeue()
@@ -733,7 +753,11 @@ func (e *endpoint) handleSegments() *tcpip.Error {
 				// validated by checking their SEQ-fields." So
 				// we only process it if it's acceptable.
 				s.decRef()
-				return tcpip.ErrConnectionReset
+				e.mu.Lock()
+				e.state = stateError
+				e.hardError = tcpip.ErrConnectionReset
+				e.mu.Unlock()
+				return false
 			}
 		} else if s.flagIsSet(flagAck) {
 			// Patch the window size in the segment according to the
@@ -745,7 +769,7 @@ func (e *endpoint) handleSegments() *tcpip.Error {
 			// must be dropped as per
 			// https://tools.ietf.org/html/rfc7323#section-3.2.
 			if e.sendTSOk && !s.parsedOptions.TS {
-				e.stack.Stats().DroppedPackets.Increment()
+				atomic.AddUint64(&e.stack.MutableStats().DroppedPackets, 1)
 				s.decRef()
 				continue
 			}
@@ -770,72 +794,19 @@ func (e *endpoint) handleSegments() *tcpip.Error {
 		e.snd.sendAck()
 	}
 
-	e.resetKeepaliveTimer(true)
-
-	return nil
-}
-
-// keepaliveTimerExpired is called when the keepaliveTimer fires. We send TCP
-// keepalive packets periodically when the connection is idle. If we don't hear
-// from the other side after a number of tries, we terminate the connection.
-func (e *endpoint) keepaliveTimerExpired() *tcpip.Error {
-	e.keepalive.Lock()
-	if !e.keepalive.enabled || !e.keepalive.timer.checkExpiration() {
-		e.keepalive.Unlock()
-		return nil
-	}
-
-	if e.keepalive.unacked >= e.keepalive.count {
-		e.keepalive.Unlock()
-		return tcpip.ErrConnectionReset
-	}
-
-	// RFC1122 4.2.3.6: TCP keepalive is a dataless ACK with
-	// seg.seq = snd.nxt-1.
-	e.keepalive.unacked++
-	e.keepalive.Unlock()
-	e.snd.sendSegment(buffer.VectorisedView{}, flagAck, e.snd.sndNxt-1)
-	e.resetKeepaliveTimer(false)
-	return nil
-}
-
-// resetKeepaliveTimer restarts or stops the keepalive timer, depending on
-// whether it is enabled for this endpoint.
-func (e *endpoint) resetKeepaliveTimer(receivedData bool) {
-	e.keepalive.Lock()
-	defer e.keepalive.Unlock()
-	if receivedData {
-		e.keepalive.unacked = 0
-	}
-	// Start the keepalive timer IFF it's enabled and there is no pending
-	// data to send.
-	if !e.keepalive.enabled || e.snd == nil || e.snd.sndUna != e.snd.sndNxt {
-		e.keepalive.timer.disable()
-		return
-	}
-	if e.keepalive.unacked > 0 {
-		e.keepalive.timer.enable(e.keepalive.interval)
-	} else {
-		e.keepalive.timer.enable(e.keepalive.idle)
-	}
-}
-
-// disableKeepaliveTimer stops the keepalive timer.
-func (e *endpoint) disableKeepaliveTimer() {
-	e.keepalive.Lock()
-	e.keepalive.timer.disable()
-	e.keepalive.Unlock()
+	return true
 }
 
 // protocolMainLoop is the main loop of the TCP protocol. It runs in its own
 // goroutine and is responsible for sending segments and handling received
 // segments.
-func (e *endpoint) protocolMainLoop(handshake bool) *tcpip.Error {
+func (e *endpoint) protocolMainLoop(passive bool) *tcpip.Error {
 	var closeTimer *time.Timer
 	var closeWaker sleep.Waker
 
-	epilogue := func() {
-		// e.mu is expected to be hold upon entering this section.
+	defer func() {
+		e.waiterQueue.Notify(waiter.EventIn | waiter.EventOut)
+		e.completeWorker()
 
 		if e.snd != nil {
 			e.snd.resendTimer.cleanup()
@@ -844,25 +815,17 @@ func (e *endpoint) protocolMainLoop(handshake bool) *tcpip.Error {
 		if closeTimer != nil {
 			closeTimer.Stop()
 		}
+	}()
 
-		e.completeWorkerLocked()
-
-		if e.drainDone != nil {
-			close(e.drainDone)
-		}
-
-		e.mu.Unlock()
-
-		// When the protocol loop exits we should wake up our waiters.
-		e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.EventIn | waiter.EventOut)
-	}
-
-	if handshake {
+	if !passive {
 		// This is an active connection, so we must initiate the 3-way
 		// handshake, and then inform potential waiters about its
 		// completion.
-		h := newHandshake(e, seqnum.Size(e.receiveBufferAvailable()))
-		if err := h.execute(); err != nil {
+		h, err := newHandshake(e, seqnum.Size(e.receiveBufferAvailable()))
+		if err == nil {
+			err = h.execute()
+		}
+		if err != nil {
 			e.lastErrorMu.Lock()
 			e.lastError = err
 			e.lastErrorMu.Unlock()
@@ -870,8 +833,7 @@ func (e *endpoint) protocolMainLoop(handshake bool) *tcpip.Error {
 			e.mu.Lock()
 			e.state = stateError
 			e.hardError = err
-			// Lock released below.
-			epilogue()
+			e.mu.Unlock()
 
 			return err
 		}
@@ -886,26 +848,21 @@ func (e *endpoint) protocolMainLoop(handshake bool) *tcpip.Error {
 		e.rcvListMu.Unlock()
 	}
 
-	e.keepalive.timer.init(&e.keepalive.waker)
-	defer e.keepalive.timer.cleanup()
-
 	// Tell waiters that the endpoint is connected and writable.
 	e.mu.Lock()
 	e.state = stateConnected
-	drained := e.drainDone != nil
 	e.mu.Unlock()
-	if drained {
-		close(e.drainDone)
-		<-e.undrain
-	}
 
 	e.waiterQueue.Notify(waiter.EventOut)
+
+	// When the protocol loop exits we should wake up our waiters with EventHUp.
+	defer e.waiterQueue.Notify(waiter.EventHUp)
 
 	// Set up the functions that will be called when the main protocol loop
 	// wakes up.
 	funcs := []struct {
 		w *sleep.Waker
-		f func() *tcpip.Error
+		f func() bool
 	}{
 		{
 			w: &e.sndWaker,
@@ -921,26 +878,24 @@ func (e *endpoint) protocolMainLoop(handshake bool) *tcpip.Error {
 		},
 		{
 			w: &closeWaker,
-			f: func() *tcpip.Error {
-				return tcpip.ErrConnectionAborted
+			f: func() bool {
+				e.resetConnection(tcpip.ErrConnectionAborted)
+				return false
 			},
 		},
 		{
 			w: &e.snd.resendWaker,
-			f: func() *tcpip.Error {
+			f: func() bool {
 				if !e.snd.retransmitTimerExpired() {
-					return tcpip.ErrTimeout
+					e.resetConnection(tcpip.ErrTimeout)
+					return false
 				}
-				return nil
+				return true
 			},
 		},
 		{
-			w: &e.keepalive.waker,
-			f: e.keepaliveTimerExpired,
-		},
-		{
 			w: &e.notificationWaker,
-			f: func() *tcpip.Error {
+			f: func() bool {
 				n := e.fetchNotifications()
 				if n&notifyNonZeroReceiveWindow != 0 {
 					e.rcv.nonZeroWindow()
@@ -960,44 +915,14 @@ func (e *endpoint) protocolMainLoop(handshake bool) *tcpip.Error {
 					e.snd.updateMaxPayloadSize(mtu, count)
 				}
 
-				if n&notifyReset != 0 {
-					e.mu.Lock()
-					e.resetConnectionLocked(tcpip.ErrConnectionAborted)
-					e.mu.Unlock()
-				}
 				if n&notifyClose != 0 && closeTimer == nil {
-					// Reset the connection 3 seconds after
-					// the endpoint has been closed.
-					//
-					// The timer could fire in background
-					// when the endpoint is drained. That's
-					// OK as the loop here will not honor
-					// the firing until the undrain arrives.
+					// Reset the connection 3 seconds after the
+					// endpoint has been closed.
 					closeTimer = time.AfterFunc(3*time.Second, func() {
 						closeWaker.Assert()
 					})
 				}
-
-				if n&notifyKeepaliveChanged != 0 {
-					// The timer could fire in background
-					// when the endpoint is drained. That's
-					// OK. See above.
-					e.resetKeepaliveTimer(true)
-				}
-
-				if n&notifyDrain != 0 {
-					for !e.segmentQueue.empty() {
-						if err := e.handleSegments(); err != nil {
-							return err
-						}
-					}
-					if e.state != stateError {
-						close(e.drainDone)
-						<-e.undrain
-					}
-				}
-
-				return nil
+				return true
 			},
 		},
 	}
@@ -1008,50 +933,21 @@ func (e *endpoint) protocolMainLoop(handshake bool) *tcpip.Error {
 		s.AddWaker(funcs[i].w, i)
 	}
 
-	// The following assertions and notifications are needed for restored
-	// endpoints. Fresh newly created endpoints have empty states and should
-	// not invoke any.
-	e.segmentQueue.mu.Lock()
-	if !e.segmentQueue.list.Empty() {
-		e.newSegmentWaker.Assert()
-	}
-	e.segmentQueue.mu.Unlock()
-
-	e.rcvListMu.Lock()
-	if !e.rcvList.Empty() {
-		e.waiterQueue.Notify(waiter.EventIn)
-	}
-	e.rcvListMu.Unlock()
-
-	e.mu.RLock()
-	if e.workerCleanup {
-		e.notifyProtocolGoroutine(notifyClose)
-	}
-	e.mu.RUnlock()
-
 	// Main loop. Handle segments until both send and receive ends of the
 	// connection have completed.
 	for !e.rcv.closed || !e.snd.closed || e.snd.sndUna != e.snd.sndNxtList {
 		e.workMu.Unlock()
 		v, _ := s.Fetch(true)
 		e.workMu.Lock()
-		if err := funcs[v].f(); err != nil {
-			e.mu.Lock()
-			e.resetConnectionLocked(err)
-			// Lock released below.
-			epilogue()
-
+		if !funcs[v].f() {
 			return nil
 		}
 	}
 
 	// Mark endpoint as closed.
 	e.mu.Lock()
-	if e.state != stateError {
-		e.state = stateClosed
-	}
-	// Lock released below.
-	epilogue()
+	e.state = stateClosed
+	e.mu.Unlock()
 
 	return nil
 }

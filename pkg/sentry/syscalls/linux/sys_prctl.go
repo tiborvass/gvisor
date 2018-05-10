@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,12 +18,28 @@ import (
 	"syscall"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
+	"gvisor.googlesource.com/gvisor/pkg/bpf"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/kdefs"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 )
+
+// userSockFprog is equivalent to Linux's struct sock_fprog on amd64.
+type userSockFprog struct {
+	// Len is the length of the filter in BPF instructions.
+	Len uint16
+
+	_ [6]byte // padding for alignment
+
+	// Filter is a user pointer to the struct sock_filter array that makes up
+	// the filter program. Filter is a uint64 rather than a usermem.Addr
+	// because usermem.Addr is actually uintptr, which is not a fixed-size
+	// type, and encoding/binary.Read objects to this.
+	Filter uint64
+}
 
 // Prctl implements linux syscall prctl(2).
 // It has a list of subfunctions which operate on the process. The arguments are
@@ -87,10 +103,6 @@ func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		}
 
 	case linux.PR_SET_MM:
-		if !t.HasCapability(linux.CAP_SYS_RESOURCE) {
-			return 0, nil, syscall.EPERM
-		}
-
 		switch args[1].Int() {
 		case linux.PR_SET_MM_EXE_FILE:
 			fd := kdefs.FD(args[2].Int())
@@ -108,22 +120,6 @@ func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 
 			// Set the underlying executable.
 			t.MemoryManager().SetExecutable(file.Dirent)
-
-		case linux.PR_SET_MM_AUXV,
-			linux.PR_SET_MM_START_CODE,
-			linux.PR_SET_MM_END_CODE,
-			linux.PR_SET_MM_START_DATA,
-			linux.PR_SET_MM_END_DATA,
-			linux.PR_SET_MM_START_STACK,
-			linux.PR_SET_MM_START_BRK,
-			linux.PR_SET_MM_BRK,
-			linux.PR_SET_MM_ARG_START,
-			linux.PR_SET_MM_ARG_END,
-			linux.PR_SET_MM_ENV_START,
-			linux.PR_SET_MM_ENV_END:
-
-			t.Kernel().EmitUnimplementedEvent(t)
-			fallthrough
 		default:
 			return 0, nil, syscall.EINVAL
 		}
@@ -133,7 +129,7 @@ func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 			return 0, nil, syscall.EINVAL
 		}
 		// no_new_privs is assumed to always be set. See
-		// kernel.Task.updateCredsForExec.
+		// auth.Credentials.UpdateForExec.
 		return 0, nil, nil
 
 	case linux.PR_GET_NO_NEW_PRIVS:
@@ -147,8 +143,20 @@ func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 			// Unsupported mode.
 			return 0, nil, syscall.EINVAL
 		}
-
-		return 0, nil, seccomp(t, linux.SECCOMP_SET_MODE_FILTER, 0, args[2].Pointer())
+		var fprog userSockFprog
+		if _, err := t.CopyIn(args[2].Pointer(), &fprog); err != nil {
+			return 0, nil, err
+		}
+		filter := make([]linux.BPFInstruction, int(fprog.Len))
+		if _, err := t.CopyIn(usermem.Addr(fprog.Filter), &filter); err != nil {
+			return 0, nil, err
+		}
+		compiledFilter, err := bpf.Compile(filter)
+		if err != nil {
+			t.Debugf("Invalid seccomp-bpf filter: %v", err)
+			return 0, nil, syscall.EINVAL
+		}
+		return 0, nil, t.AppendSyscallFilter(compiledFilter)
 
 	case linux.PR_GET_SECCOMP:
 		return uintptr(t.SeccompMode()), nil, nil
@@ -171,29 +179,8 @@ func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		}
 		return 0, nil, t.DropBoundingCapability(cp)
 
-	case linux.PR_GET_DUMPABLE,
-		linux.PR_SET_DUMPABLE,
-		linux.PR_GET_TIMING,
-		linux.PR_SET_TIMING,
-		linux.PR_GET_TSC,
-		linux.PR_SET_TSC,
-		linux.PR_TASK_PERF_EVENTS_DISABLE,
-		linux.PR_TASK_PERF_EVENTS_ENABLE,
-		linux.PR_GET_TIMERSLACK,
-		linux.PR_SET_TIMERSLACK,
-		linux.PR_MCE_KILL,
-		linux.PR_MCE_KILL_GET,
-		linux.PR_GET_TID_ADDRESS,
-		linux.PR_SET_CHILD_SUBREAPER,
-		linux.PR_GET_CHILD_SUBREAPER,
-		linux.PR_GET_THP_DISABLE,
-		linux.PR_SET_THP_DISABLE,
-		linux.PR_MPX_ENABLE_MANAGEMENT,
-		linux.PR_MPX_DISABLE_MANAGEMENT:
-
-		t.Kernel().EmitUnimplementedEvent(t)
-		fallthrough
 	default:
+		t.Warningf("Unsupported prctl %d", option)
 		return 0, nil, syscall.EINVAL
 	}
 

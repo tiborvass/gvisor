@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -88,8 +88,6 @@ const LockEOF = math.MaxUint64
 //
 // A Lock may be downgraded from a write lock to a read lock only if
 // the write lock's uid is the same as the read lock.
-//
-// +stateify savable
 type Lock struct {
 	// Readers are the set of read lock holders identified by UniqueID.
 	// If len(Readers) > 0 then HasWriter must be false.
@@ -105,8 +103,6 @@ type Lock struct {
 }
 
 // Locks is a thread-safe wrapper around a LockSet.
-//
-// +stateify savable
 type Locks struct {
 	// mu protects locks below.
 	mu sync.Mutex `state:"nosave"`
@@ -115,13 +111,13 @@ type Locks struct {
 	locks LockSet
 
 	// blockedQueue is the queue of waiters that are waiting on a lock.
-	blockedQueue waiter.Queue `state:"zerovalue"`
+	blockedQueue waiter.Queue
 }
 
 // Blocker is the interface used for blocking locks. Passing a nil Blocker
 // will be treated as non-blocking.
 type Blocker interface {
-	Block(C <-chan struct{}) error
+	Block(C chan struct{}) error
 }
 
 const (

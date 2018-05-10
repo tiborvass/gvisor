@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,8 +32,6 @@ import (
 // DirtyInfo is the value type of DirtySet, and represents information about a
 // Mappable offset that is dirty (the cached data for that offset is newer than
 // its source).
-//
-// +stateify savable
 type DirtyInfo struct {
 	// Keep is true if the represented offset is concurrently writable, such
 	// that writing the data for that offset back to the source does not

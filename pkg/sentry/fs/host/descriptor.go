@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,21 +19,19 @@ import (
 	"path"
 	"syscall"
 
-	"gvisor.googlesource.com/gvisor/pkg/fdnotifier"
 	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/pkg/waiter"
+	"gvisor.googlesource.com/gvisor/pkg/waiter/fdnotifier"
 )
 
 // descriptor wraps a host fd.
-//
-// +stateify savable
 type descriptor struct {
 	// donated is true if the host fd was donated by another process.
 	donated bool
 
-	// If origFD >= 0, it is the host fd that this file was originally created
-	// from, which must be available at time of restore. The FD can be closed
-	// after descriptor is created. Only set if donated is true.
+	// If origFD >= 0, it is the host fd that this file was
+	// originally created from, which must be available at time
+	// of restore. Only valid if donated is true.
 	origFD int
 
 	// wouldBlock is true if value (below) points to a file that can

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,26 +18,27 @@ import (
 	"fmt"
 	"syscall"
 
+	"golang.org/x/sys/unix"
+	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/fd"
-	"gvisor.googlesource.com/gvisor/pkg/fdnotifier"
 	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/pkg/secio"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/fsutil"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/memmap"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/safemem"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 	"gvisor.googlesource.com/gvisor/pkg/waiter"
+	"gvisor.googlesource.com/gvisor/pkg/waiter/fdnotifier"
 )
 
 // fileOperations implements fs.FileOperations for a host file descriptor.
-//
-// +stateify savable
 type fileOperations struct {
-	fsutil.FileNoIoctl     `state:"nosave"`
-	fsutil.FileNoopRelease `state:"nosave"`
+	fsutil.NoopRelease `state:"nosave"`
 
 	// iops are the Inode operations for this file.
 	iops *inodeOperations `state:"wait"`
@@ -47,49 +48,49 @@ type fileOperations struct {
 
 	// dirCursor is the directory cursor.
 	dirCursor string
+
+	// allowIoctl determines whether ioctls should be passed through to the
+	// host.
+	allowIoctl bool
 }
 
 // fileOperations implements fs.FileOperations.
 var _ fs.FileOperations = (*fileOperations)(nil)
 
 // NewFile creates a new File backed by the provided host file descriptor. If
-// NewFile succeeds, ownership of the FD is transferred to the returned File.
+// NewFile succeeds, ownership of the fd is transferred to the returned File.
 //
 // The returned File cannot be saved, since there is no guarantee that the same
-// FD will exist or represent the same file at time of restore. If such a
+// fd will exist or represent the same file at time of restore. If such a
 // guarantee does exist, use ImportFile instead.
 func NewFile(ctx context.Context, fd int, mounter fs.FileOwner) (*fs.File, error) {
 	return newFileFromDonatedFD(ctx, fd, mounter, false, false)
 }
 
 // ImportFile creates a new File backed by the provided host file descriptor.
-// Unlike NewFile, the file descriptor used by the File is duped from FD to
-// ensure that later changes to FD are not reflected by the fs.File.
+// Unlike NewFile, the file descriptor used by the File is duped from fd to
+// ensure that later changes to fd are not reflected by the fs.File.
 //
-// If the returned file is saved, it will be restored by re-importing the FD
+// If the returned file is saved, it will be restored by re-importing the fd
 // originally passed to ImportFile. It is the restorer's responsibility to
-// ensure that the FD represents the same file.
-func ImportFile(ctx context.Context, fd int, mounter fs.FileOwner, isTTY bool) (*fs.File, error) {
-	return newFileFromDonatedFD(ctx, fd, mounter, true, isTTY)
+// ensure that the fd represents the same file.
+func ImportFile(ctx context.Context, fd int, mounter fs.FileOwner, allowIoctl bool) (*fs.File, error) {
+	return newFileFromDonatedFD(ctx, fd, mounter, true, allowIoctl)
 }
 
-// newFileFromDonatedFD returns an fs.File from a donated FD. If the FD is
+// newFileFromDonatedFD returns an fs.File from a donated fd. If the fd is
 // saveable, then saveable is true.
-func newFileFromDonatedFD(ctx context.Context, donated int, mounter fs.FileOwner, saveable, isTTY bool) (*fs.File, error) {
+func newFileFromDonatedFD(ctx context.Context, donated int, mounter fs.FileOwner, saveable, allowIoctl bool) (*fs.File, error) {
 	var s syscall.Stat_t
 	if err := syscall.Fstat(donated, &s); err != nil {
 		return nil, err
 	}
-	flags, err := fileFlagsFromDonatedFD(donated)
-	if err != nil {
-		return nil, err
-	}
 	switch s.Mode & syscall.S_IFMT {
 	case syscall.S_IFSOCK:
-		if isTTY {
-			return nil, fmt.Errorf("cannot import host socket as TTY")
+		flags, err := fileFlagsFromDonatedFD(donated)
+		if err != nil {
+			return nil, err
 		}
-
 		s, err := newSocket(ctx, donated, saveable)
 		if err != nil {
 			return nil, err
@@ -99,6 +100,10 @@ func newFileFromDonatedFD(ctx context.Context, donated int, mounter fs.FileOwner
 		})
 		return s, nil
 	default:
+		flags, err := fileFlagsFromDonatedFD(donated)
+		if err != nil {
+			return nil, err
+		}
 		msrc := newMountSource(ctx, "/", mounter, &Filesystem{}, fs.MountSourceFlags{}, false /* dontTranslateOwnership */)
 		inode, err := newInode(ctx, msrc, donated, saveable, true /* donated */)
 		if err != nil {
@@ -110,18 +115,14 @@ func newFileFromDonatedFD(ctx context.Context, donated int, mounter fs.FileOwner
 		dirent := fs.NewDirent(inode, name)
 		defer dirent.DecRef()
 
-		if isTTY {
-			return newTTYFile(ctx, dirent, flags, iops), nil
-		}
-
-		return newFile(ctx, dirent, flags, iops), nil
+		return newFile(ctx, dirent, flags, iops, allowIoctl), nil
 	}
 }
 
 func fileFlagsFromDonatedFD(donated int) (fs.FileFlags, error) {
 	flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(donated), syscall.F_GETFL, 0)
 	if errno != 0 {
-		log.Warningf("Failed to get file flags for donated FD %d (errno=%d)", donated, errno)
+		log.Warningf("Failed to get file flags for donated fd %d (errno=%d)", donated, errno)
 		return fs.FileFlags{}, syscall.EIO
 	}
 	accmode := flags & syscall.O_ACCMODE
@@ -136,14 +137,17 @@ func fileFlagsFromDonatedFD(donated int) (fs.FileFlags, error) {
 }
 
 // newFile returns a new fs.File.
-func newFile(ctx context.Context, dirent *fs.Dirent, flags fs.FileFlags, iops *inodeOperations) *fs.File {
+func newFile(ctx context.Context, dirent *fs.Dirent, flags fs.FileFlags, iops *inodeOperations, allowIoctl bool) *fs.File {
 	if !iops.ReturnsWouldBlock() {
 		// Allow reading/writing at an arbitrary offset for files
 		// that support it.
 		flags.Pread = true
 		flags.Pwrite = true
 	}
-	return fs.NewFile(ctx, dirent, flags, &fileOperations{iops: iops})
+	return fs.NewFile(ctx, dirent, flags, &fileOperations{
+		iops:       iops,
+		allowIoctl: allowIoctl,
+	})
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
@@ -264,7 +268,7 @@ func (f *fileOperations) Fsync(ctx context.Context, file *fs.File, start int64, 
 func (f *fileOperations) Flush(context.Context, *fs.File) error {
 	// This is a no-op because flushing the resource backing this
 	// file would mean closing it. We can't do that because other
-	// open files may depend on the backing host FD.
+	// open files may depend on the backing host fd.
 	return nil
 }
 
@@ -279,4 +283,89 @@ func (f *fileOperations) ConfigureMMap(ctx context.Context, file *fs.File, opts 
 // Seek implements fs.FileOperations.Seek.
 func (f *fileOperations) Seek(ctx context.Context, file *fs.File, whence fs.SeekWhence, offset int64) (int64, error) {
 	return fsutil.SeekWithDirCursor(ctx, file, whence, offset, &f.dirCursor)
+}
+
+// Ioctl implements fs.FileOperations.Iocotl.
+func (f *fileOperations) Ioctl(ctx context.Context, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+	if !f.allowIoctl {
+		return 0, syserror.ENOTTY
+	}
+	// Ignore arg[0].  This is the real FD:
+	fd := f.iops.fileState.FD()
+	ioctl := args[1].Uint64()
+	switch ioctl {
+	case unix.TCGETS:
+		termios, err := ioctlGetTermios(fd)
+		if err != nil {
+			return 0, err
+		}
+		_, err = usermem.CopyObjectOut(ctx, io, args[2].Pointer(), termios, usermem.IOOpts{
+			AddressSpaceActive: true,
+		})
+		return 0, err
+
+	case unix.TCSETS, unix.TCSETSW:
+		var termios linux.Termios
+		if _, err := usermem.CopyObjectIn(ctx, io, args[2].Pointer(), &termios, usermem.IOOpts{
+			AddressSpaceActive: true,
+		}); err != nil {
+			return 0, err
+		}
+		err := ioctlSetTermios(fd, ioctl, &termios)
+		return 0, err
+
+	case unix.TIOCGPGRP:
+		// Args: pid_t *argp
+		// When successful, equivalent to *argp = tcgetpgrp(fd).
+		// Get the process group ID of the foreground process group on
+		// this terminal.
+
+		t := kernel.TaskFromContext(ctx)
+		if t == nil {
+			panic(fmt.Sprintf("cannot get thread group from context %v", ctx))
+		}
+		tid := t.ThreadID()
+		_, err := usermem.CopyObjectOut(ctx, io, args[2].Pointer(), &tid, usermem.IOOpts{
+			AddressSpaceActive: true,
+		})
+		return 0, err
+
+	case unix.TIOCSPGRP:
+		// Args: const pid_t *argp
+		// Equivalent to tcsetpgrp(fd, *argp).
+		// Set the foreground process group ID of this terminal.
+
+		// Not much we can do with this one at the moment, so we just
+		// lie and pretend everything is great. Bash and Sh seem fine
+		// with this.
+		log.Warningf("Ignoring application ioctl(TIOCSPGRP) call")
+		return 0, nil
+
+	case unix.TIOCGWINSZ:
+		// Args: struct winsize *argp
+		// Get window size.
+		winsize, err := unix.IoctlGetWinsize(fd, unix.TIOCGWINSZ)
+		if err != nil {
+			return 0, err
+		}
+		_, err = usermem.CopyObjectOut(ctx, io, args[2].Pointer(), winsize, usermem.IOOpts{
+			AddressSpaceActive: true,
+		})
+		return 0, err
+
+	case unix.TIOCSWINSZ:
+		// Args: const struct winsize *argp
+		// Set window size.
+		var winsize unix.Winsize
+		if _, err := usermem.CopyObjectIn(ctx, io, args[2].Pointer(), &winsize, usermem.IOOpts{
+			AddressSpaceActive: true,
+		}); err != nil {
+			return 0, err
+		}
+		err := unix.IoctlSetWinsize(fd, unix.TIOCSWINSZ, &winsize)
+		return 0, err
+
+	default:
+		return 0, syserror.ENOTTY
+	}
 }

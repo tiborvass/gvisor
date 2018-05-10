@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,16 +25,14 @@ import (
 
 // regularFileOperations implements fs.FileOperations for a regular
 // tmpfs file.
-//
-// +stateify savable
 type regularFileOperations struct {
-	waiter.AlwaysReady       `state:"nosave"`
-	fsutil.FileNoopRelease   `state:"nosave"`
-	fsutil.FileGenericSeek   `state:"nosave"`
-	fsutil.FileNotDirReaddir `state:"nosave"`
-	fsutil.FileNoopFsync     `state:"nosave"`
-	fsutil.FileNoopFlush     `state:"nosave"`
-	fsutil.FileNoIoctl       `state:"nosave"`
+	waiter.AlwaysReady   `state:"nosave"`
+	fsutil.NoopRelease   `state:"nosave"`
+	fsutil.GenericSeek   `state:"nosave"`
+	fsutil.NotDirReaddir `state:"nosave"`
+	fsutil.NoopFsync     `state:"nosave"`
+	fsutil.NoopFlush     `state:"nosave"`
+	fsutil.NoIoctl       `state:"nosave"`
 
 	// iops is the InodeOperations of a regular tmpfs file. It is
 	// guaranteed to be the same as file.Dirent.Inode.InodeOperations,

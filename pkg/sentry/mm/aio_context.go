@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,8 +28,6 @@ import (
 )
 
 // aioManager creates and manages asynchronous I/O contexts.
-//
-// +stateify savable
 type aioManager struct {
 	// mu protects below.
 	mu sync.Mutex `state:"nosave"`
@@ -91,16 +89,12 @@ func (a *aioManager) lookupAIOContext(id uint64) (*AIOContext, bool) {
 }
 
 // ioResult is a completed I/O operation.
-//
-// +stateify savable
 type ioResult struct {
 	data interface{}
 	ioEntry
 }
 
 // AIOContext is a single asynchronous I/O context.
-//
-// +stateify savable
 type AIOContext struct {
 	// done is the notification channel used for all requests.
 	done chan struct{} `state:"nosave"`
@@ -196,8 +190,6 @@ func (ctx *AIOContext) WaitChannel() (chan struct{}, bool) {
 
 // aioMappable implements memmap.MappingIdentity and memmap.Mappable for AIO
 // ring buffers.
-//
-// +stateify savable
 type aioMappable struct {
 	refs.AtomicRefCount
 
@@ -244,7 +236,7 @@ func (m *aioMappable) Msync(ctx context.Context, mr memmap.MappableRange) error 
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
-func (m *aioMappable) AddMapping(_ context.Context, _ memmap.MappingSpace, ar usermem.AddrRange, offset uint64, _ bool) error {
+func (m *aioMappable) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) error {
 	// Don't allow mappings to be expanded (in Linux, fs/aio.c:aio_ring_mmap()
 	// sets VM_DONTEXPAND).
 	if offset != 0 || uint64(ar.Length()) != aioRingBufferSize {
@@ -254,11 +246,11 @@ func (m *aioMappable) AddMapping(_ context.Context, _ memmap.MappingSpace, ar us
 }
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
-func (m *aioMappable) RemoveMapping(context.Context, memmap.MappingSpace, usermem.AddrRange, uint64, bool) {
+func (m *aioMappable) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) {
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
-func (m *aioMappable) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64, _ bool) error {
+func (m *aioMappable) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64) error {
 	// Don't allow mappings to be expanded (in Linux, fs/aio.c:aio_ring_mmap()
 	// sets VM_DONTEXPAND).
 	if offset != 0 || uint64(dstAR.Length()) != aioRingBufferSize {

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -117,19 +117,15 @@ type MemoryLocked struct {
 	File *os.File
 }
 
-// Init initializes global 'MemoryAccounting'.
-func Init() error {
-	const name = "memory-usage"
+func newMemoryLocked() MemoryLocked {
+	name := "memory-usage"
 	fd, err := memutil.CreateMemFD(name, 0)
 	if err != nil {
-		if e, ok := err.(syscall.Errno); ok && e == syscall.ENOSYS {
-			return fmt.Errorf("memfd_create(2) is not implemented. Check that you have Linux 3.17 or higher")
-		}
-		return fmt.Errorf("error creating usage file: %v", err)
+		panic("error creating usage file: " + err.Error())
 	}
 	file := os.NewFile(uintptr(fd), name)
 	if err := file.Truncate(int64(RTMemoryStatsSize)); err != nil {
-		return fmt.Errorf("error truncating usage file: %v", err)
+		panic("error truncating usage file: " + err.Error())
 	}
 	// Note: We rely on the returned page being initially zeroed. This will
 	// always be the case for a newly mapped page from /dev/shm. If we obtain
@@ -137,14 +133,13 @@ func Init() error {
 	// explicitly zero the page.
 	mmap, err := syscall.Mmap(int(file.Fd()), 0, int(RTMemoryStatsSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
-		return fmt.Errorf("error mapping usage file: %v", err)
+		panic("error mapping usage file: " + err.Error())
 	}
 
-	MemoryAccounting = &MemoryLocked{
+	return MemoryLocked{
 		File:          file,
 		RTMemoryStats: RTMemoryStatsPointer(mmap),
 	}
-	return nil
 }
 
 // MemoryAccounting is the global memory stats.
@@ -152,7 +147,7 @@ func Init() error {
 // There is no need to save or restore the global memory accounting object,
 // because individual frame kinds are saved and charged only when they become
 // resident.
-var MemoryAccounting *MemoryLocked
+var MemoryAccounting = newMemoryLocked()
 
 func (m *MemoryLocked) incLocked(val uint64, kind MemoryKind) {
 	switch kind {

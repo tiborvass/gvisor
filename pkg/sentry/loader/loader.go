@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,21 +17,18 @@ package loader
 
 import (
 	"bytes"
-	"fmt"
+	"crypto/rand"
 	"io"
 	"path"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi"
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/cpuid"
-	"gvisor.googlesource.com/gvisor/pkg/rand"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/mm"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
-	"gvisor.googlesource.com/gvisor/pkg/syserr"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 )
 
@@ -57,12 +54,7 @@ func readFull(ctx context.Context, f *fs.File, dst usermem.IOSequence, offset in
 // installed in the Task FDMap. The caller takes ownership of both.
 //
 // name must be a readable, executable, regular file.
-func openPath(ctx context.Context, mm *fs.MountNamespace, root, wd *fs.Dirent, maxTraversals *uint, name string) (*fs.Dirent, *fs.File, error) {
-	if name == "" {
-		ctx.Infof("cannot open empty name")
-		return nil, nil, syserror.ENOENT
-	}
-
+func openPath(ctx context.Context, mm *fs.MountNamespace, root, wd *fs.Dirent, maxTraversals uint, name string) (*fs.Dirent, *fs.File, error) {
 	d, err := mm.FindInode(ctx, root, wd, name, maxTraversals)
 	if err != nil {
 		return nil, nil, err
@@ -138,9 +130,9 @@ const (
 //  * arch.Context matching the binary arch
 //  * fs.Dirent of the binary file
 //  * Possibly updated argv
-func loadPath(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, root, wd *fs.Dirent, remainingTraversals *uint, fs *cpuid.FeatureSet, filename string, argv []string) (loadedELF, arch.Context, *fs.Dirent, []string, error) {
+func loadPath(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, root, wd *fs.Dirent, maxTraversals uint, fs *cpuid.FeatureSet, filename string, argv, envv []string) (loadedELF, arch.Context, *fs.Dirent, []string, error) {
 	for i := 0; i < maxLoaderAttempts; i++ {
-		d, f, err := openPath(ctx, mounts, root, wd, remainingTraversals, filename)
+		d, f, err := openPath(ctx, mounts, root, wd, maxTraversals, filename)
 		if err != nil {
 			ctx.Infof("Error opening %s: %v", filename, err)
 			return loadedELF{}, nil, nil, nil, err
@@ -165,7 +157,7 @@ func loadPath(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespac
 
 		switch {
 		case bytes.Equal(hdr[:], []byte(elfMagic)):
-			loaded, ac, err := loadELF(ctx, m, mounts, root, wd, remainingTraversals, fs, f)
+			loaded, ac, err := loadELF(ctx, m, mounts, root, wd, maxTraversals, fs, f)
 			if err != nil {
 				ctx.Infof("Error loading ELF: %v", err)
 				return loadedELF{}, nil, nil, nil, err
@@ -174,7 +166,7 @@ func loadPath(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespac
 			d.IncRef()
 			return loaded, ac, d, argv, err
 		case bytes.Equal(hdr[:2], []byte(interpreterScriptMagic)):
-			newpath, newargv, err := parseInterpreterScript(ctx, filename, f, argv)
+			newpath, newargv, err := parseInterpreterScript(ctx, filename, f, argv, envv)
 			if err != nil {
 				ctx.Infof("Error loading interpreter script: %v", err)
 				return loadedELF{}, nil, nil, nil, err
@@ -198,18 +190,20 @@ func loadPath(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespac
 // Preconditions:
 //  * The Task MemoryManager is empty.
 //  * Load is called on the Task goroutine.
-func Load(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, root, wd *fs.Dirent, maxTraversals *uint, fs *cpuid.FeatureSet, filename string, argv, envv []string, extraAuxv []arch.AuxEntry, vdso *VDSO) (abi.OS, arch.Context, string, *syserr.Error) {
+func Load(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, root, wd *fs.Dirent, maxTraversals uint, fs *cpuid.FeatureSet, filename string, argv, envv []string, extraAuxv []arch.AuxEntry, vdso *VDSO) (abi.OS, arch.Context, string, error) {
 	// Load the binary itself.
-	loaded, ac, d, argv, err := loadPath(ctx, m, mounts, root, wd, maxTraversals, fs, filename, argv)
+	loaded, ac, d, argv, err := loadPath(ctx, m, mounts, root, wd, maxTraversals, fs, filename, argv, envv)
 	if err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Failed to load %s: %v", filename, err), syserr.FromError(err).ToLinux())
+		ctx.Infof("Failed to load %s: %v", filename, err)
+		return 0, nil, "", err
 	}
 	defer d.DecRef()
 
 	// Load the VDSO.
 	vdsoAddr, err := loadVDSO(ctx, m, vdso, loaded)
 	if err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Error loading VDSO: %v", err), syserr.FromError(err).ToLinux())
+		ctx.Infof("Error loading VDSO: %v", err)
+		return 0, nil, "", err
 	}
 
 	// Setup the heap. brk starts at the next page after the end of the
@@ -217,40 +211,39 @@ func Load(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, r
 	// loaded.end is available for its use.
 	e, ok := loaded.end.RoundUp()
 	if !ok {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("brk overflows: %#x", loaded.end), linux.ENOEXEC)
+		ctx.Warningf("brk overflows: %#x", loaded.end)
+		return 0, nil, "", syserror.ENOEXEC
 	}
 	m.BrkSetup(ctx, e)
 
 	// Allocate our stack.
 	stack, err := allocStack(ctx, m, ac)
 	if err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Failed to allocate stack: %v", err), syserr.FromError(err).ToLinux())
+		ctx.Infof("Failed to allocate stack: %v", err)
+		return 0, nil, "", err
 	}
 
 	// Push the original filename to the stack, for AT_EXECFN.
 	execfn, err := stack.Push(filename)
 	if err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Failed to push exec filename: %v", err), syserr.FromError(err).ToLinux())
+		ctx.Infof("Failed to push exec filename: %v", err)
+		return 0, nil, "", err
 	}
 
 	// Push 16 random bytes on the stack which AT_RANDOM will point to.
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Failed to read random bytes: %v", err), syserr.FromError(err).ToLinux())
+		ctx.Infof("Failed to read random bytes: %v", err)
+		return 0, nil, "", err
 	}
 	random, err := stack.Push(b)
 	if err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Failed to push random bytes: %v", err), syserr.FromError(err).ToLinux())
+		ctx.Infof("Failed to push random bytes: %v", err)
+		return 0, nil, "", err
 	}
 
-	c := auth.CredentialsFromContext(ctx)
-
-	// Add generic auxv entries.
+	// Add generic auxv entries
 	auxv := append(loaded.auxv, arch.Auxv{
-		arch.AuxEntry{linux.AT_UID, usermem.Addr(c.RealKUID.In(c.UserNamespace).OrOverflow())},
-		arch.AuxEntry{linux.AT_EUID, usermem.Addr(c.EffectiveKUID.In(c.UserNamespace).OrOverflow())},
-		arch.AuxEntry{linux.AT_GID, usermem.Addr(c.RealKGID.In(c.UserNamespace).OrOverflow())},
-		arch.AuxEntry{linux.AT_EGID, usermem.Addr(c.EffectiveKGID.In(c.UserNamespace).OrOverflow())},
 		arch.AuxEntry{linux.AT_CLKTCK, linux.CLOCKS_PER_SEC},
 		arch.AuxEntry{linux.AT_EXECFN, execfn},
 		arch.AuxEntry{linux.AT_RANDOM, random},
@@ -261,7 +254,8 @@ func Load(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, r
 
 	sl, err := stack.Load(argv, envv, auxv)
 	if err != nil {
-		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Failed to load stack: %v", err), syserr.FromError(err).ToLinux())
+		ctx.Infof("Failed to load stack: %v", err)
+		return 0, nil, "", err
 	}
 
 	m.SetArgvStart(sl.ArgvStart)

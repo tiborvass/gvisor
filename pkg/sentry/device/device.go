@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -181,14 +181,6 @@ func (m *MultiDevice) Load(key MultiDeviceKey, value uint64) bool {
 	if m.cache == nil {
 		m.cache = make(map[MultiDeviceKey]uint64)
 		m.rcache = make(map[uint64]MultiDeviceKey)
-	}
-
-	if val, exists := m.cache[key]; exists && val != value {
-		return false
-	}
-	if k, exists := m.rcache[value]; exists && k != key {
-		// Should never happen.
-		panic("MultiDevice's caches are inconsistent")
 	}
 
 	// Cache value at key.

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,16 +29,16 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/kdefs"
 	ktime "gvisor.googlesource.com/gvisor/pkg/sentry/kernel/time"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserr"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 )
 
 // ControlMessages represents the union of unix control messages and tcpip
 // control messages.
 type ControlMessages struct {
-	Unix transport.ControlMessages
+	Unix unix.ControlMessages
 	IP   tcpip.ControlMessages
 }
 
@@ -86,31 +86,19 @@ type Socket interface {
 	//
 	// senderAddrLen is the address length to be returned to the application,
 	// not necessarily the actual length of the address.
-	//
-	// If err != nil, the recv was not successful.
 	RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, haveDeadline bool, deadline ktime.Time, senderRequested bool, controlDataLen uint64) (n int, senderAddr interface{}, senderAddrLen uint32, controlMessages ControlMessages, err *syserr.Error)
 
 	// SendMsg implements the sendmsg(2) linux syscall. SendMsg does not take
 	// ownership of the ControlMessage on error.
-	//
-	// If n > 0, err will either be nil or an error from t.Block.
-	SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, haveDeadline bool, deadline ktime.Time, controlMessages ControlMessages) (n int, err *syserr.Error)
+	SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, controlMessages ControlMessages) (n int, err *syserr.Error)
 
 	// SetRecvTimeout sets the timeout (in ns) for recv operations. Zero means
-	// no timeout, and negative means DONTWAIT.
+	// no timeout.
 	SetRecvTimeout(nanoseconds int64)
 
 	// RecvTimeout gets the current timeout (in ns) for recv operations. Zero
-	// means no timeout, and negative means DONTWAIT.
+	// means no timeout.
 	RecvTimeout() int64
-
-	// SetSendTimeout sets the timeout (in ns) for send operations. Zero means
-	// no timeout, and negative means DONTWAIT.
-	SetSendTimeout(nanoseconds int64)
-
-	// SendTimeout gets the current timeout (in ns) for send operations. Zero
-	// means no timeout, and negative means DONTWAIT.
-	SendTimeout() int64
 }
 
 // Provider is the interface implemented by providers of sockets for specific
@@ -121,12 +109,12 @@ type Provider interface {
 	// If a nil Socket _and_ a nil error is returned, it means that the
 	// protocol is not supported. A non-nil error should only be returned
 	// if the protocol is supported, but an error occurs during creation.
-	Socket(t *kernel.Task, stype transport.SockType, protocol int) (*fs.File, *syserr.Error)
+	Socket(t *kernel.Task, stype unix.SockType, protocol int) (*fs.File, *syserr.Error)
 
 	// Pair creates a pair of connected sockets.
 	//
 	// See Socket for error information.
-	Pair(t *kernel.Task, stype transport.SockType, protocol int) (*fs.File, *fs.File, *syserr.Error)
+	Pair(t *kernel.Task, stype unix.SockType, protocol int) (*fs.File, *fs.File, *syserr.Error)
 }
 
 // families holds a map of all known address families and their providers.
@@ -140,7 +128,7 @@ func RegisterProvider(family int, provider Provider) {
 }
 
 // New creates a new socket with the given family, type and protocol.
-func New(t *kernel.Task, family int, stype transport.SockType, protocol int) (*fs.File, *syserr.Error) {
+func New(t *kernel.Task, family int, stype unix.SockType, protocol int) (*fs.File, *syserr.Error) {
 	for _, p := range families[family] {
 		s, err := p.Socket(t, stype, protocol)
 		if err != nil {
@@ -156,7 +144,7 @@ func New(t *kernel.Task, family int, stype transport.SockType, protocol int) (*f
 
 // Pair creates a new connected socket pair with the given family, type and
 // protocol.
-func Pair(t *kernel.Task, family int, stype transport.SockType, protocol int) (*fs.File, *fs.File, *syserr.Error) {
+func Pair(t *kernel.Task, family int, stype unix.SockType, protocol int) (*fs.File, *fs.File, *syserr.Error) {
 	providers, ok := families[family]
 	if !ok {
 		return nil, nil, syserr.ErrAddressFamilyNotSupported
@@ -178,12 +166,18 @@ func Pair(t *kernel.Task, family int, stype transport.SockType, protocol int) (*
 // NewDirent returns a sockfs fs.Dirent that resides on device d.
 func NewDirent(ctx context.Context, d *device.Device) *fs.Dirent {
 	ino := d.NextIno()
-	iops := &fsutil.SimpleFileInode{
-		InodeSimpleAttributes: fsutil.NewInodeSimpleAttributes(ctx, fs.FileOwnerFromContext(ctx), fs.FilePermissions{
-			User: fs.PermMask{Read: true, Write: true},
-		}, linux.SOCKFS_MAGIC),
-	}
-	inode := fs.NewInode(iops, fs.NewPseudoMountSource(), fs.StableAttr{
+	// There is no real filesystem backing this pipe, so we pass in a nil
+	// Filesystem.
+	inode := fs.NewInode(fsutil.NewSimpleInodeOperations(fsutil.InodeSimpleAttributes{
+		FSType: linux.SOCKFS_MAGIC,
+		UAttr: fs.WithCurrentTime(ctx, fs.UnstableAttr{
+			Owner: fs.FileOwnerFromContext(ctx),
+			Perms: fs.FilePermissions{
+				User: fs.PermMask{Read: true, Write: true},
+			},
+			Links: 1,
+		}),
+	}), fs.NewNonCachingMountSource(nil, fs.MountSourceFlags{}), fs.StableAttr{
 		Type:      fs.Socket,
 		DeviceID:  d.DeviceID(),
 		InodeID:   ino,
@@ -194,134 +188,26 @@ func NewDirent(ctx context.Context, d *device.Device) *fs.Dirent {
 	return fs.NewDirent(inode, fmt.Sprintf("socket:[%d]", ino))
 }
 
-// SendReceiveTimeout stores timeouts for send and receive calls.
+// ReceiveTimeout stores a timeout for receive calls.
 //
 // It is meant to be embedded into Socket implementations to help satisfy the
 // interface.
 //
-// Care must be taken when copying SendReceiveTimeout as it contains atomic
+// Care must be taken when copying ReceiveTimeout as it contains atomic
 // variables.
-//
-// +stateify savable
-type SendReceiveTimeout struct {
-	// send is length of the send timeout in nanoseconds.
+type ReceiveTimeout struct {
+	// ns is length of the timeout in nanoseconds.
 	//
-	// send must be accessed atomically.
-	send int64
-
-	// recv is length of the receive timeout in nanoseconds.
-	//
-	// recv must be accessed atomically.
-	recv int64
+	// ns must be accessed atomically.
+	ns int64
 }
 
 // SetRecvTimeout implements Socket.SetRecvTimeout.
-func (to *SendReceiveTimeout) SetRecvTimeout(nanoseconds int64) {
-	atomic.StoreInt64(&to.recv, nanoseconds)
+func (rt *ReceiveTimeout) SetRecvTimeout(nanoseconds int64) {
+	atomic.StoreInt64(&rt.ns, nanoseconds)
 }
 
 // RecvTimeout implements Socket.RecvTimeout.
-func (to *SendReceiveTimeout) RecvTimeout() int64 {
-	return atomic.LoadInt64(&to.recv)
-}
-
-// SetSendTimeout implements Socket.SetSendTimeout.
-func (to *SendReceiveTimeout) SetSendTimeout(nanoseconds int64) {
-	atomic.StoreInt64(&to.send, nanoseconds)
-}
-
-// SendTimeout implements Socket.SendTimeout.
-func (to *SendReceiveTimeout) SendTimeout() int64 {
-	return atomic.LoadInt64(&to.send)
-}
-
-// GetSockOptEmitUnimplementedEvent emits unimplemented event if name is valid.
-// It contains names that are valid for GetSockOpt when level is SOL_SOCKET.
-func GetSockOptEmitUnimplementedEvent(t *kernel.Task, name int) {
-	switch name {
-	case linux.SO_ACCEPTCONN,
-		linux.SO_BPF_EXTENSIONS,
-		linux.SO_COOKIE,
-		linux.SO_DOMAIN,
-		linux.SO_ERROR,
-		linux.SO_GET_FILTER,
-		linux.SO_INCOMING_NAPI_ID,
-		linux.SO_MEMINFO,
-		linux.SO_PEERCRED,
-		linux.SO_PEERGROUPS,
-		linux.SO_PEERNAME,
-		linux.SO_PEERSEC,
-		linux.SO_PROTOCOL,
-		linux.SO_SNDLOWAT,
-		linux.SO_TYPE:
-
-		t.Kernel().EmitUnimplementedEvent(t)
-
-	default:
-		emitUnimplementedEvent(t, name)
-	}
-}
-
-// SetSockOptEmitUnimplementedEvent emits unimplemented event if name is valid.
-// It contains names that are valid for SetSockOpt when level is SOL_SOCKET.
-func SetSockOptEmitUnimplementedEvent(t *kernel.Task, name int) {
-	switch name {
-	case linux.SO_ATTACH_BPF,
-		linux.SO_ATTACH_FILTER,
-		linux.SO_ATTACH_REUSEPORT_CBPF,
-		linux.SO_ATTACH_REUSEPORT_EBPF,
-		linux.SO_CNX_ADVICE,
-		linux.SO_DETACH_FILTER,
-		linux.SO_RCVBUFFORCE,
-		linux.SO_SNDBUFFORCE:
-
-		t.Kernel().EmitUnimplementedEvent(t)
-
-	default:
-		emitUnimplementedEvent(t, name)
-	}
-}
-
-// emitUnimplementedEvent emits unimplemented event if name is valid. It
-// contains names that are common between Get and SetSocketOpt when level is
-// SOL_SOCKET.
-func emitUnimplementedEvent(t *kernel.Task, name int) {
-	switch name {
-	case linux.SO_BINDTODEVICE,
-		linux.SO_BROADCAST,
-		linux.SO_BSDCOMPAT,
-		linux.SO_BUSY_POLL,
-		linux.SO_DEBUG,
-		linux.SO_DONTROUTE,
-		linux.SO_INCOMING_CPU,
-		linux.SO_KEEPALIVE,
-		linux.SO_LINGER,
-		linux.SO_LOCK_FILTER,
-		linux.SO_MARK,
-		linux.SO_MAX_PACING_RATE,
-		linux.SO_NOFCS,
-		linux.SO_NO_CHECK,
-		linux.SO_OOBINLINE,
-		linux.SO_PASSCRED,
-		linux.SO_PASSSEC,
-		linux.SO_PEEK_OFF,
-		linux.SO_PRIORITY,
-		linux.SO_RCVBUF,
-		linux.SO_RCVLOWAT,
-		linux.SO_RCVTIMEO,
-		linux.SO_REUSEADDR,
-		linux.SO_REUSEPORT,
-		linux.SO_RXQ_OVFL,
-		linux.SO_SELECT_ERR_QUEUE,
-		linux.SO_SNDBUF,
-		linux.SO_SNDTIMEO,
-		linux.SO_TIMESTAMP,
-		linux.SO_TIMESTAMPING,
-		linux.SO_TIMESTAMPNS,
-		linux.SO_TXTIME,
-		linux.SO_WIFI_STATUS,
-		linux.SO_ZEROCOPY:
-
-		t.Kernel().EmitUnimplementedEvent(t)
-	}
+func (rt *ReceiveTimeout) RecvTimeout() int64 {
+	return atomic.LoadInt64(&rt.ns)
 }

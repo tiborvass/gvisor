@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,8 +26,6 @@ import (
 )
 
 // Stack implements inet.Stack for netstack/tcpip/stack.Stack.
-//
-// +stateify savable
 type Stack struct {
 	Stack *stack.Stack `state:"manual"`
 }
@@ -41,16 +39,10 @@ func (s *Stack) SupportsIPv6() bool {
 func (s *Stack) Interfaces() map[int32]inet.Interface {
 	is := make(map[int32]inet.Interface)
 	for id, ni := range s.Stack.NICInfo() {
-		var devType uint16
-		if ni.Flags.Loopback {
-			devType = linux.ARPHRD_LOOPBACK
-		}
 		is[int32(id)] = inet.Interface{
-			Name:       ni.Name,
-			Addr:       []byte(ni.LinkAddress),
-			Flags:      uint32(nicStateFlagsToLinux(ni.Flags)),
-			DeviceType: devType,
-			MTU:        ni.MTU,
+			Name: ni.Name,
+			Addr: []byte(ni.LinkAddress),
+			// TODO: Other fields.
 		}
 	}
 	return is

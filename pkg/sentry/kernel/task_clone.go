@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -197,10 +197,10 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 	if opts.NewIPCNamespace {
 		// Note that "If CLONE_NEWIPC is set, then create the process in a new IPC
 		// namespace"
-		ipcns = NewIPCNamespace(userns)
+		ipcns = NewIPCNamespace()
 	}
 
-	tc, err := t.tc.Fork(t, t.k, !opts.NewAddressSpace)
+	tc, err := t.tc.Fork(t, !opts.NewAddressSpace)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -210,25 +210,7 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 		tc.Arch.SetStack(uintptr(opts.Stack))
 	}
 	if opts.SetTLS {
-		if !tc.Arch.SetTLS(uintptr(opts.TLS)) {
-			return 0, nil, syserror.EPERM
-		}
-	}
-
-	var fsc *FSContext
-	if opts.NewFSContext {
-		fsc = t.fsc.Fork()
-	} else {
-		fsc = t.fsc
-		fsc.IncRef()
-	}
-
-	var fds *FDMap
-	if opts.NewFiles {
-		fds = t.fds.Fork()
-	} else {
-		fds = t.fds
-		fds.IncRef()
+		tc.Arch.StateData().Regs.Fs_base = uint64(opts.TLS)
 	}
 
 	pidns := t.tg.pidns
@@ -238,34 +220,27 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 		pidns = pidns.NewChild(userns)
 	}
 	tg := t.tg
+	parent := t.parent
 	if opts.NewThreadGroup {
 		sh := t.tg.signalHandlers
 		if opts.NewSignalHandlers {
 			sh = sh.Fork()
 		}
-		tg = t.k.newThreadGroup(pidns, sh, opts.TerminationSignal, tg.limits.GetCopy(), t.k.monotonicClock)
+		tg = NewThreadGroup(pidns, sh, opts.TerminationSignal, tg.limits.GetCopy(), t.k.monotonicClock)
+		parent = t
 	}
-
 	cfg := &TaskConfig{
-		Kernel:                  t.k,
-		ThreadGroup:             tg,
-		SignalMask:              t.SignalMask(),
-		TaskContext:             tc,
-		FSContext:               fsc,
-		FDMap:                   fds,
-		Credentials:             creds.Fork(),
-		Niceness:                t.Niceness(),
-		NetworkNamespaced:       t.netns,
-		AllowedCPUMask:          t.CPUMask(),
-		UTSNamespace:            utsns,
-		IPCNamespace:            ipcns,
-		AbstractSocketNamespace: t.abstractSockets,
-		ContainerID:             t.ContainerID(),
-	}
-	if opts.NewThreadGroup {
-		cfg.Parent = t
-	} else {
-		cfg.InheritParent = t
+		Kernel:            t.k,
+		Parent:            parent,
+		ThreadGroup:       tg,
+		TaskContext:       tc,
+		TaskResources:     t.tr.Fork(!opts.NewFiles, !opts.NewFSContext),
+		Niceness:          t.Niceness(),
+		Credentials:       creds.Fork(),
+		NetworkNamespaced: t.netns,
+		AllowedCPUMask:    t.CPUMask(),
+		UTSNamespace:      utsns,
+		IPCNamespace:      ipcns,
 	}
 	if opts.NewNetworkNamespace {
 		cfg.NetworkNamespaced = true
@@ -303,10 +278,7 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 	// "If fork/clone and execve are allowed by @prog, any child processes will
 	// be constrained to the same filters and system call ABI as the parent." -
 	// Documentation/prctl/seccomp_filter.txt
-	if f := t.syscallFilters.Load(); f != nil {
-		copiedFilters := append([]bpf.Program(nil), f.([]bpf.Program)...)
-		nt.syscallFilters.Store(copiedFilters)
-	}
+	nt.syscallFilters = append([]bpf.Program(nil), t.syscallFilters...)
 	if opts.Vfork {
 		nt.vforkParent = t
 	}
@@ -375,7 +347,6 @@ func (t *Task) unstopVforkParent() {
 	}
 }
 
-// +stateify savable
 type runSyscallAfterPtraceEventClone struct {
 	vforkChild *Task
 
@@ -393,7 +364,6 @@ func (r *runSyscallAfterPtraceEventClone) execute(t *Task) taskRunState {
 	return (*runSyscallExit)(nil)
 }
 
-// +stateify savable
 type runSyscallAfterVforkStop struct {
 	// childTID has the same meaning as
 	// runSyscallAfterPtraceEventClone.vforkChildTID.
@@ -458,17 +428,15 @@ func (t *Task) Unshare(opts *SharingOptions) error {
 		t.childPIDNamespace = t.tg.pidns.NewChild(t.UserNamespace())
 	}
 	t.mu.Lock()
-	// Can't defer unlock: DecRefs must occur without holding t.mu.
+	defer t.mu.Unlock()
 	if opts.NewNetworkNamespace {
 		if !haveCapSysAdmin {
-			t.mu.Unlock()
 			return syserror.EPERM
 		}
 		t.netns = true
 	}
 	if opts.NewUTSNamespace {
 		if !haveCapSysAdmin {
-			t.mu.Unlock()
 			return syserror.EPERM
 		}
 		// Note that this must happen after NewUserNamespace, so the
@@ -477,29 +445,21 @@ func (t *Task) Unshare(opts *SharingOptions) error {
 	}
 	if opts.NewIPCNamespace {
 		if !haveCapSysAdmin {
-			t.mu.Unlock()
 			return syserror.EPERM
 		}
 		// Note that "If CLONE_NEWIPC is set, then create the process in a new IPC
 		// namespace"
-		t.ipcns = NewIPCNamespace(t.creds.UserNamespace)
+		t.ipcns = NewIPCNamespace()
 	}
-	var oldfds *FDMap
 	if opts.NewFiles {
-		oldfds = t.fds
-		t.fds = oldfds.Fork()
+		oldFDMap := t.tr.FDMap
+		t.tr.FDMap = oldFDMap.Fork()
+		oldFDMap.DecRef()
 	}
-	var oldfsc *FSContext
 	if opts.NewFSContext {
-		oldfsc = t.fsc
-		t.fsc = oldfsc.Fork()
-	}
-	t.mu.Unlock()
-	if oldfds != nil {
-		oldfds.DecRef()
-	}
-	if oldfsc != nil {
-		oldfsc.DecRef()
+		oldFS := t.tr.FSContext
+		t.tr.FSContext = oldFS.Fork()
+		oldFS.DecRef()
 	}
 	return nil
 }
@@ -509,8 +469,6 @@ func (t *Task) Unshare(opts *SharingOptions) error {
 // current MM. (Normally, CLONE_VFORK is used in conjunction with CLONE_VM, so
 // that the child and parent share mappings until the child execve()s into a
 // new process image or exits.)
-//
-// +stateify savable
 type vforkStop struct{}
 
 // StopIgnoresKill implements TaskStop.Killable.

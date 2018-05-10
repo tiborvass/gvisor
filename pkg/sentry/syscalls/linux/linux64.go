@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +13,8 @@
 // limitations under the License.
 
 // Package linux provides syscall tables for amd64 Linux.
+//
+// NOTE: Linux i386 support has been removed.
 package linux
 
 import (
@@ -32,19 +34,15 @@ import (
 const _AUDIT_ARCH_X86_64 = 0xc000003e
 
 // AMD64 is a table of Linux amd64 syscall API with the corresponding syscall
-// numbers from Linux 4.4. The entries commented out are those syscalls we
+// numbers from Linux 3.11. The entries commented out are those syscalls we
 // don't currently support.
 var AMD64 = &kernel.SyscallTable{
 	OS:   abi.Linux,
 	Arch: arch.AMD64,
 	Version: kernel.Version{
-		// Version 4.4 is chosen as a stable, longterm version of Linux, which
-		// guides the interface provided by this syscall table. The build
-		// version is that for a clean build with default kernel config, at 5
-		// minutes after v4.4 was tagged.
 		Sysname: "Linux",
-		Release: "4.4",
-		Version: "#1 SMP Sun Jan 10 15:06:54 PST 2016",
+		Release: "3.11.10",
+		Version: "#1 SMP Fri Nov 29 10:47:50 PST 2013",
 	},
 	AuditNumber: _AUDIT_ARCH_X86_64,
 	Table: map[uintptr]kernel.SyscallFn{
@@ -77,9 +75,9 @@ var AMD64 = &kernel.SyscallTable{
 		26: Msync,
 		27: Mincore,
 		28: Madvise,
-		29: Shmget,
-		30: Shmat,
-		31: Shmctl,
+		//     29: Shmget, TODO
+		//     30: Shmat, TODO
+		//     31: Shmctl, TODO
 		32: Dup,
 		33: Dup2,
 		34: Pause,
@@ -115,7 +113,7 @@ var AMD64 = &kernel.SyscallTable{
 		64: Semget,
 		65: Semop,
 		66: Semctl,
-		67: Shmdt,
+		//     67: Shmdt, TODO
 		//     68: Msgget, TODO
 		//     69: Msgsnd, TODO
 		//     70: Msgrcv, TODO
@@ -196,11 +194,11 @@ var AMD64 = &kernel.SyscallTable{
 		145: SchedGetscheduler,
 		146: SchedGetPriorityMax,
 		147: SchedGetPriorityMin,
-		148: syscalls.ErrorWithEvent(syscall.EPERM), // SchedRrGetInterval,
-		149: Mlock,
-		150: Munlock,
-		151: Mlockall,
-		152: Munlockall,
+		148: syscalls.ErrorWithEvent(syscall.EPERM),      // SchedRrGetInterval,
+		149: syscalls.Error(nil),                         // Mlock, TODO
+		150: syscalls.Error(nil),                         // Munlock, TODO
+		151: syscalls.Error(nil),                         // Mlockall, TODO
+		152: syscalls.Error(nil),                         // Munlockall, TODO
 		153: syscalls.CapError(linux.CAP_SYS_TTY_CONFIG), // Vhangup,
 		154: syscalls.Error(syscall.EPERM),               // ModifyLdt,
 		155: syscalls.Error(syscall.EPERM),               // PivotRoot,
@@ -270,11 +268,11 @@ var AMD64 = &kernel.SyscallTable{
 		219: RestartSyscall,
 		//     220: Semtimedop, TODO
 		221: Fadvise64,
-		222: TimerCreate,
-		223: TimerSettime,
-		224: TimerGettime,
-		225: TimerGetoverrun,
-		226: TimerDelete,
+		//     222: TimerCreate, TODO
+		//     223: TimerSettime, TODO
+		//     224: TimerGettime, TODO
+		//     225: TimerGetoverrun, TODO
+		//     226: TimerDelete, TODO
 		227: ClockSettime,
 		228: ClockGettime,
 		229: ClockGetres,
@@ -325,7 +323,7 @@ var AMD64 = &kernel.SyscallTable{
 		274: syscalls.Error(syscall.ENOSYS), // GetRobustList, obsolete
 		//     275: Splice, TODO
 		//     276: Tee, TODO
-		277: SyncFileRange,
+		//     277: SyncFileRange, TODO
 		//     278: Vmsplice, TODO
 		279: syscalls.CapError(linux.CAP_SYS_NICE), // MovePages, requires cap_sys_nice (mostly)
 		280: Utimensat,
@@ -362,22 +360,8 @@ var AMD64 = &kernel.SyscallTable{
 		//     311: ProcessVmWritev, TODO may require cap_sys_ptrace
 		312: syscalls.CapError(linux.CAP_SYS_PTRACE), // Kcmp, requires cap_sys_ptrace
 		313: syscalls.CapError(linux.CAP_SYS_MODULE), // FinitModule, requires cap_sys_module
-		//     314: SchedSetattr, TODO, we have no scheduler
-		//     315: SchedGetattr, TODO, we have no scheduler
-		//     316: Renameat2, TODO
-		317: Seccomp,
+		// "Backports."
 		318: GetRandom,
-		//     319: MemfdCreate, TODO
-		320: syscalls.CapError(linux.CAP_SYS_BOOT),  // KexecFileLoad, infeasible to support
-		321: syscalls.CapError(linux.CAP_SYS_ADMIN), // Bpf, requires cap_sys_admin for all commands
-		//     322: Execveat, TODO
-		//     323: Userfaultfd, TODO
-		//     324: Membarrier, TODO
-		325: Mlock2,
-		// Syscalls after 325 are "backports" from versions of Linux after 4.4.
-		//	326: CopyFileRange,
-		327: Preadv2,
-		328: Pwritev2,
 	},
 
 	Emulate: map[usermem.Addr]uintptr{
@@ -386,7 +370,7 @@ var AMD64 = &kernel.SyscallTable{
 		0xffffffffff600800: 309, // vsyscall getcpu(2)
 	},
 	Missing: func(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
-		t.Kernel().EmitUnimplementedEvent(t)
+		syscalls.UnimplementedEvent(t)
 		return 0, syserror.ENOSYS
 	},
 }

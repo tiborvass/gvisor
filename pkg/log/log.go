@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -251,8 +251,8 @@ const defaultStackSize = 1 << 16 // 64KB
 // maxStackSize is the maximum buffer size to allocate for stack traces.
 const maxStackSize = 1 << 26 // 64MB
 
-// Stacks returns goroutine stacks, like panic.
-func Stacks(all bool) []byte {
+// stacks returns goroutine stacks, like panic.
+func stacks(all bool) []byte {
 	var trace []byte
 	for s := defaultStackSize; s <= maxStackSize; s *= 4 {
 		trace = make([]byte, s)
@@ -271,7 +271,7 @@ func Stacks(all bool) []byte {
 //
 // This will be print a traceback, tb, as Warningf(format+":\n%s", v..., tb).
 func Traceback(format string, v ...interface{}) {
-	v = append(v, Stacks(false))
+	v = append(v, stacks(false))
 	Warningf(format+":\n%s", v...)
 }
 
@@ -279,7 +279,7 @@ func Traceback(format string, v ...interface{}) {
 //
 // This will be print a traceback, tb, as Warningf(format+":\n%s", v..., tb).
 func TracebackAll(format string, v ...interface{}) {
-	v = append(v, Stacks(true))
+	v = append(v, stacks(true))
 	Warningf(format+":\n%s", v...)
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -44,39 +44,20 @@ type Stats struct {
 	last time.Time
 }
 
-// sample adds the samples to the given object.
-func (s *Stats) sample(typ reflect.Type) {
-	now := time.Now()
-	s.byType[typ].total += now.Sub(s.last)
-	s.last = now
-}
-
-// Add adds a sample count.
-func (s *Stats) Add(obj reflect.Value) {
-	if s == nil {
-		return
-	}
+// sample adds the given number of samples to the given object.
+func (s *Stats) sample(typ reflect.Type, count uint) {
 	if s.byType == nil {
 		s.byType = make(map[reflect.Type]*statEntry)
 	}
-	typ := obj.Type()
 	entry, ok := s.byType[typ]
 	if !ok {
 		entry = new(statEntry)
 		s.byType[typ] = entry
 	}
-	entry.count++
-}
-
-// Remove removes a sample count. It should only be called after a previous
-// Add().
-func (s *Stats) Remove(obj reflect.Value) {
-	if s == nil {
-		return
-	}
-	typ := obj.Type()
-	entry := s.byType[typ]
-	entry.count--
+	now := time.Now()
+	entry.count += count
+	entry.total += now.Sub(s.last)
+	s.last = now
 }
 
 // Start starts a sample.
@@ -86,7 +67,7 @@ func (s *Stats) Start(obj reflect.Value) {
 	}
 	if len(s.stack) > 0 {
 		last := s.stack[len(s.stack)-1]
-		s.sample(last)
+		s.sample(last, 0)
 	} else {
 		// First time sample.
 		s.last = time.Now()
@@ -100,7 +81,7 @@ func (s *Stats) Done() {
 		return
 	}
 	last := s.stack[len(s.stack)-1]
-	s.sample(last)
+	s.sample(last, 1)
 	s.stack = s.stack[:len(s.stack)-1]
 }
 

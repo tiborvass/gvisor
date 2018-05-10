@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package kernel
 
 import (
 	"fmt"
+	"syscall"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
@@ -23,10 +24,21 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 )
 
+// ptrace constants from Linux's include/uapi/linux/ptrace.h.
+const (
+	_PTRACE_EVENT_SECCOMP  = 7
+	PTRACE_SEIZE           = 0x4206
+	PTRACE_INTERRUPT       = 0x4207
+	PTRACE_LISTEN          = 0x4208
+	PTRACE_PEEKSIGINFO     = 0x4209
+	PTRACE_GETSIGMASK      = 0x420a
+	PTRACE_SETSIGMASK      = 0x420b
+	_PTRACE_O_EXITKILL     = 1 << 20
+	_PTRACE_O_TRACESECCOMP = 1 << _PTRACE_EVENT_SECCOMP
+)
+
 // ptraceOptions are the subset of options controlling a task's ptrace behavior
 // that are set by ptrace(PTRACE_SETOPTIONS).
-//
-// +stateify savable
 type ptraceOptions struct {
 	// ExitKill is true if the tracee should be sent SIGKILL when the tracer
 	// exits.
@@ -187,8 +199,6 @@ func (t *Task) hasTracer() bool {
 }
 
 // ptraceStop is a TaskStop placed on tasks in a ptrace-stop.
-//
-// +stateify savable
 type ptraceStop struct {
 	// If frozen is true, the stopped task's tracer is currently operating on
 	// it, so Task.Kill should not remove the stop.
@@ -495,7 +505,7 @@ func (t *Task) ptraceSeccomp(data uint16) bool {
 		return false
 	}
 	t.Debugf("Entering PTRACE_EVENT_SECCOMP stop")
-	t.ptraceEventLocked(linux.PTRACE_EVENT_SECCOMP, uint64(data))
+	t.ptraceEventLocked(_PTRACE_EVENT_SECCOMP, uint64(data))
 	return true
 }
 
@@ -577,19 +587,19 @@ func (t *Task) ptraceClone(kind ptraceCloneKind, child *Task, opts *CloneOptions
 		case ptraceCloneKindClone:
 			if t.ptraceOpts.TraceClone {
 				t.Debugf("Entering PTRACE_EVENT_CLONE stop")
-				t.ptraceEventLocked(linux.PTRACE_EVENT_CLONE, uint64(t.tg.pidns.tids[child]))
+				t.ptraceEventLocked(syscall.PTRACE_EVENT_CLONE, uint64(t.tg.pidns.tids[child]))
 				event = true
 			}
 		case ptraceCloneKindFork:
 			if t.ptraceOpts.TraceFork {
 				t.Debugf("Entering PTRACE_EVENT_FORK stop")
-				t.ptraceEventLocked(linux.PTRACE_EVENT_FORK, uint64(t.tg.pidns.tids[child]))
+				t.ptraceEventLocked(syscall.PTRACE_EVENT_FORK, uint64(t.tg.pidns.tids[child]))
 				event = true
 			}
 		case ptraceCloneKindVfork:
 			if t.ptraceOpts.TraceVfork {
 				t.Debugf("Entering PTRACE_EVENT_VFORK stop")
-				t.ptraceEventLocked(linux.PTRACE_EVENT_VFORK, uint64(t.tg.pidns.tids[child]))
+				t.ptraceEventLocked(syscall.PTRACE_EVENT_VFORK, uint64(t.tg.pidns.tids[child]))
 				event = true
 			}
 		default:
@@ -627,7 +637,7 @@ func (t *Task) ptraceClone(kind ptraceCloneKind, child *Task, opts *CloneOptions
 			// running, so we don't have to.
 			child.pendingSignals.enqueue(&arch.SignalInfo{
 				Signo: int32(linux.SIGSTOP),
-			}, nil)
+			})
 			child.tg.signalHandlers.mu.Unlock()
 		}
 	}
@@ -647,7 +657,7 @@ func (t *Task) ptraceVforkDone(child ThreadID) bool {
 		return false
 	}
 	t.Debugf("Entering PTRACE_EVENT_VFORK_DONE stop")
-	t.ptraceEventLocked(linux.PTRACE_EVENT_VFORK_DONE, uint64(child))
+	t.ptraceEventLocked(syscall.PTRACE_EVENT_VFORK_DONE, uint64(child))
 	return true
 }
 
@@ -670,7 +680,7 @@ func (t *Task) ptraceExec(oldTID ThreadID) {
 	}
 	if t.ptraceOpts.TraceExec {
 		t.Debugf("Entering PTRACE_EVENT_EXEC stop")
-		t.ptraceEventLocked(linux.PTRACE_EVENT_EXEC, uint64(oldTID))
+		t.ptraceEventLocked(syscall.PTRACE_EVENT_EXEC, uint64(oldTID))
 		return
 	}
 	// "If the PTRACE_O_TRACEEXEC option is not in effect for the execing
@@ -704,7 +714,7 @@ func (t *Task) ptraceExit() {
 	status := t.exitStatus.Status()
 	t.tg.signalHandlers.mu.Unlock()
 	t.Debugf("Entering PTRACE_EVENT_EXIT stop")
-	t.ptraceEventLocked(linux.PTRACE_EVENT_EXIT, uint64(status))
+	t.ptraceEventLocked(syscall.PTRACE_EVENT_EXIT, uint64(status))
 }
 
 // Preconditions: The TaskSet mutex must be locked.
@@ -752,7 +762,7 @@ func (t *Task) ptraceKill(target *Task) error {
 // Ptrace implements the ptrace system call.
 func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 	// PTRACE_TRACEME ignores all other arguments.
-	if req == linux.PTRACE_TRACEME {
+	if req == syscall.PTRACE_TRACEME {
 		return t.ptraceTraceme()
 	}
 	// All other ptrace requests operate on a current or future tracee
@@ -764,12 +774,12 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 
 	// PTRACE_ATTACH (and PTRACE_SEIZE, which is unimplemented) do not require
 	// that target is not already a tracee.
-	if req == linux.PTRACE_ATTACH {
+	if req == syscall.PTRACE_ATTACH {
 		return t.ptraceAttach(target)
 	}
 	// PTRACE_KILL (and PTRACE_INTERRUPT, which is unimplemented) require that
 	// the target is a tracee, but does not require that it is ptrace-stopped.
-	if req == linux.PTRACE_KILL {
+	if req == syscall.PTRACE_KILL {
 		return t.ptraceKill(target)
 	}
 	// All other ptrace requests require that the target is a ptrace-stopped
@@ -802,37 +812,37 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 
 	// Resuming commands end the ptrace stop, but only if successful.
 	switch req {
-	case linux.PTRACE_DETACH:
+	case syscall.PTRACE_DETACH:
 		if err := t.ptraceDetach(target, linux.Signal(data)); err != nil {
 			target.ptraceUnfreeze()
 			return err
 		}
 		return nil
-	case linux.PTRACE_CONT:
+	case syscall.PTRACE_CONT:
 		if err := target.ptraceUnstop(ptraceSyscallNone, false, linux.Signal(data)); err != nil {
 			target.ptraceUnfreeze()
 			return err
 		}
 		return nil
-	case linux.PTRACE_SYSCALL:
+	case syscall.PTRACE_SYSCALL:
 		if err := target.ptraceUnstop(ptraceSyscallIntercept, false, linux.Signal(data)); err != nil {
 			target.ptraceUnfreeze()
 			return err
 		}
 		return nil
-	case linux.PTRACE_SINGLESTEP:
+	case syscall.PTRACE_SINGLESTEP:
 		if err := target.ptraceUnstop(ptraceSyscallNone, true, linux.Signal(data)); err != nil {
 			target.ptraceUnfreeze()
 			return err
 		}
 		return nil
-	case linux.PTRACE_SYSEMU:
+	case syscall.PTRACE_SYSEMU:
 		if err := target.ptraceUnstop(ptraceSyscallEmu, false, linux.Signal(data)); err != nil {
 			target.ptraceUnfreeze()
 			return err
 		}
 		return nil
-	case linux.PTRACE_SYSEMU_SINGLESTEP:
+	case syscall.PTRACE_SYSEMU_SINGLESTEP:
 		if err := target.ptraceUnstop(ptraceSyscallEmu, true, linux.Signal(data)); err != nil {
 			target.ptraceUnfreeze()
 			return err
@@ -843,7 +853,7 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 	defer target.ptraceUnfreeze()
 
 	switch req {
-	case linux.PTRACE_PEEKTEXT, linux.PTRACE_PEEKDATA:
+	case syscall.PTRACE_PEEKTEXT, syscall.PTRACE_PEEKDATA:
 		// "At the system call level, the PTRACE_PEEKTEXT, PTRACE_PEEKDATA, and
 		// PTRACE_PEEKUSER requests have a different API: they store the result
 		// at the address specified by the data parameter, and the return value
@@ -857,13 +867,13 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		_, err := t.CopyOut(data, word)
 		return err
 
-	case linux.PTRACE_POKETEXT, linux.PTRACE_POKEDATA:
+	case syscall.PTRACE_POKETEXT, syscall.PTRACE_POKEDATA:
 		_, err := usermem.CopyObjectOut(t, target.MemoryManager(), addr, t.Arch().Native(uintptr(data)), usermem.IOOpts{
 			IgnorePermissions: true,
 		})
 		return err
 
-	case linux.PTRACE_PEEKUSR: // aka PTRACE_PEEKUSER
+	case syscall.PTRACE_PEEKUSR: // aka PTRACE_PEEKUSER
 		n, err := target.Arch().PtracePeekUser(uintptr(addr))
 		if err != nil {
 			return err
@@ -871,10 +881,10 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		_, err = t.CopyOut(data, n)
 		return err
 
-	case linux.PTRACE_POKEUSR: // aka PTRACE_POKEUSER
+	case syscall.PTRACE_POKEUSR: // aka PTRACE_POKEUSER
 		return target.Arch().PtracePokeUser(uintptr(addr), uintptr(data))
 
-	case linux.PTRACE_GETREGS:
+	case syscall.PTRACE_GETREGS:
 		// "Copy the tracee's general-purpose ... registers ... to the address
 		// data in the tracer. ... (addr is ignored.) Note that SPARC systems
 		// have the meaning of data and addr reversed ..."
@@ -888,7 +898,7 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		})
 		return err
 
-	case linux.PTRACE_GETFPREGS:
+	case syscall.PTRACE_GETFPREGS:
 		_, err := target.Arch().PtraceGetFPRegs(&usermem.IOReadWriter{
 			Ctx:  t,
 			IO:   t.MemoryManager(),
@@ -899,7 +909,7 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		})
 		return err
 
-	case linux.PTRACE_GETREGSET:
+	case syscall.PTRACE_GETREGSET:
 		// "Read the tracee's registers. addr specifies, in an
 		// architecture-dependent way, the type of registers to be read. ...
 		// data points to a struct iovec, which describes the destination
@@ -921,16 +931,10 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		if err != nil {
 			return err
 		}
-
-		// Update iovecs to represent the range of the written register set.
-		end, ok := ar.Start.AddLength(uint64(n))
-		if !ok {
-			panic(fmt.Sprintf("%#x + %#x overflows. Invalid reg size > %#x", ar.Start, n, ar.Length()))
-		}
-		ar.End = end
+		ar.End -= usermem.Addr(n)
 		return t.CopyOutIovecs(data, usermem.AddrRangeSeqOf(ar))
 
-	case linux.PTRACE_SETREGS:
+	case syscall.PTRACE_SETREGS:
 		_, err := target.Arch().PtraceSetRegs(&usermem.IOReadWriter{
 			Ctx:  t,
 			IO:   t.MemoryManager(),
@@ -941,7 +945,7 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		})
 		return err
 
-	case linux.PTRACE_SETFPREGS:
+	case syscall.PTRACE_SETFPREGS:
 		_, err := target.Arch().PtraceSetFPRegs(&usermem.IOReadWriter{
 			Ctx:  t,
 			IO:   t.MemoryManager(),
@@ -952,7 +956,7 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		})
 		return err
 
-	case linux.PTRACE_SETREGSET:
+	case syscall.PTRACE_SETREGSET:
 		ars, err := t.CopyInIovecs(data, 1)
 		if err != nil {
 			return err
@@ -972,7 +976,7 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		ar.End -= usermem.Addr(n)
 		return t.CopyOutIovecs(data, usermem.AddrRangeSeqOf(ar))
 
-	case linux.PTRACE_GETSIGINFO:
+	case syscall.PTRACE_GETSIGINFO:
 		t.tg.pidns.owner.mu.RLock()
 		defer t.tg.pidns.owner.mu.RUnlock()
 		if target.ptraceSiginfo == nil {
@@ -981,7 +985,7 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		_, err := t.CopyOut(data, target.ptraceSiginfo)
 		return err
 
-	case linux.PTRACE_SETSIGINFO:
+	case syscall.PTRACE_SETSIGINFO:
 		var info arch.SignalInfo
 		if _, err := t.CopyIn(data, &info); err != nil {
 			return err
@@ -994,14 +998,16 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		target.ptraceSiginfo = &info
 		return nil
 
-	case linux.PTRACE_GETSIGMASK:
+	case PTRACE_GETSIGMASK:
 		if addr != linux.SignalSetSize {
 			return syserror.EINVAL
 		}
-		_, err := t.CopyOut(data, target.SignalMask())
+		target.mu.Lock()
+		defer target.mu.Unlock()
+		_, err := t.CopyOut(data, target.tr.SignalMask)
 		return err
 
-	case linux.PTRACE_SETSIGMASK:
+	case PTRACE_SETSIGMASK:
 		if addr != linux.SignalSetSize {
 			return syserror.EINVAL
 		}
@@ -1013,35 +1019,29 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		target.SetSignalMask(mask &^ UnblockableSignals)
 		return nil
 
-	case linux.PTRACE_SETOPTIONS:
+	case syscall.PTRACE_SETOPTIONS:
 		t.tg.pidns.owner.mu.Lock()
 		defer t.tg.pidns.owner.mu.Unlock()
-		validOpts := uintptr(linux.PTRACE_O_EXITKILL |
-			linux.PTRACE_O_TRACESYSGOOD |
-			linux.PTRACE_O_TRACECLONE |
-			linux.PTRACE_O_TRACEEXEC |
-			linux.PTRACE_O_TRACEEXIT |
-			linux.PTRACE_O_TRACEFORK |
-			linux.PTRACE_O_TRACESECCOMP |
-			linux.PTRACE_O_TRACEVFORK |
-			linux.PTRACE_O_TRACEVFORKDONE)
+		validOpts := uintptr(_PTRACE_O_EXITKILL | syscall.PTRACE_O_TRACESYSGOOD | syscall.PTRACE_O_TRACECLONE |
+			syscall.PTRACE_O_TRACEEXEC | syscall.PTRACE_O_TRACEEXIT | syscall.PTRACE_O_TRACEFORK |
+			_PTRACE_O_TRACESECCOMP | syscall.PTRACE_O_TRACEVFORK | syscall.PTRACE_O_TRACEVFORKDONE)
 		if uintptr(data)&^validOpts != 0 {
 			return syserror.EINVAL
 		}
 		target.ptraceOpts = ptraceOptions{
-			ExitKill:       data&linux.PTRACE_O_EXITKILL != 0,
-			SysGood:        data&linux.PTRACE_O_TRACESYSGOOD != 0,
-			TraceClone:     data&linux.PTRACE_O_TRACECLONE != 0,
-			TraceExec:      data&linux.PTRACE_O_TRACEEXEC != 0,
-			TraceExit:      data&linux.PTRACE_O_TRACEEXIT != 0,
-			TraceFork:      data&linux.PTRACE_O_TRACEFORK != 0,
-			TraceSeccomp:   data&linux.PTRACE_O_TRACESECCOMP != 0,
-			TraceVfork:     data&linux.PTRACE_O_TRACEVFORK != 0,
-			TraceVforkDone: data&linux.PTRACE_O_TRACEVFORKDONE != 0,
+			ExitKill:       data&_PTRACE_O_EXITKILL != 0,
+			SysGood:        data&syscall.PTRACE_O_TRACESYSGOOD != 0,
+			TraceClone:     data&syscall.PTRACE_O_TRACECLONE != 0,
+			TraceExec:      data&syscall.PTRACE_O_TRACEEXEC != 0,
+			TraceExit:      data&syscall.PTRACE_O_TRACEEXIT != 0,
+			TraceFork:      data&syscall.PTRACE_O_TRACEFORK != 0,
+			TraceSeccomp:   data&_PTRACE_O_TRACESECCOMP != 0,
+			TraceVfork:     data&syscall.PTRACE_O_TRACEVFORK != 0,
+			TraceVforkDone: data&syscall.PTRACE_O_TRACEVFORKDONE != 0,
 		}
 		return nil
 
-	case linux.PTRACE_GETEVENTMSG:
+	case syscall.PTRACE_GETEVENTMSG:
 		t.tg.pidns.owner.mu.RLock()
 		defer t.tg.pidns.owner.mu.RUnlock()
 		_, err := t.CopyOut(usermem.Addr(data), target.ptraceEventMsg)

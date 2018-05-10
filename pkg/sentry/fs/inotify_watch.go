@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@ package fs
 
 import (
 	"sync"
-	"sync/atomic"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 )
@@ -27,14 +26,15 @@ import (
 // holding an extra ref on each dirent known (by inotify) to point to the
 // inode. These are known as pins. For a full discussion, see
 // fs/g3doc/inotify.md.
-//
-// +stateify savable
 type Watch struct {
 	// Inotify instance which owns this watch.
 	owner *Inotify
 
 	// Descriptor for this watch. This is unique across an inotify instance.
 	wd int32
+
+	// Events being monitored via this watch.
+	mask uint32
 
 	// The inode being watched. Note that we don't directly hold a reference on
 	// this inode. Instead we hold a reference on the dirent(s) containing the
@@ -47,10 +47,6 @@ type Watch struct {
 
 	// mu protects the fields below.
 	mu sync.Mutex `state:"nosave"`
-
-	// Events being monitored via this watch. Must be accessed atomically,
-	// writes are protected by mu.
-	mask uint32
 
 	// pins is the set of dirents this watch is currently pinning in memory by
 	// holding a reference to them. See Pin()/Unpin().
@@ -66,7 +62,7 @@ func (w *Watch) ID() uint64 {
 // should continue to be be notified of events after the target has been
 // unlinked.
 func (w *Watch) NotifyParentAfterUnlink() bool {
-	return atomic.LoadUint32(&w.mask)&linux.IN_EXCL_UNLINK == 0
+	return w.mask&linux.IN_EXCL_UNLINK == 0
 }
 
 // isRenameEvent returns true if eventMask describes a rename event.
@@ -76,17 +72,15 @@ func isRenameEvent(eventMask uint32) bool {
 
 // Notify queues a new event on this watch.
 func (w *Watch) Notify(name string, events uint32, cookie uint32) {
-	mask := atomic.LoadUint32(&w.mask)
-	if mask&events == 0 {
+	unmaskableBits := ^uint32(0) &^ linux.IN_ALL_EVENTS
+	effectiveMask := unmaskableBits | w.mask
+	matchedEvents := effectiveMask & events
+
+	if matchedEvents == 0 {
 		// We weren't watching for this event.
 		return
 	}
 
-	// Event mask should include bits matched from the watch plus all control
-	// event bits.
-	unmaskableBits := ^uint32(0) &^ linux.IN_ALL_EVENTS
-	effectiveMask := unmaskableBits | mask
-	matchedEvents := effectiveMask & events
 	w.owner.queueEvent(newEvent(w.wd, name, matchedEvents, cookie))
 }
 

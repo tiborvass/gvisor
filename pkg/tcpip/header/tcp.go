@@ -1,23 +1,12 @@
-// Copyright 2018 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Netstack Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 package header
 
 import (
 	"encoding/binary"
 
-	"github.com/google/btree"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip/seqnum"
 )
@@ -121,8 +110,6 @@ type TCPSynOptions struct {
 }
 
 // SACKBlock represents a single contiguous SACK block.
-//
-// +stateify savable
 type SACKBlock struct {
 	// Start indicates the lowest sequence number in the block.
 	Start seqnum.Value
@@ -132,20 +119,8 @@ type SACKBlock struct {
 	End seqnum.Value
 }
 
-// Less returns true if r.Start < b.Start.
-func (r SACKBlock) Less(b btree.Item) bool {
-	return r.Start.LessThan(b.(SACKBlock).Start)
-}
-
-// Contains returns true if b is completely contained in r.
-func (r SACKBlock) Contains(b SACKBlock) bool {
-	return r.Start.LessThanEq(b.Start) && b.End.LessThanEq(r.End)
-}
-
 // TCPOptions are used to parse and cache the TCP segment options for a non
 // syn/syn-ack segment.
-//
-// +stateify savable
 type TCPOptions struct {
 	// TS is true if the TimeStamp option is enabled.
 	TS bool

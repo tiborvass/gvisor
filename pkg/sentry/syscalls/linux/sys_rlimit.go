@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -90,7 +90,6 @@ var setableLimits = map[limits.LimitType]struct{}{
 	limits.CPU:           {},
 	limits.Data:          {},
 	limits.FileSize:      {},
-	limits.MemoryLocked:  {},
 	limits.Stack:         {},
 	// These are not enforced, but we include them here to avoid returning
 	// EPERM, since some apps expect them to succeed.
@@ -112,7 +111,7 @@ func prlimit64(t *kernel.Task, resource limits.LimitType, newLim *limits.Limit) 
 	}
 
 	if resource == limits.CPU {
-		t.NotifyRlimitCPUUpdated()
+		t.ThreadGroup().SetCPUTimer(newLim)
 	}
 	return oldLim, nil
 }

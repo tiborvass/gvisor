@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,43 +46,19 @@ func (f FDs) Less(i, j int) bool {
 }
 
 // FDFlags define flags for an individual descriptor.
-//
-// +stateify savable
 type FDFlags struct {
 	// CloseOnExec indicates the descriptor should be closed on exec.
 	CloseOnExec bool
 }
 
-// ToLinuxFileFlags converts a kernel.FDFlags object to a Linux file flags
-// representation.
-func (f FDFlags) ToLinuxFileFlags() (mask uint) {
-	if f.CloseOnExec {
-		mask |= linux.O_CLOEXEC
-	}
-	return
-}
-
-// ToLinuxFDFlags converts a kernel.FDFlags object to a Linux descriptor flags
-// representation.
-func (f FDFlags) ToLinuxFDFlags() (mask uint) {
-	if f.CloseOnExec {
-		mask |= linux.FD_CLOEXEC
-	}
-	return
-}
-
 // descriptor holds the details about a file descriptor, namely a pointer the
 // file itself and the descriptor flags.
-//
-// +stateify savable
 type descriptor struct {
 	file  *fs.File
 	flags FDFlags
 }
 
 // FDMap is used to manage File references and flags.
-//
-// +stateify savable
 type FDMap struct {
 	refs.AtomicRefCount
 	k     *Kernel

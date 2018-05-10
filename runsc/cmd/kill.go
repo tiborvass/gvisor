@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,24 +15,21 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 	"strings"
 	"syscall"
 
+	"context"
 	"flag"
 	"github.com/google/subcommands"
 	"golang.org/x/sys/unix"
 	"gvisor.googlesource.com/gvisor/runsc/boot"
-	"gvisor.googlesource.com/gvisor/runsc/container"
+	"gvisor.googlesource.com/gvisor/runsc/sandbox"
 )
 
 // Kill implements subcommands.Command for the "kill" command.
-type Kill struct {
-	all bool
-	pid int
-}
+type Kill struct{}
 
 // Name implements subcommands.Command.Name.
 func (*Kill) Name() string {
@@ -41,7 +38,7 @@ func (*Kill) Name() string {
 
 // Synopsis implements subcommands.Command.Synopsis.
 func (*Kill) Synopsis() string {
-	return "sends a signal to the container"
+	return "sends a signal to the sandbox"
 }
 
 // Usage implements subcommands.Command.Usage.
@@ -50,13 +47,15 @@ func (*Kill) Usage() string {
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
-func (k *Kill) SetFlags(f *flag.FlagSet) {
-	f.BoolVar(&k.all, "all", false, "send the specified signal to all processes inside the container")
-	f.IntVar(&k.pid, "pid", 0, "send the specified signal to a specific process")
+func (*Kill) SetFlags(f *flag.FlagSet) {
+	// TODO: Implement this flag.  It is defined here just to
+	// prevent runsc from crashing if it is passed.
+	var all bool
+	f.BoolVar(&all, "all", false, "send the specified signal to all processes inside the container")
 }
 
 // Execute implements subcommands.Command.Execute.
-func (k *Kill) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (*Kill) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
 	if f.NArg() == 0 || f.NArg() > 2 {
 		f.Usage()
 		return subcommands.ExitUsageError
@@ -65,19 +64,15 @@ func (k *Kill) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 	id := f.Arg(0)
 	conf := args[0].(*boot.Config)
 
-	if k.pid != 0 && k.all {
-		Fatalf("it is invalid to specify both --all and --pid")
-	}
-
-	c, err := container.Load(conf.RootDir, id)
+	s, err := sandbox.Load(conf.RootDir, id)
 	if err != nil {
-		Fatalf("loading container: %v", err)
+		Fatalf("error loading sandbox: %v", err)
 	}
 
 	// The OCI command-line spec says that the signal should be specified
 	// via a flag, but runc (and things that call runc) pass it as an
 	// argument.
-	signal := f.Arg(1)
+	signal := f.Arg(2)
 	if signal == "" {
 		signal = "TERM"
 	}
@@ -86,15 +81,8 @@ func (k *Kill) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 	if err != nil {
 		Fatalf("%v", err)
 	}
-
-	if k.pid != 0 {
-		if err := c.SignalProcess(sig, int32(k.pid)); err != nil {
-			Fatalf("failed to signal pid %d: %v", k.pid, err)
-		}
-	} else {
-		if err := c.SignalContainer(sig, k.all); err != nil {
-			Fatalf("%v", err)
-		}
+	if err := s.Signal(sig); err != nil {
+		Fatalf("%v", err)
 	}
 	return subcommands.ExitSuccess
 }

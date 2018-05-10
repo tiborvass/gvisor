@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-// +build amd64
 
 package arch
 
@@ -27,9 +25,6 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/limits"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 )
-
-// Host specifies the host architecture.
-const Host = AMD64
 
 // These constants come directly from Linux.
 const (
@@ -100,8 +95,6 @@ const (
 )
 
 // context64 represents an AMD64 context.
-//
-// +stateify savable
 type context64 struct {
 	State
 	sigFPState []x86FPState // fpstate to be restored on sigreturn.
@@ -156,22 +149,6 @@ func (c *context64) Stack() uintptr {
 // SetStack sets the current stack pointer.
 func (c *context64) SetStack(value uintptr) {
 	c.Regs.Rsp = uint64(value)
-}
-
-// TLS returns the current TLS pointer.
-func (c *context64) TLS() uintptr {
-	return uintptr(c.Regs.Fs_base)
-}
-
-// SetTLS sets the current TLS pointer. Returns false if value is invalid.
-func (c *context64) SetTLS(value uintptr) bool {
-	if !isValidSegmentBase(uint64(value)) {
-		return false
-	}
-
-	c.Regs.Fs = 0
-	c.Regs.Fs_base = uint64(value)
-	return true
 }
 
 // SetRSEQInterruptedIP implements Context.SetRSEQInterruptedIP.

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +15,6 @@
 package kernel
 
 import (
-	"fmt"
-
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
@@ -35,11 +33,13 @@ const SignalPanic = linux.SIGUSR2
 //
 // context is used only for debugging to differentiate these cases.
 //
-// Preconditions: Kernel must have an init process.
-func (k *Kernel) sendExternalSignal(info *arch.SignalInfo, context string) {
+// Returns false if signal could not be sent because the Kernel is not fully
+// initialized yet.
+func (k *Kernel) sendExternalSignal(info *arch.SignalInfo, context string) bool {
 	switch linux.Signal(info.Signo) {
 	case platform.SignalInterrupt:
 		// Assume that a call to platform.Context.Interrupt() misfired.
+		return true
 
 	case SignalPanic:
 		// SignalPanic is also specially handled in sentry setup to ensure that
@@ -50,10 +50,13 @@ func (k *Kernel) sendExternalSignal(info *arch.SignalInfo, context string) {
 	default:
 		log.Infof("Received external signal %d in %s context", info.Signo, context)
 		if k.globalInit == nil {
-			panic(fmt.Sprintf("Received external signal %d before init created", info.Signo))
+			log.Warningf("Received external signal %d before init created", info.Signo)
+			return false
 		}
 		k.globalInit.SendSignal(info)
 	}
+
+	return true
 }
 
 // sigPriv returns a SignalInfo representing a signal sent by the sentry. (The

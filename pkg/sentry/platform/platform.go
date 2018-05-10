@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -133,8 +133,7 @@ type Context interface {
 	// - ErrContextSignal: The Context was interrupted by a signal. The
 	// returned *arch.SignalInfo contains information about the signal. If
 	// arch.SignalInfo.Signo == SIGSEGV, the returned usermem.AccessType
-	// contains the access type of the triggering fault. The caller owns
-	// the returned SignalInfo.
+	// contains the access type of the triggering fault.
 	//
 	// - ErrContextInterrupt: The Context was interrupted by a call to
 	// Interrupt(). Switch() may return ErrContextInterrupt spuriously. In
@@ -154,13 +153,6 @@ var (
 	// ErrContextSignal is returned by Context.Switch() to indicate that the
 	// Context was interrupted by a signal.
 	ErrContextSignal = fmt.Errorf("interrupted by signal")
-
-	// ErrContextSignalCPUID is equivalent to ErrContextSignal, except that
-	// a check should be done for execution of the CPUID instruction. If
-	// the current instruction pointer is a CPUID instruction, then this
-	// should be emulated appropriately. If not, then the given signal
-	// should be handled per above.
-	ErrContextSignalCPUID = fmt.Errorf("interrupted by signal, possible CPUID")
 
 	// ErrContextInterrupt is returned by Context.Switch() to indicate that the
 	// Context was interrupted by a call to Context.Interrupt().
@@ -213,7 +205,7 @@ type AddressSpace interface {
 
 	// Release releases this address space. After releasing, a new AddressSpace
 	// must be acquired via platform.NewAddressSpace().
-	Release()
+	Release() error
 
 	// AddressSpaceIO methods are supported iff the associated platform's
 	// Platform.SupportsAddressSpaceIO() == true. AddressSpaces for which this
@@ -313,8 +305,8 @@ type File interface {
 	MapInto(as AddressSpace, addr usermem.Addr, fr FileRange, at usermem.AccessType, precommit bool) error
 
 	// MapInternal returns a mapping of the given file offsets in the invoking
-	// process' address space for reading and writing. The returned mapping is
-	// valid as long as a reference is held on the mapped range.
+	// process' address space for reading and writing. The lifetime of the
+	// returned mapping is implementation-defined.
 	//
 	// Note that fr.Start and fr.End need not be page-aligned.
 	//

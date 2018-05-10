@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -44,7 +44,8 @@ import (
 //
 // CachingInodeOperations implements Mappable for the CachedFileObject:
 //
-// - If CachedFileObject.FD returns a value >= 0 then the file descriptor
+// - If CachedFileObject.FD returns a value >= 0 and the current platform shares
+//   a host fd table with the sentry, then the value of CachedFileObject.FD
 //   will be memory mapped on the host.
 //
 // - Otherwise, the contents of CachedFileObject are buffered into memory
@@ -55,8 +56,6 @@ import (
 //
 // Implementations of InodeOperations.WriteOut must call Sync to write out
 // in-memory modifications of data and metadata to the CachedFileObject.
-//
-// +stateify savable
 type CachingInodeOperations struct {
 	// backingFile is a handle to a cached file object.
 	backingFile CachedFileObject
@@ -180,9 +179,8 @@ func (c *CachingInodeOperations) Release() {
 // UnstableAttr implements fs.InodeOperations.UnstableAttr.
 func (c *CachingInodeOperations) UnstableAttr(ctx context.Context, inode *fs.Inode) (fs.UnstableAttr, error) {
 	c.attrMu.Lock()
-	attr := c.attr
-	c.attrMu.Unlock()
-	return attr, nil
+	defer c.attrMu.Unlock()
+	return c.attr, nil
 }
 
 // SetPermissions implements fs.InodeOperations.SetPermissions.
@@ -427,47 +425,6 @@ func (c *CachingInodeOperations) touchStatusChangeTimeLocked(ctx context.Context
 	c.dirtyAttr.StatusChangeTime = true
 }
 
-// UpdateUnstable updates the cached unstable attributes. Only non-dirty
-// attributes are updated.
-func (c *CachingInodeOperations) UpdateUnstable(attr fs.UnstableAttr) {
-	// All attributes are protected by attrMu.
-	c.attrMu.Lock()
-
-	if !c.dirtyAttr.Usage {
-		c.attr.Usage = attr.Usage
-	}
-	if !c.dirtyAttr.Perms {
-		c.attr.Perms = attr.Perms
-	}
-	if !c.dirtyAttr.UID {
-		c.attr.Owner.UID = attr.Owner.UID
-	}
-	if !c.dirtyAttr.GID {
-		c.attr.Owner.GID = attr.Owner.GID
-	}
-	if !c.dirtyAttr.AccessTime {
-		c.attr.AccessTime = attr.AccessTime
-	}
-	if !c.dirtyAttr.ModificationTime {
-		c.attr.ModificationTime = attr.ModificationTime
-	}
-	if !c.dirtyAttr.StatusChangeTime {
-		c.attr.StatusChangeTime = attr.StatusChangeTime
-	}
-	if !c.dirtyAttr.Links {
-		c.attr.Links = attr.Links
-	}
-
-	// Size requires holding attrMu and dataMu.
-	c.dataMu.Lock()
-	if !c.dirtyAttr.Size {
-		c.attr.Size = attr.Size
-	}
-	c.dataMu.Unlock()
-
-	c.attrMu.Unlock()
-}
-
 // Read reads from frames and otherwise directly from the backing file
 // into dst starting at offset until dst is full, EOF is reached, or an
 // error is encountered.
@@ -506,17 +463,15 @@ func (c *CachingInodeOperations) Read(ctx context.Context, file *fs.File, dst us
 //
 // If Write partially fills src, a non-nil error is returned.
 func (c *CachingInodeOperations) Write(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
-	// Hot path. Avoid defers.
 	if src.NumBytes() == 0 {
 		return 0, nil
 	}
 
 	c.attrMu.Lock()
+	defer c.attrMu.Unlock()
 	// Compare Linux's mm/filemap.c:__generic_file_write_iter() => file_update_time().
 	c.touchModificationTimeLocked(ctx)
-	n, err := src.CopyInTo(ctx, &inodeReadWriter{ctx, c, offset})
-	c.attrMu.Unlock()
-	return n, err
+	return src.CopyInTo(ctx, &inodeReadWriter{ctx, c, offset})
 }
 
 type inodeReadWriter struct {
@@ -527,17 +482,15 @@ type inodeReadWriter struct {
 
 // ReadToBlocks implements safemem.Reader.ReadToBlocks.
 func (rw *inodeReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
-	// Hot path. Avoid defers.
 	rw.c.dataMu.RLock()
+	defer rw.c.dataMu.RUnlock()
 
 	// Compute the range to read.
 	if rw.offset >= rw.c.attr.Size {
-		rw.c.dataMu.RUnlock()
 		return 0, io.EOF
 	}
 	end := fs.ReadEndOffset(rw.offset, int64(dsts.NumBytes()), rw.c.attr.Size)
 	if end == rw.offset { // dsts.NumBytes() == 0?
-		rw.c.dataMu.RUnlock()
 		return 0, nil
 	}
 
@@ -551,7 +504,6 @@ func (rw *inodeReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 			// Get internal mappings from the cache.
 			ims, err := mem.MapInternal(seg.FileRangeOf(seg.Range().Intersect(mr)), usermem.Read)
 			if err != nil {
-				rw.c.dataMu.RUnlock()
 				return done, err
 			}
 
@@ -561,7 +513,6 @@ func (rw *inodeReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 			rw.offset += int64(n)
 			dsts = dsts.DropFirst64(n)
 			if err != nil {
-				rw.c.dataMu.RUnlock()
 				return done, err
 			}
 
@@ -578,7 +529,6 @@ func (rw *inodeReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 			dsts = dsts.DropFirst64(n)
 			// Partial reads are fine. But we must stop reading.
 			if n != dst.NumBytes() || err != nil {
-				rw.c.dataMu.RUnlock()
 				return done, err
 			}
 
@@ -589,43 +539,37 @@ func (rw *inodeReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 			break
 		}
 	}
-	rw.c.dataMu.RUnlock()
 	return done, nil
-}
-
-// maybeGrowFile grows the file's size if data has been written past the old
-// size.
-//
-// Preconditions: rw.c.attrMu and rw.c.dataMu bust be locked.
-func (rw *inodeReadWriter) maybeGrowFile() {
-	// If the write ends beyond the file's previous size, it causes the
-	// file to grow.
-	if rw.offset > rw.c.attr.Size {
-		rw.c.attr.Size = rw.offset
-		rw.c.dirtyAttr.Size = true
-	}
-	if rw.offset > rw.c.attr.Usage {
-		// This is incorrect if CachingInodeOperations is caching a sparse
-		// file. (In Linux, keeping inode::i_blocks up to date is the
-		// filesystem's responsibility.)
-		rw.c.attr.Usage = rw.offset
-		rw.c.dirtyAttr.Usage = true
-	}
 }
 
 // WriteFromBlocks implements safemem.Writer.WriteFromBlocks.
 //
 // Preconditions: rw.c.attrMu must be locked.
 func (rw *inodeReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, error) {
-	// Hot path. Avoid defers.
 	rw.c.dataMu.Lock()
+	defer rw.c.dataMu.Unlock()
 
 	// Compute the range to write.
 	end := fs.WriteEndOffset(rw.offset, int64(srcs.NumBytes()))
 	if end == rw.offset { // srcs.NumBytes() == 0?
-		rw.c.dataMu.Unlock()
 		return 0, nil
 	}
+
+	defer func() {
+		// If the write ends beyond the file's previous size, it causes the
+		// file to grow.
+		if rw.offset > rw.c.attr.Size {
+			rw.c.attr.Size = rw.offset
+			rw.c.dirtyAttr.Size = true
+		}
+		if rw.offset > rw.c.attr.Usage {
+			// This is incorrect if CachingInodeOperations is caching a sparse
+			// file. (In Linux, keeping inode::i_blocks up to date is the
+			// filesystem's responsibility.)
+			rw.c.attr.Usage = rw.offset
+			rw.c.dirtyAttr.Usage = true
+		}
+	}()
 
 	mem := rw.c.platform.Memory()
 	var done uint64
@@ -638,8 +582,6 @@ func (rw *inodeReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, error
 			segMR := seg.Range().Intersect(mr)
 			ims, err := mem.MapInternal(seg.FileRangeOf(segMR), usermem.Write)
 			if err != nil {
-				rw.maybeGrowFile()
-				rw.c.dataMu.Unlock()
 				return done, err
 			}
 
@@ -650,8 +592,6 @@ func (rw *inodeReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, error
 			srcs = srcs.DropFirst64(n)
 			rw.c.dirty.MarkDirty(segMR)
 			if err != nil {
-				rw.maybeGrowFile()
-				rw.c.dataMu.Unlock()
 				return done, err
 			}
 
@@ -668,8 +608,6 @@ func (rw *inodeReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, error
 			srcs = srcs.DropFirst64(n)
 			// Partial writes are fine. But we must stop writing.
 			if n != src.NumBytes() || err != nil {
-				rw.maybeGrowFile()
-				rw.c.dataMu.Unlock()
 				return done, err
 			}
 
@@ -680,16 +618,14 @@ func (rw *inodeReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, error
 			break
 		}
 	}
-	rw.maybeGrowFile()
-	rw.c.dataMu.Unlock()
 	return done, nil
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
-func (c *CachingInodeOperations) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64, writable bool) error {
-	// Hot path. Avoid defers.
+func (c *CachingInodeOperations) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) error {
 	c.mapsMu.Lock()
-	mapped := c.mappings.AddMapping(ms, ar, offset, writable)
+	defer c.mapsMu.Unlock()
+	mapped := c.mappings.AddMapping(ms, ar, offset)
 	// Do this unconditionally since whether we have c.backingFile.FD() >= 0
 	// can change across save/restore.
 	for _, r := range mapped {
@@ -700,15 +636,14 @@ func (c *CachingInodeOperations) AddMapping(ctx context.Context, ms memmap.Mappi
 			usage.MemoryAccounting.Inc(r.Length(), usage.Mapped)
 		}
 	}
-	c.mapsMu.Unlock()
 	return nil
 }
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
-func (c *CachingInodeOperations) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64, writable bool) {
-	// Hot path. Avoid defers.
+func (c *CachingInodeOperations) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) {
 	c.mapsMu.Lock()
-	unmapped := c.mappings.RemoveMapping(ms, ar, offset, writable)
+	defer c.mapsMu.Unlock()
+	unmapped := c.mappings.RemoveMapping(ms, ar, offset)
 	for _, r := range unmapped {
 		c.hostFileMapper.DecRefOn(r)
 	}
@@ -718,7 +653,6 @@ func (c *CachingInodeOperations) RemoveMapping(ctx context.Context, ms memmap.Ma
 				usage.MemoryAccounting.Dec(r.Length(), usage.Mapped)
 			}
 		}
-		c.mapsMu.Unlock()
 		return
 	}
 
@@ -727,6 +661,7 @@ func (c *CachingInodeOperations) RemoveMapping(ctx context.Context, ms memmap.Ma
 	// strategy.
 	mem := c.platform.Memory()
 	c.dataMu.Lock()
+	defer c.dataMu.Unlock()
 	for _, r := range unmapped {
 		if err := SyncDirty(ctx, r, &c.cache, &c.dirty, uint64(c.attr.Size), c.platform.Memory(), c.backingFile.WriteFromBlocksAt); err != nil {
 			log.Warningf("Failed to writeback cached data %v: %v", r, err)
@@ -734,18 +669,15 @@ func (c *CachingInodeOperations) RemoveMapping(ctx context.Context, ms memmap.Ma
 		c.cache.Drop(r, mem)
 		c.dirty.KeepClean(r)
 	}
-	c.dataMu.Unlock()
-	c.mapsMu.Unlock()
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
-func (c *CachingInodeOperations) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64, writable bool) error {
-	return c.AddMapping(ctx, ms, dstAR, offset, writable)
+func (c *CachingInodeOperations) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64) error {
+	return c.AddMapping(ctx, ms, dstAR, offset)
 }
 
 // Translate implements memmap.Mappable.Translate.
 func (c *CachingInodeOperations) Translate(ctx context.Context, required, optional memmap.MappableRange, at usermem.AccessType) ([]memmap.Translation, error) {
-	// Hot path. Avoid defer.
 	if !c.forcePageCache && c.backingFile.FD() >= 0 {
 		return []memmap.Translation{
 			{
@@ -757,6 +689,7 @@ func (c *CachingInodeOperations) Translate(ctx context.Context, required, option
 	}
 
 	c.dataMu.Lock()
+	defer c.dataMu.Unlock()
 
 	// Constrain translations to c.attr.Size (rounded up) to prevent
 	// translation to pages that may be concurrently truncated.
@@ -764,7 +697,6 @@ func (c *CachingInodeOperations) Translate(ctx context.Context, required, option
 	var beyondEOF bool
 	if required.End > pgend {
 		if required.Start >= pgend {
-			c.dataMu.Unlock()
 			return nil, &memmap.BusError{io.EOF}
 		}
 		beyondEOF = true
@@ -793,8 +725,6 @@ func (c *CachingInodeOperations) Translate(ctx context.Context, required, option
 		}
 		translatedEnd = segMR.End
 	}
-
-	c.dataMu.Unlock()
 
 	// Don't return the error returned by c.cache.Fill if it occurred outside
 	// of required.
@@ -867,8 +797,9 @@ func (c *CachingInodeOperations) MapInternal(fr platform.FileRange, at usermem.A
 // underlying host fd and CachingInodeOperations is used as the platform.File
 // during translation.
 func (c *CachingInodeOperations) IncRef(fr platform.FileRange) {
-	// Hot path. Avoid defers.
 	c.dataMu.Lock()
+	defer c.dataMu.Unlock()
+
 	seg, gap := c.refs.Find(fr.Start)
 	for {
 		switch {
@@ -884,7 +815,6 @@ func (c *CachingInodeOperations) IncRef(fr platform.FileRange) {
 			seg, gap = c.refs.InsertWithoutMerging(gap, newRange, 1).NextNonEmpty()
 		default:
 			c.refs.MergeAdjacent(fr)
-			c.dataMu.Unlock()
 			return
 		}
 	}
@@ -894,8 +824,9 @@ func (c *CachingInodeOperations) IncRef(fr platform.FileRange) {
 // underlying host fd and CachingInodeOperations is used as the platform.File
 // during translation.
 func (c *CachingInodeOperations) DecRef(fr platform.FileRange) {
-	// Hot path. Avoid defers.
 	c.dataMu.Lock()
+	defer c.dataMu.Unlock()
+
 	seg := c.refs.FindSegment(fr.Start)
 
 	for seg.Ok() && seg.Start() < fr.End {
@@ -911,6 +842,4 @@ func (c *CachingInodeOperations) DecRef(fr platform.FileRange) {
 		}
 	}
 	c.refs.MergeAdjacent(fr)
-	c.dataMu.Unlock()
-
 }

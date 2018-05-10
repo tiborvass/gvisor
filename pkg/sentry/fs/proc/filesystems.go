@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,14 +18,11 @@ import (
 	"bytes"
 	"fmt"
 
-	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/proc/seqfile"
 )
 
 // filesystemsData backs /proc/filesystems.
-//
-// +stateify savable
 type filesystemsData struct{}
 
 // NeedsUpdate returns true on the first generation. The set of registered file
@@ -36,7 +33,7 @@ func (*filesystemsData) NeedsUpdate(generation int64) bool {
 
 // ReadSeqFileData returns data for the SeqFile reader.
 // SeqData, the current generation and where in the file the handle corresponds to.
-func (*filesystemsData) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
+func (*filesystemsData) ReadSeqFileData(h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
 	// We don't ever expect to see a non-nil SeqHandle.
 	if h != nil {
 		return nil, 0
@@ -45,9 +42,6 @@ func (*filesystemsData) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle
 	// Generate the file contents.
 	var buf bytes.Buffer
 	for _, sys := range fs.GetFilesystems() {
-		if !sys.AllowUserList() {
-			continue
-		}
 		nodev := "nodev"
 		if sys.Flags()&fs.FilesystemRequiresDev != 0 {
 			nodev = ""

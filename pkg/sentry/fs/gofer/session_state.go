@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,19 +18,9 @@ import (
 	"fmt"
 
 	"gvisor.googlesource.com/gvisor/pkg/p9"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/unet"
 )
-
-// beforeSave is invoked by stateify.
-func (s *session) beforeSave() {
-	if s.endpoints != nil {
-		if err := s.fillPathMap(); err != nil {
-			panic("failed to save paths to endpoint map before saving" + err.Error())
-		}
-	}
-}
 
 // afterLoad is invoked by stateify.
 func (s *session) afterLoad() {
@@ -73,9 +63,6 @@ func (s *session) afterLoad() {
 	if opts.aname != s.aname {
 		panic(fmt.Sprintf("new attach name %v, want %v", opts.aname, s.aname))
 	}
-
-	// Check if endpointMaps exist when uds sockets are enabled
-	// (only pathmap will actualy have been saved).
 	if opts.privateunixsocket != (s.endpoints != nil) {
 		panic(fmt.Sprintf("new privateunixsocket option %v, want %v", opts.privateunixsocket, s.endpoints != nil))
 	}
@@ -84,13 +71,13 @@ func (s *session) afterLoad() {
 	}
 
 	// Manually restore the connection.
-	conn, err := unet.NewSocket(opts.fd)
+	s.conn, err = unet.NewSocket(opts.fd)
 	if err != nil {
 		panic(fmt.Sprintf("failed to create Socket for FD %d: %v", opts.fd, err))
 	}
 
 	// Manually restore the client.
-	s.client, err = p9.NewClient(conn, s.msize, s.version)
+	s.client, err = p9.NewClient(s.conn, s.msize, s.version)
 	if err != nil {
 		panic(fmt.Sprintf("failed to connect client to server: %v", err))
 	}
@@ -100,16 +87,4 @@ func (s *session) afterLoad() {
 	if err != nil {
 		panic(fmt.Sprintf("failed to attach to aname: %v", err))
 	}
-
-	// If private unix sockets are enabled, create and fill the session's endpoint
-	// maps.
-	if opts.privateunixsocket {
-		// TODO: Context is not plumbed to save/restore.
-		ctx := &dummyClockContext{context.Background()}
-
-		if err = s.restoreEndpointMaps(ctx); err != nil {
-			panic("failed to restore endpoint maps: " + err.Error())
-		}
-	}
-
 }

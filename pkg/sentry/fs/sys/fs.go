@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,11 +20,7 @@ import (
 )
 
 // filesystem is a sysfs.
-//
-// +stateify savable
 type filesystem struct{}
-
-var _ fs.Filesystem = (*filesystem)(nil)
 
 func init() {
 	fs.RegisterFilesystem(&filesystem{})
@@ -41,11 +37,6 @@ func (*filesystem) Name() string {
 
 // AllowUserMount allows users to mount(2) this file system.
 func (*filesystem) AllowUserMount() bool {
-	return true
-}
-
-// AllowUserList allows this filesystem to be listed in /proc/filesystems.
-func (*filesystem) AllowUserList() bool {
 	return true
 }
 

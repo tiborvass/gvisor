@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -43,8 +43,8 @@ func xsave(*byte)
 // xsaveopt uses xsaveopt to save floating point state.
 func xsaveopt(*byte)
 
-// WriteFS sets the GS address (set by init).
-var WriteFS func(addr uintptr)
+// wrfs sets the GS address (set by init).
+var wrfs func(addr uintptr)
 
 // wrfsbase writes to the GS base address.
 func wrfsbase(addr uintptr)
@@ -52,8 +52,8 @@ func wrfsbase(addr uintptr)
 // wrfsmsr writes to the GS_BASE MSR.
 func wrfsmsr(addr uintptr)
 
-// WriteGS sets the GS address (set by init).
-var WriteGS func(addr uintptr)
+// wrgs sets the GS address (set by init).
+var wrgs func(addr uintptr)
 
 // wrgsbase writes to the GS base address.
 func wrgsbase(addr uintptr)
@@ -63,9 +63,6 @@ func wrgsmsr(addr uintptr)
 
 // writeCR3 writes the CR3 value.
 func writeCR3(phys uintptr)
-
-// readCR3 reads the current CR3 value.
-func readCR3() uintptr
 
 // readCR2 reads the current CR2 value.
 func readCR2() uintptr
@@ -122,10 +119,10 @@ func Init(featureSet *cpuid.FeatureSet) {
 		LoadFloatingPoint = fxrstor
 	}
 	if hasFSGSBASE {
-		WriteFS = wrfsbase
-		WriteGS = wrgsbase
+		wrfs = wrfsbase
+		wrgs = wrgsbase
 	} else {
-		WriteFS = wrfsmsr
-		WriteGS = wrgsmsr
+		wrfs = wrfsmsr
+		wrgs = wrgsmsr
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -76,7 +76,7 @@ func Execve(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	envvAddr := args[2].Pointer()
 
 	// Extract our arguments.
-	filename, err := t.CopyInString(filenameAddr, linux.PATH_MAX)
+	filename, err := t.CopyInString(filenameAddr, syscall.PathMax)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -103,10 +103,9 @@ func Execve(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	defer wd.DecRef()
 
 	// Load the new TaskContext.
-	maxTraversals := uint(linux.MaxSymlinkTraversals)
-	tc, se := t.Kernel().LoadTaskImage(t, t.MountNamespace(), root, wd, &maxTraversals, filename, argv, envv, t.Arch().FeatureSet())
-	if se != nil {
-		return 0, nil, se.ToError()
+	tc, err := t.Kernel().LoadTaskImage(t, t.MountNamespace(), root, wd, linux.MaxSymlinkTraversals, filename, argv, envv, t.Arch().FeatureSet())
+	if err != nil {
+		return 0, nil, err
 	}
 
 	ctrl, err := t.Execve(tc)
@@ -160,8 +159,8 @@ func clone(t *kernel.Task, flags int, stack usermem.Addr, parentTID usermem.Addr
 }
 
 // Clone implements linux syscall clone(2).
-// sys_clone has so many flavors. We implement the default one in linux 3.11
-// x86_64:
+// sys_clone has so many flavors. We implement the default one in the
+// current linux 3.11 x86_64:
 //    sys_clone(clone_flags, newsp, parent_tidptr, child_tidptr, tls_val)
 func Clone(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	flags := int(args[0].Int())

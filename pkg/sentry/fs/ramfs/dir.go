@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,12 +18,11 @@ import (
 	"sync"
 	"syscall"
 
-	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/fsutil"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 )
 
 // CreateOps represents operations to create different file types.
@@ -38,27 +37,15 @@ type CreateOps struct {
 	NewSymlink func(ctx context.Context, dir *fs.Inode, target string) (*fs.Inode, error)
 
 	// NewBoundEndpoint creates a new socket.
-	NewBoundEndpoint func(ctx context.Context, dir *fs.Inode, ep transport.BoundEndpoint, perms fs.FilePermissions) (*fs.Inode, error)
+	NewBoundEndpoint func(ctx context.Context, dir *fs.Inode, ep unix.BoundEndpoint, perms fs.FilePermissions) (*fs.Inode, error)
 
 	// NewFifo creates a new fifo.
 	NewFifo func(ctx context.Context, dir *fs.Inode, perm fs.FilePermissions) (*fs.Inode, error)
 }
 
 // Dir represents a single directory in the filesystem.
-//
-// +stateify savable
 type Dir struct {
-	fsutil.InodeGenericChecker `state:"nosave"`
-	fsutil.InodeIsDirTruncate  `state:"nosave"`
-	fsutil.InodeNoopRelease    `state:"nosave"`
-	fsutil.InodeNoopWriteOut   `state:"nosave"`
-	fsutil.InodeNotMappable    `state:"nosave"`
-	fsutil.InodeNotSocket      `state:"nosave"`
-	fsutil.InodeNotSymlink     `state:"nosave"`
-	fsutil.InodeVirtual        `state:"nosave"`
-
-	fsutil.InodeSimpleAttributes
-	fsutil.InodeSimpleExtendedAttributes
+	Entry
 
 	// CreateOps may be provided.
 	//
@@ -75,23 +62,17 @@ type Dir struct {
 	children map[string]*fs.Inode
 
 	// dentryMap is a sortedDentryMap containing entries for all children.
-	// Its entries are kept up-to-date with d.children.
+	// Its entries ar kept up-to-date with d.children.
 	dentryMap *fs.SortedDentryMap
 }
 
-var _ fs.InodeOperations = (*Dir)(nil)
-
-// NewDir returns a new Dir with the given contents and attributes.
-func NewDir(ctx context.Context, contents map[string]*fs.Inode, owner fs.FileOwner, perms fs.FilePermissions) *Dir {
-	d := &Dir{
-		InodeSimpleAttributes: fsutil.NewInodeSimpleAttributes(ctx, owner, perms, linux.RAMFS_MAGIC),
-	}
-
+// InitDir initializes a directory.
+func (d *Dir) InitDir(ctx context.Context, contents map[string]*fs.Inode, owner fs.FileOwner, perms fs.FilePermissions) {
+	d.InitEntry(ctx, owner, perms)
 	if contents == nil {
 		contents = make(map[string]*fs.Inode)
 	}
 	d.children = contents
-
 	// Build the entries map ourselves, rather than calling addChildLocked,
 	// because it will be faster.
 	entries := make(map[string]fs.DentAttr, len(contents))
@@ -105,8 +86,6 @@ func NewDir(ctx context.Context, contents map[string]*fs.Inode, owner fs.FileOwn
 
 	// Directories have an extra link, corresponding to '.'.
 	d.AddLink()
-
-	return d
 }
 
 // addChildLocked add the child inode, inheriting its reference.
@@ -143,24 +122,17 @@ func (d *Dir) FindChild(name string) (*fs.Inode, bool) {
 	return child, ok
 }
 
-// Children returns the names and DentAttrs of all children. It can be used to
-// implement Readdir for types that embed ramfs.Dir.
-func (d *Dir) Children() ([]string, map[string]fs.DentAttr) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.dentryMap.GetAll()
-}
-
 // removeChildLocked attempts to remove an entry from this directory.
+// This Entry's mutex must be held. It returns the removed Inode.
 func (d *Dir) removeChildLocked(ctx context.Context, name string) (*fs.Inode, error) {
 	inode, ok := d.children[name]
 	if !ok {
-		return nil, syserror.EACCES
+		return nil, ErrNotFound
 	}
 
 	delete(d.children, name)
 	d.dentryMap.Remove(name)
-	d.NotifyModification(ctx)
+	d.Entry.NotifyModification(ctx)
 
 	// If the child was a subdirectory, then we must decrement this dir's
 	// link count which was the child's ".." directory entry.
@@ -169,7 +141,7 @@ func (d *Dir) removeChildLocked(ctx context.Context, name string) (*fs.Inode, er
 	}
 
 	// Update ctime.
-	inode.InodeOperations.NotifyStatusChange(ctx)
+	inode.NotifyStatusChange(ctx)
 
 	// Given we're now removing this inode to the directory we must also
 	// decrease its link count. Similarly it is increased in addChildLocked.
@@ -178,8 +150,8 @@ func (d *Dir) removeChildLocked(ctx context.Context, name string) (*fs.Inode, er
 	return inode, nil
 }
 
-// Remove removes the named non-directory.
-func (d *Dir) Remove(ctx context.Context, _ *fs.Inode, name string) error {
+// RemoveEntry attempts to remove an entry from this directory.
+func (d *Dir) RemoveEntry(ctx context.Context, name string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	inode, err := d.removeChildLocked(ctx, name)
@@ -190,25 +162,29 @@ func (d *Dir) Remove(ctx context.Context, _ *fs.Inode, name string) error {
 	// Remove our reference on the inode.
 	inode.DecRef()
 	return nil
+}
+
+// Remove removes the named non-directory.
+func (d *Dir) Remove(ctx context.Context, dir *fs.Inode, name string) error {
+	return d.RemoveEntry(ctx, name)
 }
 
 // RemoveDirectory removes the named directory.
-func (d *Dir) RemoveDirectory(ctx context.Context, _ *fs.Inode, name string) error {
+func (d *Dir) RemoveDirectory(ctx context.Context, dir *fs.Inode, name string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Get the child and make sure it is not empty.
-	childInode, err := d.walkLocked(ctx, name)
+	n, err := d.walkLocked(ctx, name)
 	if err != nil {
 		return err
 	}
-	if ok, err := hasChildren(ctx, childInode); err != nil {
+	dirCtx := &fs.DirCtx{}
+	if _, err := n.HandleOps().DeprecatedReaddir(ctx, dirCtx, 0); err != nil {
 		return err
-	} else if ok {
-		return syserror.ENOTEMPTY
 	}
-
-	// Child was empty. Proceed with removal.
+	if len(dirCtx.DentAttrs()) > 0 {
+		return ErrNotEmpty
+	}
 	inode, err := d.removeChildLocked(ctx, name)
 	if err != nil {
 		return err
@@ -217,11 +193,11 @@ func (d *Dir) RemoveDirectory(ctx context.Context, _ *fs.Inode, name string) err
 	// Remove our reference on the inode.
 	inode.DecRef()
 
-	return nil
+	return err
 }
 
 // Lookup loads an inode at p into a Dirent.
-func (d *Dir) Lookup(ctx context.Context, _ *fs.Inode, p string) (*fs.Dirent, error) {
+func (d *Dir) Lookup(ctx context.Context, dir *fs.Inode, p string) (*fs.Dirent, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -236,9 +212,9 @@ func (d *Dir) Lookup(ctx context.Context, _ *fs.Inode, p string) (*fs.Dirent, er
 	return fs.NewDirent(inode, p), nil
 }
 
-// walkLocked must be called with d.mu held.
+// walkLocked must be called with this Entry's mutex held.
 func (d *Dir) walkLocked(ctx context.Context, p string) (*fs.Inode, error) {
-	d.NotifyAccess(ctx)
+	d.Entry.NotifyAccess(ctx)
 
 	// Lookup a child node.
 	if inode, ok := d.children[p]; ok {
@@ -266,7 +242,7 @@ func (d *Dir) createInodeOperationsCommon(ctx context.Context, name string, make
 	}
 
 	d.addChildLocked(name, inode)
-	d.NotifyModification(ctx)
+	d.Entry.NotifyModification(ctx)
 
 	return inode, nil
 }
@@ -274,7 +250,7 @@ func (d *Dir) createInodeOperationsCommon(ctx context.Context, name string, make
 // Create creates a new Inode with the given name and returns its File.
 func (d *Dir) Create(ctx context.Context, dir *fs.Inode, name string, flags fs.FileFlags, perms fs.FilePermissions) (*fs.File, error) {
 	if d.CreateOps == nil || d.CreateOps.NewFile == nil {
-		return nil, syserror.EACCES
+		return nil, ErrDenied
 	}
 
 	inode, err := d.createInodeOperationsCommon(ctx, name, func() (*fs.Inode, error) {
@@ -296,7 +272,7 @@ func (d *Dir) Create(ctx context.Context, dir *fs.Inode, name string, flags fs.F
 // CreateLink returns a new link.
 func (d *Dir) CreateLink(ctx context.Context, dir *fs.Inode, oldname, newname string) error {
 	if d.CreateOps == nil || d.CreateOps.NewSymlink == nil {
-		return syserror.EACCES
+		return ErrDenied
 	}
 	_, err := d.createInodeOperationsCommon(ctx, newname, func() (*fs.Inode, error) {
 		return d.NewSymlink(ctx, dir, oldname)
@@ -314,10 +290,10 @@ func (d *Dir) CreateHardLink(ctx context.Context, dir *fs.Inode, target *fs.Inod
 
 	// The link count will be incremented in addChildLocked.
 	d.addChildLocked(name, target)
-	d.NotifyModification(ctx)
+	d.Entry.NotifyModification(ctx)
 
 	// Update ctime.
-	target.InodeOperations.NotifyStatusChange(ctx)
+	target.NotifyStatusChange(ctx)
 
 	return nil
 }
@@ -325,7 +301,7 @@ func (d *Dir) CreateHardLink(ctx context.Context, dir *fs.Inode, target *fs.Inod
 // CreateDirectory returns a new subdirectory.
 func (d *Dir) CreateDirectory(ctx context.Context, dir *fs.Inode, name string, perms fs.FilePermissions) error {
 	if d.CreateOps == nil || d.CreateOps.NewDir == nil {
-		return syserror.EACCES
+		return ErrDenied
 	}
 	_, err := d.createInodeOperationsCommon(ctx, name, func() (*fs.Inode, error) {
 		return d.NewDir(ctx, dir, perms)
@@ -336,28 +312,23 @@ func (d *Dir) CreateDirectory(ctx context.Context, dir *fs.Inode, name string, p
 }
 
 // Bind implements fs.InodeOperations.Bind.
-func (d *Dir) Bind(ctx context.Context, dir *fs.Inode, name string, ep transport.BoundEndpoint, perms fs.FilePermissions) (*fs.Dirent, error) {
+func (d *Dir) Bind(ctx context.Context, dir *fs.Inode, name string, ep unix.BoundEndpoint, perms fs.FilePermissions) error {
 	if d.CreateOps == nil || d.CreateOps.NewBoundEndpoint == nil {
-		return nil, syserror.EACCES
+		return ErrDenied
 	}
-	inode, err := d.createInodeOperationsCommon(ctx, name, func() (*fs.Inode, error) {
+	_, err := d.createInodeOperationsCommon(ctx, name, func() (*fs.Inode, error) {
 		return d.NewBoundEndpoint(ctx, dir, ep, perms)
 	})
 	if err == syscall.EEXIST {
-		return nil, syscall.EADDRINUSE
+		return syscall.EADDRINUSE
 	}
-	if err != nil {
-		return nil, err
-	}
-	// Take another ref on inode which will be donated to the new dirent.
-	inode.IncRef()
-	return fs.NewDirent(inode, name), nil
+	return err
 }
 
 // CreateFifo implements fs.InodeOperations.CreateFifo.
 func (d *Dir) CreateFifo(ctx context.Context, dir *fs.Inode, name string, perms fs.FilePermissions) error {
 	if d.CreateOps == nil || d.CreateOps.NewFifo == nil {
-		return syserror.EACCES
+		return ErrDenied
 	}
 	_, err := d.createInodeOperationsCommon(ctx, name, func() (*fs.Inode, error) {
 		return d.NewFifo(ctx, dir, perms)
@@ -365,123 +336,29 @@ func (d *Dir) CreateFifo(ctx context.Context, dir *fs.Inode, name string, perms 
 	return err
 }
 
-// GetFile implements fs.InodeOperations.GetFile.
-func (d *Dir) GetFile(ctx context.Context, dirent *fs.Dirent, flags fs.FileFlags) (*fs.File, error) {
-	flags.Pread = true
-	return fs.NewFile(ctx, dirent, flags, &dirFileOperations{dir: d}), nil
-}
+func (d *Dir) readdirLocked(ctx context.Context, dirCtx *fs.DirCtx, offset int) (int, error) {
+	// Serialize the entries in dentryMap.
+	n, err := fs.GenericReaddir(dirCtx, d.dentryMap)
 
-// Rename implements fs.InodeOperations.Rename.
-func (*Dir) Rename(ctx context.Context, oldParent *fs.Inode, oldName string, newParent *fs.Inode, newName string) error {
-	return Rename(ctx, oldParent.InodeOperations, oldName, newParent.InodeOperations, newName)
-}
+	// Touch the access time.
+	d.Entry.NotifyAccess(ctx)
 
-// dirFileOperations implements fs.FileOperations for a ramfs directory.
-//
-// +stateify savable
-type dirFileOperations struct {
-	fsutil.DirFileOperations `state:"nosave"`
-
-	// dirCursor contains the name of the last directory entry that was
-	// serialized.
-	dirCursor string
-
-	// dir is the ramfs dir that this file corresponds to.
-	dir *Dir
-}
-
-var _ fs.FileOperations = (*dirFileOperations)(nil)
-
-// Seek implements fs.FileOperations.Seek.
-func (dfo *dirFileOperations) Seek(ctx context.Context, file *fs.File, whence fs.SeekWhence, offset int64) (int64, error) {
-	return fsutil.SeekWithDirCursor(ctx, file, whence, offset, &dfo.dirCursor)
-}
-
-// IterateDir implements DirIterator.IterateDir.
-func (dfo *dirFileOperations) IterateDir(ctx context.Context, dirCtx *fs.DirCtx, offset int) (int, error) {
-	dfo.dir.mu.Lock()
-	defer dfo.dir.mu.Unlock()
-
-	n, err := fs.GenericReaddir(dirCtx, dfo.dir.dentryMap)
 	return offset + n, err
 }
 
-// Readdir implements FileOperations.Readdir.
-func (dfo *dirFileOperations) Readdir(ctx context.Context, file *fs.File, serializer fs.DentrySerializer) (int64, error) {
-	root := fs.RootFromContext(ctx)
-	defer root.DecRef()
-	dirCtx := &fs.DirCtx{
-		Serializer: serializer,
-		DirCursor:  &dfo.dirCursor,
-	}
-	dfo.dir.InodeSimpleAttributes.NotifyAccess(ctx)
-	return fs.DirentReaddir(ctx, file.Dirent, dfo, root, dirCtx, file.Offset())
+// DeprecatedReaddir emits the entries contained in this directory.
+func (d *Dir) DeprecatedReaddir(ctx context.Context, dirCtx *fs.DirCtx, offset int) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.readdirLocked(ctx, dirCtx, offset)
 }
 
-// hasChildren is a helper method that determines whether an arbitrary inode
-// (not necessarily ramfs) has any children.
-func hasChildren(ctx context.Context, inode *fs.Inode) (bool, error) {
-	// Take an extra ref on inode which will be given to the dirent and
-	// dropped when that dirent is destroyed.
-	inode.IncRef()
-	d := fs.NewTransientDirent(inode)
-	defer d.DecRef()
-
-	file, err := inode.GetFile(ctx, d, fs.FileFlags{Read: true})
-	if err != nil {
-		return false, err
-	}
-	defer file.DecRef()
-
-	ser := &fs.CollectEntriesSerializer{}
-	if err := file.Readdir(ctx, ser); err != nil {
-		return false, err
-	}
-	// We will always write "." and "..", so ignore those two.
-	if ser.Written() > 2 {
-		return true, nil
-	}
-	return false, nil
+// DeprecatedPreadv always returns ErrIsDirectory
+func (*Dir) DeprecatedPreadv(context.Context, usermem.IOSequence, int64) (int64, error) {
+	return 0, ErrIsDirectory
 }
 
-// Rename renames from a *ramfs.Dir to another *ramfs.Dir.
-func Rename(ctx context.Context, oldParent fs.InodeOperations, oldName string, newParent fs.InodeOperations, newName string) error {
-	op, ok := oldParent.(*Dir)
-	if !ok {
-		return syserror.EXDEV
-	}
-	np, ok := newParent.(*Dir)
-	if !ok {
-		return syserror.EXDEV
-	}
-
-	np.mu.Lock()
-	defer np.mu.Unlock()
-
-	// Check whether the ramfs entry to be replaced is a non-empty directory.
-	if replaced, ok := np.children[newName]; ok {
-		if fs.IsDir(replaced.StableAttr) {
-			if ok, err := hasChildren(ctx, replaced); err != nil {
-				return err
-			} else if ok {
-				return syserror.ENOTEMPTY
-			}
-		}
-	}
-
-	// Be careful, we may have already grabbed this mutex above.
-	if op != np {
-		op.mu.Lock()
-		defer op.mu.Unlock()
-	}
-
-	// Do the swap.
-	n := op.children[oldName]
-	op.removeChildLocked(ctx, oldName)
-	np.addChildLocked(newName, n)
-
-	// Update ctime.
-	n.InodeOperations.NotifyStatusChange(ctx)
-
-	return nil
+// DeprecatedPwritev always returns ErrIsDirectory
+func (*Dir) DeprecatedPwritev(context.Context, usermem.IOSequence, int64) (int64, error) {
+	return 0, ErrIsDirectory
 }

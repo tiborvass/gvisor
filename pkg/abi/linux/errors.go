@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,8 +25,8 @@ func (e *Errno) Number() int {
 	return e.number
 }
 
-// String implements fmt.Stringer.String.
-func (e *Errno) String() string {
+// Error implements error.Error.
+func (e *Errno) Error() string {
 	return e.name
 }
 

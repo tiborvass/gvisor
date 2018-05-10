@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,12 +20,16 @@ import (
 	"fmt"
 	"syscall"
 	"unsafe"
+
+	"gvisor.googlesource.com/gvisor/pkg/sentry/platform/ring0/pagetables"
 )
 
 var (
-	runDataSize    int
-	hasGuestPCID   bool
-	cpuidSupported = cpuidEntries{nr: _KVM_NR_CPUID_ENTRIES}
+	runDataSize     int
+	hasGuestPCID    bool
+	hasGuestINVPCID bool
+	pagetablesOpts  pagetables.Opts
+	cpuidSupported  = cpuidEntries{nr: _KVM_NR_CPUID_ENTRIES}
 )
 
 func updateSystemValues(fd int) error {
@@ -70,7 +74,19 @@ func updateSystemValues(fd int) error {
 		if entry.function == 1 && entry.index == 0 && entry.ecx&(1<<17) != 0 {
 			hasGuestPCID = true // Found matching PCID in guest feature set.
 		}
+		if entry.function == 7 && entry.index == 0 && entry.ebx&(1<<10) != 0 {
+			hasGuestINVPCID = true // Found matching INVPCID in guest feature set.
+		}
 	}
+
+	// A basic sanity check: ensure that we don't attempt to
+	// invpcid if guest PCIDs are not supported; it's not clear
+	// what the semantics of this would be (or why some CPU or
+	// hypervisor would export this particular combination).
+	hasGuestINVPCID = hasGuestPCID && hasGuestINVPCID
+
+	// Set the pagetables to use PCID if it's available.
+	pagetablesOpts.EnablePCID = hasGuestPCID
 
 	// Success.
 	return nil

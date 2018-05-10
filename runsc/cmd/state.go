@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,15 +15,15 @@
 package cmd
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 
+	"context"
 	"flag"
 	"github.com/google/subcommands"
 	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/runsc/boot"
-	"gvisor.googlesource.com/gvisor/runsc/container"
+	"gvisor.googlesource.com/gvisor/runsc/sandbox"
 )
 
 // State implements subcommands.Command for the "state" command.
@@ -36,12 +36,12 @@ func (*State) Name() string {
 
 // Synopsis implements subcommands.Command.Synopsis.
 func (*State) Synopsis() string {
-	return "get the state of a container"
+	return "get the state of a sandbox"
 }
 
 // Usage implements subcommands.Command.Usage.
 func (*State) Usage() string {
-	return `state [flags] <container id> - get the state of a container`
+	return `state [flags] <container id> - get the state of a sandbox`
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -57,19 +57,16 @@ func (*State) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) s
 	id := f.Arg(0)
 	conf := args[0].(*boot.Config)
 
-	c, err := container.Load(conf.RootDir, id)
+	s, err := sandbox.Load(conf.RootDir, id)
 	if err != nil {
-		Fatalf("loading container: %v", err)
+		Fatalf("error loading sandbox: %v", err)
 	}
-	log.Debugf("Returning state for container %+v", c)
-
-	state := c.State()
-	log.Debugf("State: %+v", state)
+	log.Debugf("Returning state %+v", s)
 
 	// Write json-encoded state directly to stdout.
-	b, err := json.MarshalIndent(state, "", "  ")
+	b, err := json.MarshalIndent(s.State(), "", "  ")
 	if err != nil {
-		Fatalf("marshaling container state: %v", err)
+		Fatalf("error marshaling sandbox state: %v", err)
 	}
 	os.Stdout.Write(b)
 	return subcommands.ExitSuccess

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,16 +16,20 @@
 package dev
 
 import (
-	"math"
-
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/ashmem"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/binder"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/ramfs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/tmpfs"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/platform"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 )
+
+// Dev is the root node.
+type Dev struct {
+	ramfs.Dir
+}
 
 func newCharacterDevice(iops fs.InodeOperations, msrc *fs.MountSource) *fs.Inode {
 	return fs.NewInode(iops, msrc, fs.StableAttr{
@@ -37,7 +41,8 @@ func newCharacterDevice(iops fs.InodeOperations, msrc *fs.MountSource) *fs.Inode
 }
 
 func newDirectory(ctx context.Context, msrc *fs.MountSource) *fs.Inode {
-	iops := ramfs.NewDir(ctx, nil, fs.RootOwner, fs.FilePermsFromMode(0555))
+	iops := &ramfs.Dir{}
+	iops.InitDir(ctx, map[string]*fs.Inode{}, fs.RootOwner, fs.FilePermsFromMode(0555))
 	return fs.NewInode(iops, msrc, fs.StableAttr{
 		DeviceID:  devDevice.DeviceID(),
 		InodeID:   devDevice.NextIno(),
@@ -47,7 +52,8 @@ func newDirectory(ctx context.Context, msrc *fs.MountSource) *fs.Inode {
 }
 
 func newSymlink(ctx context.Context, target string, msrc *fs.MountSource) *fs.Inode {
-	iops := ramfs.NewSymlink(ctx, fs.RootOwner, target)
+	iops := &ramfs.Symlink{}
+	iops.InitSymlink(ctx, fs.RootOwner, target)
 	return fs.NewInode(iops, msrc, fs.StableAttr{
 		DeviceID:  devDevice.DeviceID(),
 		InodeID:   devDevice.NextIno(),
@@ -58,6 +64,8 @@ func newSymlink(ctx context.Context, target string, msrc *fs.MountSource) *fs.In
 
 // New returns the root node of a device filesystem.
 func New(ctx context.Context, msrc *fs.MountSource, binderEnabled bool, ashmemEnabled bool) *fs.Inode {
+	d := &Dev{}
+
 	contents := map[string]*fs.Inode{
 		"fd":     newSymlink(ctx, "/proc/self/fd", msrc),
 		"stdin":  newSymlink(ctx, "/proc/self/fd/0", msrc),
@@ -76,7 +84,7 @@ func New(ctx context.Context, msrc *fs.MountSource, binderEnabled bool, ashmemEn
 		"random":  newCharacterDevice(newRandomDevice(ctx, fs.RootOwner, 0444), msrc),
 		"urandom": newCharacterDevice(newRandomDevice(ctx, fs.RootOwner, 0444), msrc),
 
-		"shm": tmpfs.NewDir(ctx, nil, fs.RootOwner, fs.FilePermsFromMode(0777), msrc),
+		"shm": tmpfs.NewDir(ctx, nil, fs.RootOwner, fs.FilePermsFromMode(0777), msrc, platform.FromContext(ctx)),
 
 		// A devpts is typically mounted at /dev/pts to provide
 		// pseudoterminal support. Place an empty directory there for
@@ -104,19 +112,11 @@ func New(ctx context.Context, msrc *fs.MountSource, binderEnabled bool, ashmemEn
 		contents["ashmem"] = newCharacterDevice(ashmem, msrc)
 	}
 
-	iops := ramfs.NewDir(ctx, contents, fs.RootOwner, fs.FilePermsFromMode(0555))
-	return fs.NewInode(iops, msrc, fs.StableAttr{
+	d.InitDir(ctx, contents, fs.RootOwner, fs.FilePermsFromMode(0555))
+	return fs.NewInode(d, msrc, fs.StableAttr{
 		DeviceID:  devDevice.DeviceID(),
 		InodeID:   devDevice.NextIno(),
 		BlockSize: usermem.PageSize,
 		Type:      fs.Directory,
 	})
-}
-
-// readZeros implements fs.FileOperations.Read with infinite null bytes.
-type readZeros struct{}
-
-// Read implements fs.FileOperations.Read.
-func (readZeros) Read(ctx context.Context, file *fs.File, dst usermem.IOSequence, offset int64) (int64, error) {
-	return dst.ZeroOut(ctx, math.MaxInt64)
 }

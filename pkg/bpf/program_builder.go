@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,10 +21,7 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 )
 
-const (
-	labelTarget       = math.MaxUint8
-	labelDirectTarget = math.MaxUint32
-)
+const labelTarget = math.MaxUint8
 
 // ProgramBuilder assists with building a BPF program with jump
 // labels that are resolved to their proper offsets.
@@ -50,14 +47,6 @@ type label struct {
 	target int
 }
 
-type jmpType int
-
-const (
-	jDirect jmpType = iota
-	jTrue
-	jFalse
-)
-
 // source contains information about a single reference to a label.
 type source struct {
 	// Program line where the label reference is present.
@@ -65,7 +54,7 @@ type source struct {
 
 	// True if label reference is in the 'jump if true' part of the jump.
 	// False if label reference is in the 'jump if false' part of the jump.
-	jt jmpType
+	jt bool
 }
 
 // AddStmt adds a new statement to the program.
@@ -78,29 +67,23 @@ func (b *ProgramBuilder) AddJump(code uint16, k uint32, jt, jf uint8) {
 	b.instructions = append(b.instructions, Jump(code, k, jt, jf))
 }
 
-// AddDirectJumpLabel adds a new jump to the program where is labelled.
-func (b *ProgramBuilder) AddDirectJumpLabel(labelName string) {
-	b.addLabelSource(labelName, jDirect)
-	b.AddJump(Jmp|Ja, labelDirectTarget, 0, 0)
-}
-
 // AddJumpTrueLabel adds a new jump to the program where 'jump if true' is a label.
 func (b *ProgramBuilder) AddJumpTrueLabel(code uint16, k uint32, jtLabel string, jf uint8) {
-	b.addLabelSource(jtLabel, jTrue)
+	b.addLabelSource(jtLabel, true)
 	b.AddJump(code, k, labelTarget, jf)
 }
 
 // AddJumpFalseLabel adds a new jump to the program where 'jump if false' is a label.
 func (b *ProgramBuilder) AddJumpFalseLabel(code uint16, k uint32, jt uint8, jfLabel string) {
-	b.addLabelSource(jfLabel, jFalse)
-	b.AddJump(code, k, jt, labelTarget)
+	b.addLabelSource(jfLabel, false)
+	b.AddJump(code, k, jt, math.MaxUint8)
 }
 
 // AddJumpLabels adds a new jump to the program where both jump targets are labels.
 func (b *ProgramBuilder) AddJumpLabels(code uint16, k uint32, jtLabel, jfLabel string) {
-	b.addLabelSource(jtLabel, jTrue)
-	b.addLabelSource(jfLabel, jFalse)
-	b.AddJump(code, k, labelTarget, labelTarget)
+	b.addLabelSource(jtLabel, true)
+	b.addLabelSource(jfLabel, false)
+	b.AddJump(code, k, math.MaxUint8, math.MaxUint8)
 }
 
 // AddLabel sets the given label name at the current location. The next instruction is executed
@@ -121,22 +104,20 @@ func (b *ProgramBuilder) AddLabel(name string) error {
 
 // Instructions returns an array of BPF instructions representing the program with all labels
 // resolved. Return error in case label resolution failed due to an invalid program.
-//
-// N.B. Partial results will be returned in the error case, which is useful for debugging.
 func (b *ProgramBuilder) Instructions() ([]linux.BPFInstruction, error) {
 	if err := b.resolveLabels(); err != nil {
-		return b.instructions, err
+		return nil, err
 	}
 	return b.instructions, nil
 }
 
-func (b *ProgramBuilder) addLabelSource(labelName string, t jmpType) {
+func (b *ProgramBuilder) addLabelSource(labelName string, jt bool) {
 	l, ok := b.labels[labelName]
 	if !ok {
 		l = &label{sources: make([]source, 0), target: -1}
 		b.labels[labelName] = l
 	}
-	l.sources = append(l.sources, source{line: len(b.instructions), jt: t})
+	l.sources = append(l.sources, source{line: len(b.instructions), jt: jt})
 }
 
 func (b *ProgramBuilder) resolveLabels() error {
@@ -155,34 +136,21 @@ func (b *ProgramBuilder) resolveLabels() error {
 			}
 			// Calculates the jump offset from current line.
 			offset := v.target - s.line - 1
+			if offset > math.MaxUint8 {
+				return fmt.Errorf("jump offset to label '%v' is too large: %v", key, offset)
+			}
 			// Sets offset into jump instruction.
-			switch s.jt {
-			case jDirect:
-				if offset > labelDirectTarget {
-					return fmt.Errorf("jump offset to label '%v' is too large: %v, inst: %v, lineno: %v", key, offset, inst, s.line)
-				}
-				if inst.K != labelDirectTarget {
-					return fmt.Errorf("jump target is not a label")
-				}
-				inst.K = uint32(offset)
-			case jTrue:
-				if offset > labelTarget {
-					return fmt.Errorf("jump offset to label '%v' is too large: %v, inst: %v, lineno: %v", key, offset, inst, s.line)
-				}
+			if s.jt {
 				if inst.JumpIfTrue != labelTarget {
 					return fmt.Errorf("jump target is not a label")
 				}
 				inst.JumpIfTrue = uint8(offset)
-			case jFalse:
-				if offset > labelTarget {
-					return fmt.Errorf("jump offset to label '%v' is too large: %v, inst: %v, lineno: %v", key, offset, inst, s.line)
-				}
+			} else {
 				if inst.JumpIfFalse != labelTarget {
 					return fmt.Errorf("jump target is not a label")
 				}
 				inst.JumpIfFalse = uint8(offset)
 			}
-
 			b.instructions[s.line] = inst
 		}
 	}

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,18 +22,10 @@ const (
 	DEVPTS_SUPER_MAGIC    = 0x00001cd1
 	OVERLAYFS_SUPER_MAGIC = 0x794c7630
 	PIPEFS_MAGIC          = 0x50495045
-	PROC_SUPER_MAGIC      = 0x9fa0
 	RAMFS_MAGIC           = 0x09041934
 	SOCKFS_MAGIC          = 0x534F434B
-	SYSFS_MAGIC           = 0x62656572
 	TMPFS_MAGIC           = 0x01021994
 	V9FS_MAGIC            = 0x01021997
-)
-
-// Filesystem path limits, from uapi/linux/limits.h.
-const (
-	NAME_MAX = 255
-	PATH_MAX = 4096
 )
 
 // Statfs is struct statfs, from uapi/asm-generic/statfs.h.
@@ -75,10 +67,3 @@ type Statfs struct {
 	// Spare is unused.
 	Spare [4]uint64
 }
-
-// Sync_file_range flags, from include/uapi/linux/fs.h
-const (
-	SYNC_FILE_RANGE_WAIT_BEFORE = 1
-	SYNC_FILE_RANGE_WRITE       = 2
-	SYNC_FILE_RANGE_WAIT_AFTER  = 4
-)

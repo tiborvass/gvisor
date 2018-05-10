@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ const (
 )
 
 // parseInterpreterScript returns the interpreter path and argv.
-func parseInterpreterScript(ctx context.Context, filename string, f *fs.File, argv []string) (newpath string, newargv []string, err error) {
+func parseInterpreterScript(ctx context.Context, filename string, f *fs.File, argv, envv []string) (newpath string, newargv []string, err error) {
 	line := make([]byte, interpMaxLineLength)
 	n, err := readFull(ctx, f, usermem.BytesIOSequence(line), 0)
 	// Short read is OK.
@@ -66,7 +66,7 @@ func parseInterpreterScript(ctx context.Context, filename string, f *fs.File, ar
 	// Skip any whitespace before the interpeter.
 	line = bytes.TrimLeft(line, " \t")
 
-	// Linux only looks for spaces or tabs delimiting the interpreter and
+	// Linux only looks for a space or tab delimiting the interpreter and
 	// arg.
 	//
 	// execve(2): "On Linux, the entire string following the interpreter
@@ -77,12 +77,9 @@ func parseInterpreterScript(ctx context.Context, filename string, f *fs.File, ar
 	i = bytes.IndexAny(line, " \t")
 	if i >= 0 {
 		interp = line[:i]
-		arg = bytes.TrimLeft(line[i:], " \t")
-	}
-
-	if string(interp) == "" {
-		ctx.Infof("Interpreter script contains no interpreter: %v", line)
-		return "", []string{}, syserror.ENOEXEC
+		if i+1 < len(line) {
+			arg = line[i+1:]
+		}
 	}
 
 	// Build the new argument list:

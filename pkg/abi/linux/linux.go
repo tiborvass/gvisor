@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,7 +31,6 @@ type Sysinfo struct {
 	TotalSwap uint64
 	FreeSwap  uint64
 	Procs     uint16
-	_         [6]byte // Pad Procs to 64bits.
 	TotalHigh uint64
 	FreeHigh  uint64
 	Unit      uint32

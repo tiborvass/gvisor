@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ import (
 	"math"
 	"syscall"
 
-	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
@@ -32,14 +31,12 @@ import (
 // read and write requests. This should only be used directly for named pipes.
 // pipe(2) and pipe2(2) only support unidirectional pipes and should use
 // either pipe.Reader or pipe.Writer.
-//
-// +stateify savable
 type ReaderWriter struct {
-	fsutil.FilePipeSeek      `state:"nosave"`
-	fsutil.FileNotDirReaddir `state:"nosave"`
-	fsutil.FileNoFsync       `state:"nosave"`
-	fsutil.FileNoopFlush     `state:"nosave"`
-	fsutil.FileNoMMap        `state:"nosave"`
+	fsutil.PipeSeek      `state:"nosave"`
+	fsutil.NotDirReaddir `state:"nosave"`
+	fsutil.NoFsync       `state:"nosave"`
+	fsutil.NoopFlush     `state:"nosave"`
+	fsutil.NoMMap        `state:"nosave"`
 	*Pipe
 }
 
@@ -78,7 +75,7 @@ func (rw *ReaderWriter) Readiness(mask waiter.EventMask) waiter.EventMask {
 func (rw *ReaderWriter) Ioctl(ctx context.Context, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
 	// Switch on ioctl request.
 	switch int(args[1].Int()) {
-	case linux.FIONREAD:
+	case syscall.TIOCINQ:
 		v := rw.queuedSize()
 		if v > math.MaxInt32 {
 			panic(fmt.Sprintf("Impossibly large pipe queued size: %d", v))

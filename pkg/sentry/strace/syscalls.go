@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -75,10 +75,6 @@ const (
 	// Path is a pointer to a char* path.
 	Path
 
-	// PostPath is a pointer to a char* path, formatted after syscall
-	// execution.
-	PostPath
-
 	// ExecveStringVector is a NULL-terminated array of strings. Enforces
 	// the maximum execve array length.
 	ExecveStringVector
@@ -132,16 +128,9 @@ const (
 	// ItimerVal is a pointer to a struct itimerval.
 	ItimerVal
 
-	// PostItimerVal is a pointer to a struct itimerval, formatted after
+	// ItimerVal is a pointer to a struct itimerval, formatted after
 	// syscall execution.
 	PostItimerVal
-
-	// ItimerSpec is a pointer to a struct itimerspec.
-	ItimerSpec
-
-	// PostItimerSpec is a pointer to a struct itimerspec, formatted after
-	// syscall execution.
-	PostItimerSpec
 
 	// Timeval is a pointer to a struct timeval, formatted before and after
 	// syscall execution.
@@ -149,9 +138,6 @@ const (
 
 	// Utimbuf is a pointer to a struct utimbuf.
 	Utimbuf
-
-	// Rusage is a struct rusage, formatted after syscall execution.
-	Rusage
 
 	// CloneFlags are clone(2) flags.
 	CloneFlags
@@ -168,26 +154,8 @@ const (
 	// PtraceRequest is the ptrace(2) request.
 	PtraceRequest
 
-	// ItimerType is an itimer type (ITIMER_REAL, etc).
-	ItimerType
-
-	// Signal is a signal number.
-	Signal
-
-	// SignalMaskAction is a signal mask action passed to rt_sigprocmask(2).
-	SignalMaskAction
-
-	// SigSet is a signal set.
-	SigSet
-
-	// PostSigSet is a signal set, formatted after syscall execution.
-	PostSigSet
-
-	// SigAction is a struct sigaction.
-	SigAction
-
-	// PostSigAction is a struct sigaction, formatted after syscall execution.
-	PostSigAction
+	// Rusage is a struct rusage, formatted after syscall execution.
+	Rusage
 )
 
 // defaultFormat is the syscall argument format to use if the actual format is

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,8 +28,6 @@ import (
 
 // SignalAct represents the action that should be taken when a signal is
 // delivered, and is equivalent to struct sigaction on 64-bit x86.
-//
-// +stateify savable
 type SignalAct struct {
 	Handler  uint64
 	Flags    uint64
@@ -49,8 +47,6 @@ func (s *SignalAct) DeserializeTo(other *SignalAct) {
 
 // SignalStack represents information about a user stack, and is equivalent to
 // stack_t on 64-bit x86.
-//
-// +stateify savable
 type SignalStack struct {
 	Addr  uint64
 	Flags uint32
@@ -70,8 +66,6 @@ func (s *SignalStack) DeserializeTo(other *SignalStack) {
 
 // SignalInfo represents information about a signal being delivered, and is
 // equivalent to struct siginfo on 64-bit x86.
-//
-// +stateify savable
 type SignalInfo struct {
 	Signo int32 // Signal number
 	Errno int32 // Errno value
@@ -173,36 +167,6 @@ func (s *SignalInfo) Uid() int32 {
 
 // SetUid mutates the si_uid field.
 func (s *SignalInfo) SetUid(val int32) {
-	usermem.ByteOrder.PutUint32(s.Fields[4:8], uint32(val))
-}
-
-// Sigval returns the sigval field, which is aliased to both si_int and si_ptr.
-func (s *SignalInfo) Sigval() uint64 {
-	return usermem.ByteOrder.Uint64(s.Fields[8:16])
-}
-
-// SetSigval mutates the sigval field.
-func (s *SignalInfo) SetSigval(val uint64) {
-	usermem.ByteOrder.PutUint64(s.Fields[8:16], val)
-}
-
-// TimerID returns the si_timerid field.
-func (s *SignalInfo) TimerID() linux.TimerID {
-	return linux.TimerID(usermem.ByteOrder.Uint32(s.Fields[0:4]))
-}
-
-// SetTimerID sets the si_timerid field.
-func (s *SignalInfo) SetTimerID(val linux.TimerID) {
-	usermem.ByteOrder.PutUint32(s.Fields[0:4], uint32(val))
-}
-
-// Overrun returns the si_overrun field.
-func (s *SignalInfo) Overrun() int32 {
-	return int32(usermem.ByteOrder.Uint32(s.Fields[4:8]))
-}
-
-// SetOverrun sets the si_overrun field.
-func (s *SignalInfo) SetOverrun(val int32) {
 	usermem.ByteOrder.PutUint32(s.Fields[4:8], uint32(val))
 }
 
@@ -413,14 +377,6 @@ func (c *context64) SignalSetup(st *Stack, act *SignalAct, info *SignalInfo, alt
 	sp = frameBottom + usermem.Addr(frameSize)
 	st.Bottom = sp
 
-	// Prior to proceeding, figure out if the frame will exhaust the range
-	// for the signal stack. This is not allowed, and should immediately
-	// force signal delivery (reverting to the default handler).
-	if act.IsOnStack() && alt.IsEnabled() && !alt.Contains(frameBottom) {
-		return syscall.EFAULT
-	}
-
-	// Adjust the code.
 	info.FixSignalCodeForUser()
 
 	// Set up the stack frame.
@@ -466,15 +422,15 @@ func (c *context64) SignalSetup(st *Stack, act *SignalAct, info *SignalInfo, alt
 
 // SignalRestore implements Context.SignalRestore. (Compare to Linux's
 // arch/x86/kernel/signal.c:sys_rt_sigreturn().)
-func (c *context64) SignalRestore(st *Stack, rt bool) (linux.SignalSet, SignalStack, error) {
+func (c *context64) SignalRestore(st *Stack, rt bool) (linux.SignalSet, error) {
 	// Copy out the stack frame.
 	var uc UContext64
 	if _, err := st.Pop(&uc); err != nil {
-		return 0, SignalStack{}, err
+		return 0, err
 	}
 	var info SignalInfo
 	if _, err := st.Pop(&info); err != nil {
-		return 0, SignalStack{}, err
+		return 0, err
 	}
 
 	// Restore registers.
@@ -516,5 +472,5 @@ func (c *context64) SignalRestore(st *Stack, rt bool) (linux.SignalSet, SignalSt
 		log.Infof("sigreturn unable to restore application fpstate")
 	}
 
-	return uc.Sigset, uc.Stack, nil
+	return uc.Sigset, nil
 }

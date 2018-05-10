@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,8 +20,6 @@ import (
 
 // Buffer encapsulates a queueable byte buffer that can
 // easily be truncated.  It is designed only for use with pipes.
-//
-// +stateify savable
 type Buffer struct {
 	ilist.Entry
 	data []byte

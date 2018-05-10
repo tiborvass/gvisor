@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -105,12 +105,6 @@ type FileMem struct {
 	usageSwapped  uint64
 	usageLast     time.Time
 
-	// minUnallocatedPage is the minimum page that may be unallocated.
-	// i.e., there are no unallocated pages below minUnallocatedPage.
-	//
-	// minUnallocatedPage is protected by mu.
-	minUnallocatedPage uint64
-
 	// fileSize is the size of the backing memory file in bytes. fileSize is
 	// always a power-of-two multiple of chunkSize.
 	//
@@ -124,12 +118,6 @@ type FileMem struct {
 	// reclaimable is true if usage may contain reclaimable pages. reclaimable
 	// is protected by mu.
 	reclaimable bool
-
-	// minReclaimablePage is the minimum page that may be reclaimable.
-	// i.e., all reclaimable pages are >= minReclaimablePage.
-	//
-	// minReclaimablePage is protected by mu.
-	minReclaimablePage uint64
 
 	// reclaimCond is signaled (with mu locked) when reclaimable or destroyed
 	// transitions from false to true.
@@ -155,8 +143,6 @@ type FileMem struct {
 }
 
 // usage tracks usage information.
-//
-// +stateify savable
 type usageInfo struct {
 	// kind is the usage kind.
 	kind usage.MemoryKind
@@ -170,15 +156,23 @@ type usageInfo struct {
 	refs uint64
 }
 
+func (u *usageInfo) incRef() {
+	u.refs++
+}
+
+func (u *usageInfo) decRef() {
+	if u.refs == 0 {
+		panic("DecRef at 0 refs!")
+	}
+	u.refs--
+}
+
 const (
 	chunkShift = 24
 	chunkSize  = 1 << chunkShift // 16 MB
 	chunkMask  = chunkSize - 1
 
 	initialSize = chunkSize
-
-	// maxPage is the highest 64-bit page.
-	maxPage = math.MaxUint64 &^ (usermem.PageSize - 1)
 )
 
 // newFromFile creates a FileMem backed by the given file.
@@ -189,9 +183,6 @@ func newFromFile(file *os.File) (*FileMem, error) {
 	f := &FileMem{
 		fileSize: initialSize,
 		file:     file,
-		// No pages are reclaimable. DecRef will always be able to
-		// decrease minReclaimablePage from this point.
-		minReclaimablePage: maxPage,
 	}
 	f.reclaimCond.L = &f.mu
 	f.mappings.Store(make([]uintptr, initialSize/chunkSize))
@@ -233,9 +224,6 @@ func newFromFile(file *os.File) (*FileMem, error) {
 func New(name string) (*FileMem, error) {
 	fd, err := memutil.CreateMemFD(name, 0)
 	if err != nil {
-		if e, ok := err.(syscall.Errno); ok && e == syscall.ENOSYS {
-			return nil, fmt.Errorf("memfd_create(2) is not implemented. Check that you have Linux 3.17 or higher")
-		}
 		return nil, err
 	}
 	return newFromFile(os.NewFile(uintptr(fd), name))
@@ -265,7 +253,7 @@ func (f *FileMem) Allocate(length uint64, kind usage.MemoryKind) (platform.FileR
 		alignment = usermem.HugePageSize
 	}
 
-	start, minUnallocatedPage := findUnallocatedRange(&f.usage, f.minUnallocatedPage, length, alignment)
+	start := findUnallocatedRange(&f.usage, length, alignment)
 	end := start + length
 	// File offsets are int64s. Since length must be strictly positive, end
 	// cannot legitimately be 0.
@@ -304,36 +292,17 @@ func (f *FileMem) Allocate(length uint64, kind usage.MemoryKind) (platform.FileR
 	}) {
 		panic(fmt.Sprintf("allocating %v: failed to insert into f.usage:\n%v", fr, &f.usage))
 	}
-
-	if minUnallocatedPage < start {
-		f.minUnallocatedPage = minUnallocatedPage
-	} else {
-		// start was the first unallocated page. The next must be
-		// somewhere beyond end.
-		f.minUnallocatedPage = end
-	}
-
 	return fr, nil
 }
 
-// findUnallocatedRange returns the first unallocated page in usage of the
-// specified length and alignment beginning at page start and the first single
-// unallocated page.
-func findUnallocatedRange(usage *usageSet, start, length, alignment uint64) (uint64, uint64) {
-	// Only searched until the first page is found.
-	firstPage := start
-	foundFirstPage := false
+func findUnallocatedRange(usage *usageSet, length, alignment uint64) uint64 {
 	alignMask := alignment - 1
-	for seg := usage.LowerBoundSegment(start); seg.Ok(); seg = seg.NextSegment() {
+	var start uint64
+	for seg := usage.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 		r := seg.Range()
-
-		if !foundFirstPage && r.Start > firstPage {
-			foundFirstPage = true
-		}
-
 		if start >= r.End {
 			// start was rounded up to an alignment boundary from the end
-			// of a previous segment and is now beyond r.End.
+			// of a previous segment.
 			continue
 		}
 		// This segment represents allocated or reclaimable pages; only the
@@ -343,11 +312,8 @@ func findUnallocatedRange(usage *usageSet, start, length, alignment uint64) (uin
 			break
 		}
 		start = (r.End + alignMask) &^ alignMask
-		if !foundFirstPage {
-			firstPage = r.End
-		}
 	}
-	return start, firstPage
+	return start
 }
 
 // fallocate(2) modes, defined in Linux's include/uapi/linux/falloc.h.
@@ -463,15 +429,12 @@ func (f *FileMem) findReclaimable() (platform.FileRange, bool) {
 		// Allocate returns the first usable range in offset order and is
 		// currently a linear scan, so reclaiming from the beginning of the
 		// file minimizes the expected latency of Allocate.
-		for seg := f.usage.LowerBoundSegment(f.minReclaimablePage); seg.Ok(); seg = seg.NextSegment() {
+		for seg := f.usage.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 			if seg.ValuePtr().refs == 0 {
-				f.minReclaimablePage = seg.End()
 				return seg.Range(), true
 			}
 		}
 		f.reclaimable = false
-		// No pages are reclaimable.
-		f.minReclaimablePage = maxPage
 	}
 }
 
@@ -498,10 +461,6 @@ func (f *FileMem) markReclaimed(fr platform.FileRange) {
 	// caller of markReclaimed may not have decommitted it, so we can only mark
 	// fr as reclaimed.
 	f.usage.Remove(f.usage.Isolate(seg, fr))
-	if fr.Start < f.minUnallocatedPage {
-		// We've deallocated at least one lower page.
-		f.minUnallocatedPage = fr.Start
-	}
 }
 
 // MapInto implements platform.File.MapInto.
@@ -547,13 +506,11 @@ func (f *FileMem) IncRef(fr platform.FileRange) {
 	defer f.mu.Unlock()
 
 	gap := f.usage.ApplyContiguous(fr, func(seg usageIterator) {
-		seg.ValuePtr().refs++
+		seg.ValuePtr().incRef()
 	})
 	if gap.Ok() {
 		panic(fmt.Sprintf("IncRef(%v): attempted to IncRef on unallocated pages %v:\n%v", fr, gap.Range(), &f.usage))
 	}
-
-	f.usage.MergeAdjacent(fr)
 }
 
 // DecRef implements platform.File.DecRef.
@@ -570,10 +527,7 @@ func (f *FileMem) DecRef(fr platform.FileRange) {
 	for seg := f.usage.FindSegment(fr.Start); seg.Ok() && seg.Start() < fr.End; seg = seg.NextSegment() {
 		seg = f.usage.Isolate(seg, fr)
 		val := seg.ValuePtr()
-		if val.refs == 0 {
-			panic(fmt.Sprintf("DecRef(%v): 0 existing references on %v:\n%v", fr, seg.Range(), &f.usage))
-		}
-		val.refs--
+		val.decRef()
 		if val.refs == 0 {
 			freed = true
 			// Reclassify memory as System, until it's freed by the reclaim
@@ -587,10 +541,6 @@ func (f *FileMem) DecRef(fr platform.FileRange) {
 	f.usage.MergeAdjacent(fr)
 
 	if freed {
-		if fr.Start < f.minReclaimablePage {
-			// We've freed at least one lower page.
-			f.minReclaimablePage = fr.Start
-		}
 		f.reclaimable = true
 		f.reclaimCond.Signal()
 	}

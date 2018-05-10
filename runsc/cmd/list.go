@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,18 +15,18 @@
 package cmd
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"text/tabwriter"
 	"time"
 
+	"context"
 	"flag"
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.googlesource.com/gvisor/runsc/boot"
-	"gvisor.googlesource.com/gvisor/runsc/container"
+	"gvisor.googlesource.com/gvisor/runsc/sandbox"
 )
 
 // List implements subcommands.Command for the "list" command for the "list" command.
@@ -64,7 +64,7 @@ func (l *List) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 	}
 
 	conf := args[0].(*boot.Config)
-	ids, err := container.List(conf.RootDir)
+	ids, err := sandbox.List(conf.RootDir)
 	if err != nil {
 		Fatalf("%v", err)
 	}
@@ -76,14 +76,14 @@ func (l *List) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 		return subcommands.ExitSuccess
 	}
 
-	// Collect the containers.
-	var containers []*container.Container
+	// Collect the sandboxes.
+	var sandboxes []*sandbox.Sandbox
 	for _, id := range ids {
-		c, err := container.Load(conf.RootDir, id)
+		s, err := sandbox.Load(conf.RootDir, id)
 		if err != nil {
-			Fatalf("loading container %q: %v", id, err)
+			Fatalf("error loading sandbox %q: %v", id, err)
 		}
-		containers = append(containers, c)
+		sandboxes = append(sandboxes, s)
 	}
 
 	switch l.format {
@@ -91,24 +91,24 @@ func (l *List) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 		// Print a nice table.
 		w := tabwriter.NewWriter(os.Stdout, 12, 1, 3, ' ', 0)
 		fmt.Fprint(w, "ID\tPID\tSTATUS\tBUNDLE\tCREATED\tOWNER\n")
-		for _, c := range containers {
+		for _, s := range sandboxes {
 			fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\n",
-				c.ID,
-				c.SandboxPid(),
-				c.Status,
-				c.BundleDir,
-				c.CreatedAt.Format(time.RFC3339Nano),
-				c.Owner)
+				s.ID,
+				s.Pid,
+				s.Status,
+				s.BundleDir,
+				s.CreatedAt.Format(time.RFC3339Nano),
+				s.Owner)
 		}
 		w.Flush()
 	case "json":
 		// Print just the states.
 		var states []specs.State
-		for _, c := range containers {
-			states = append(states, c.State())
+		for _, s := range sandboxes {
+			states = append(states, s.State())
 		}
 		if err := json.NewEncoder(os.Stdout).Encode(states); err != nil {
-			Fatalf("marshaling container state: %v", err)
+			Fatalf("error marshaling sandbox state: %v", err)
 		}
 	default:
 		Fatalf("unknown list format %q", l.format)

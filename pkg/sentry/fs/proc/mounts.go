@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"sort"
 
-	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/proc/seqfile"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
@@ -28,22 +27,9 @@ import (
 // forEachMountSource runs f for the process root mount and  each mount that is a
 // descendant of the root.
 func forEachMountSource(t *kernel.Task, fn func(string, *fs.MountSource)) {
-	var fsctx *kernel.FSContext
-	t.WithMuLocked(func(t *kernel.Task) {
-		fsctx = t.FSContext()
-	})
-	if fsctx == nil {
-		// The task has been destroyed. Nothing to show here.
-		return
-	}
-
 	// All mount points must be relative to the rootDir, and mounts outside
 	// will be excluded.
-	rootDir := fsctx.RootDirectory()
-	if rootDir == nil {
-		// The task has been destroyed. Nothing to show here.
-		return
-	}
+	rootDir := t.FSContext().RootDirectory()
 	defer rootDir.DecRef()
 
 	if rootDir.Inode == nil {
@@ -58,9 +44,7 @@ func forEachMountSource(t *kernel.Task, fn func(string, *fs.MountSource)) {
 		return ms[i].ID() < ms[j].ID()
 	})
 	for _, m := range ms {
-		mroot := m.Root()
-		mountPath, desc := mroot.FullName(rootDir)
-		mroot.DecRef()
+		mountPath, desc := m.Root().FullName(rootDir)
 		if !desc {
 			// MountSources that are not descendants of the chroot jail are ignored.
 			continue
@@ -71,8 +55,6 @@ func forEachMountSource(t *kernel.Task, fn func(string, *fs.MountSource)) {
 }
 
 // mountInfoFile is used to implement /proc/[pid]/mountinfo.
-//
-// +stateify savable
 type mountInfoFile struct {
 	t *kernel.Task
 }
@@ -83,7 +65,7 @@ func (mif *mountInfoFile) NeedsUpdate(_ int64) bool {
 }
 
 // ReadSeqFileData implements SeqSource.ReadSeqFileData.
-func (mif *mountInfoFile) ReadSeqFileData(ctx context.Context, handle seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
+func (mif *mountInfoFile) ReadSeqFileData(handle seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
 	if handle != nil {
 		return nil, 0
 	}
@@ -106,9 +88,7 @@ func (mif *mountInfoFile) ReadSeqFileData(ctx context.Context, handle seqfile.Se
 
 		// (3) Major:Minor device ID. We don't have a superblock, so we
 		// just use the root inode device number.
-		mroot := m.Root()
-		sa := mroot.Inode.StableAttr
-		mroot.DecRef()
+		sa := m.Root().Inode.StableAttr
 		fmt.Fprintf(&buf, "%d:%d ", sa.DeviceFileMajor, sa.DeviceFileMinor)
 
 		// (4) Root: the pathname of the directory in the filesystem
@@ -154,8 +134,6 @@ func (mif *mountInfoFile) ReadSeqFileData(ctx context.Context, handle seqfile.Se
 }
 
 // mountsFile is used to implement /proc/[pid]/mountinfo.
-//
-// +stateify savable
 type mountsFile struct {
 	t *kernel.Task
 }
@@ -166,14 +144,14 @@ func (mf *mountsFile) NeedsUpdate(_ int64) bool {
 }
 
 // ReadSeqFileData implements SeqSource.ReadSeqFileData.
-func (mf *mountsFile) ReadSeqFileData(ctx context.Context, handle seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
+func (mf *mountsFile) ReadSeqFileData(handle seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
 	if handle != nil {
 		return nil, 0
 	}
 
 	var buf bytes.Buffer
 	forEachMountSource(mf.t, func(mountPath string, m *fs.MountSource) {
-		// Format:
+		// Format (tab-separated):
 		// <special device or remote filesystem> <mount point> <filesystem type> <mount options> <needs dump> <fsck order>
 		//
 		// We use the filesystem name as the first field, since there
@@ -191,7 +169,7 @@ func (mf *mountsFile) ReadSeqFileData(ctx context.Context, handle seqfile.SeqHan
 		if m.Filesystem != nil {
 			name = m.Filesystem.Name()
 		}
-		fmt.Fprintf(&buf, "%s %s %s %s %d %d\n", "none", mountPath, name, opts, 0, 0)
+		fmt.Fprintf(&buf, "%s\t%s\t%s\t%s\t%d\t%d\n", "none", mountPath, name, opts, 0, 0)
 	})
 
 	return []seqfile.SeqData{{Buf: buf.Bytes(), Handle: (*mountsFile)(nil)}}, 0

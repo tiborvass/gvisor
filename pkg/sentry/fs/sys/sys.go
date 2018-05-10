@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,18 +22,13 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 )
 
-func newFile(node fs.InodeOperations, msrc *fs.MountSource) *fs.Inode {
-	sattr := fs.StableAttr{
-		DeviceID:  sysfsDevice.DeviceID(),
-		InodeID:   sysfsDevice.NextIno(),
-		BlockSize: usermem.PageSize,
-		Type:      fs.SpecialFile,
-	}
-	return fs.NewInode(node, msrc, sattr)
+type Dir struct {
+	ramfs.Dir
 }
 
 func newDir(ctx context.Context, msrc *fs.MountSource, contents map[string]*fs.Inode) *fs.Inode {
-	d := ramfs.NewDir(ctx, contents, fs.RootOwner, fs.FilePermsFromMode(0555))
+	d := &Dir{}
+	d.InitDir(ctx, contents, fs.RootOwner, fs.FilePermsFromMode(0555))
 	return fs.NewInode(d, msrc, fs.StableAttr{
 		DeviceID:  sysfsDevice.DeviceID(),
 		InodeID:   sysfsDevice.NextIno(),
@@ -48,13 +43,11 @@ func New(ctx context.Context, msrc *fs.MountSource) *fs.Inode {
 		// Add a basic set of top-level directories. In Linux, these
 		// are dynamically added depending on the KConfig. Here we just
 		// add the most common ones.
-		"block": newDir(ctx, msrc, nil),
-		"bus":   newDir(ctx, msrc, nil),
-		"class": newDir(ctx, msrc, map[string]*fs.Inode{
-			"power_supply": newDir(ctx, msrc, nil),
-		}),
+		"block":    newDir(ctx, msrc, nil),
+		"bus":      newDir(ctx, msrc, nil),
+		"class":    newDir(ctx, msrc, nil),
 		"dev":      newDir(ctx, msrc, nil),
-		"devices":  newDevicesDir(ctx, msrc),
+		"devices":  newDir(ctx, msrc, nil),
 		"firmware": newDir(ctx, msrc, nil),
 		"fs":       newDir(ctx, msrc, nil),
 		"kernel":   newDir(ctx, msrc, nil),

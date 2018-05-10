@@ -1,22 +1,11 @@
-// Copyright 2018 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 The Netstack Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 package header
 
 import (
 	"encoding/binary"
-	"strings"
 
 	"gvisor.googlesource.com/gvisor/pkg/tcpip"
 )
@@ -77,9 +66,6 @@ const (
 	// IPv6MinimumMTU is the minimum MTU required by IPv6, per RFC 2460,
 	// section 5.
 	IPv6MinimumMTU = 1280
-
-	// IPv6Any is the non-routable IPv6 "any" meta address.
-	IPv6Any tcpip.Address = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
 )
 
 // PayloadLength returns the value of the "payload length" field of the ipv6
@@ -194,55 +180,12 @@ func IsV4MappedAddress(addr tcpip.Address) bool {
 		return false
 	}
 
-	return strings.HasPrefix(string(addr), "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff")
-}
-
-// IsV6MulticastAddress determines if the provided address is an IPv6
-// multicast address (anything starting with FF).
-func IsV6MulticastAddress(addr tcpip.Address) bool {
-	if len(addr) != IPv6AddressSize {
-		return false
+	const prefix = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff"
+	for i := 0; i < len(prefix); i++ {
+		if prefix[i] != addr[i] {
+			return false
+		}
 	}
-	return addr[0] == 0xff
-}
 
-// SolicitedNodeAddr computes the solicited-node multicast address. This is
-// used for NDP. Described in RFC 4291. The argument must be a full-length IPv6
-// address.
-func SolicitedNodeAddr(addr tcpip.Address) tcpip.Address {
-	const solicitedNodeMulticastPrefix = "\xff\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\xff"
-	return solicitedNodeMulticastPrefix + addr[len(addr)-3:]
-}
-
-// LinkLocalAddr computes the default IPv6 link-local address from a link-layer
-// (MAC) address.
-func LinkLocalAddr(linkAddr tcpip.LinkAddress) tcpip.Address {
-	// Convert a 48-bit MAC to an EUI-64 and then prepend the link-local
-	// header, FE80::.
-	//
-	// The conversion is very nearly:
-	//	aa:bb:cc:dd:ee:ff => FE80::Aabb:ccFF:FEdd:eeff
-	// Note the capital A. The conversion aa->Aa involves a bit flip.
-	lladdrb := [16]byte{
-		0:  0xFE,
-		1:  0x80,
-		8:  linkAddr[0] ^ 2,
-		9:  linkAddr[1],
-		10: linkAddr[2],
-		11: 0xFF,
-		12: 0xFE,
-		13: linkAddr[3],
-		14: linkAddr[4],
-		15: linkAddr[5],
-	}
-	return tcpip.Address(lladdrb[:])
-}
-
-// IsV6LinkLocalAddress determines if the provided address is an IPv6
-// link-local address (fe80::/10).
-func IsV6LinkLocalAddress(addr tcpip.Address) bool {
-	if len(addr) != IPv6AddressSize {
-		return false
-	}
-	return addr[0] == 0xfe && (addr[1]&0xc0) == 0x80
+	return true
 }

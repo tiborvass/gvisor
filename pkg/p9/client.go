@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -116,7 +116,6 @@ func NewClient(socket *unet.Socket, messageSize uint32, version string) (*Client
 			msize: largestFixedSize,
 		}
 	}
-
 	// Compute a payload size and round to 512 (normal block size)
 	// if it's larger than a single block.
 	payloadSize := messageSize - largestFixedSize
@@ -299,9 +298,4 @@ func (c *Client) sendRecv(t message, r message) error {
 // Version returns the negotiated 9P2000.L.Google version number.
 func (c *Client) Version() uint32 {
 	return c.version
-}
-
-// Close closes the underlying socket.
-func (c *Client) Close() error {
-	return c.socket.Close()
 }

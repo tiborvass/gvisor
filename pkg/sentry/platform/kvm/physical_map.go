@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -205,19 +205,17 @@ func applyPhysicalRegions(fn func(pr physicalRegion) bool) bool {
 	return true
 }
 
-// translateToPhysical translates the given virtual address.
+// TranslateToPhysical translates the given virtual address.
 //
 // Precondition: physicalInit must have been called.
-//
-//go:nosplit
-func translateToPhysical(virtual uintptr) (physical uintptr, length uintptr, ok bool) {
-	for _, pr := range physicalRegions {
+func TranslateToPhysical(virtual uintptr) (physical uintptr, length uintptr, ok bool) {
+	ok = !applyPhysicalRegions(func(pr physicalRegion) bool {
 		if pr.virtual <= virtual && virtual < pr.virtual+pr.length {
 			physical = pr.physical + (virtual - pr.virtual)
 			length = pr.length - (virtual - pr.virtual)
-			ok = true
-			return
+			return false
 		}
-	}
+		return true
+	})
 	return
 }

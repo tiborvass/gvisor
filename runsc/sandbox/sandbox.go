@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,341 +16,461 @@
 package sandbox
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"syscall"
 	"time"
 
-	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/syndtr/gocapability/capability"
+	"golang.org/x/sys/unix"
 	"gvisor.googlesource.com/gvisor/pkg/control/client"
 	"gvisor.googlesource.com/gvisor/pkg/control/server"
 	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/control"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/platform/kvm"
 	"gvisor.googlesource.com/gvisor/pkg/urpc"
 	"gvisor.googlesource.com/gvisor/runsc/boot"
-	"gvisor.googlesource.com/gvisor/runsc/cgroup"
-	"gvisor.googlesource.com/gvisor/runsc/console"
 	"gvisor.googlesource.com/gvisor/runsc/specutils"
 )
 
-// Sandbox wraps a sandbox process.
-//
-// It is used to start/stop sandbox process (and associated processes like
-// gofers), as well as for running and manipulating containers inside a running
-// sandbox.
-//
-// Note: Sandbox must be immutable because a copy of it is saved for each
-// container and changes would not be synchronized to all of them.
-type Sandbox struct {
-	// ID is the id of the sandbox (immutable). By convention, this is the same
-	// ID as the first container run in the sandbox.
-	ID string `json:"id"`
+// metadataFilename is the name of the metadata file relative to sandboxRoot
+// that holds sandbox metadata.
+const metadataFilename = "meta.json"
 
-	// Pid is the pid of the running sandbox (immutable). May be 0 is the sandbox
-	// is not running.
-	Pid int `json:"pid"`
+// See libcontainer/factory_linux.go
+var idRegex = regexp.MustCompile(`^[\w+-\.]+$`)
 
-	// Cgroup has the cgroup configuration for the sandbox.
-	Cgroup *cgroup.Cgroup `json:"cgroup"`
-
-	// child is set if a sandbox process is a child of the current process.
-	//
-	// This field isn't saved to json, because only a creator of sandbox
-	// will have it as a child process.
-	child bool
+// validateID validates the sandbox id.
+func validateID(id string) error {
+	if !idRegex.MatchString(id) {
+		return fmt.Errorf("invalid sandbox id: %v", id)
+	}
+	return nil
 }
 
-// New creates the sandbox process. The caller must call Destroy() on the
-// sandbox.
-func New(id string, spec *specs.Spec, conf *boot.Config, bundleDir, consoleSocket, userLog string, ioFiles []*os.File, cg *cgroup.Cgroup) (*Sandbox, error) {
-	s := &Sandbox{ID: id, Cgroup: cg}
-	// The Cleanup object cleans up partially created sandboxes when an error
-	// occurs. Any errors occurring during cleanup itself are ignored.
-	c := specutils.MakeCleanup(func() {
-		err := s.destroy()
-		log.Warningf("error destroying sandbox: %v", err)
-	})
-	defer c.Clean()
-
-	// Create pipe to synchronize when sandbox process has been booted.
-	fds := make([]int, 2)
-	if err := syscall.Pipe(fds); err != nil {
-		return nil, fmt.Errorf("creating pipe for sandbox %q: %v", s.ID, err)
+func validateSpec(spec *specs.Spec) error {
+	if spec.Process.SelinuxLabel != "" {
+		return fmt.Errorf("SELinux is not supported: %s", spec.Process.SelinuxLabel)
 	}
-	clientSyncFile := os.NewFile(uintptr(fds[0]), "client sandbox sync")
-	defer clientSyncFile.Close()
 
-	sandboxSyncFile := os.NewFile(uintptr(fds[1]), "sandbox sync")
+	// Docker uses AppArmor by default, so just log that it's being ignored.
+	if spec.Process.ApparmorProfile != "" {
+		log.Warningf("AppArmor profile %q is being ignored", spec.Process.ApparmorProfile)
+	}
+	// TODO: Apply seccomp to application inside sandbox.
+	if spec.Linux != nil && spec.Linux.Seccomp != nil {
+		log.Warningf("Seccomp spec is being ignored")
+	}
+	return nil
+}
 
-	// Create the sandbox process.
-	err := s.createSandboxProcess(spec, conf, bundleDir, consoleSocket, userLog, ioFiles, sandboxSyncFile)
-	// sandboxSyncFile has to be closed to be able to detect when the sandbox
-	// process exits unexpectedly.
-	sandboxSyncFile.Close()
-	if err != nil {
+// Sandbox wraps a child sandbox process, and is responsible for saving and
+// loading sandbox metadata to disk.
+//
+// Within a root directory, we maintain subdirectories for each sandbox named
+// with the sandbox id.  The sandbox metadata is is stored as json within the
+// sandbox directory in a file named "meta.json".  This metadata format is
+// defined by us, and is not part of the OCI spec.
+//
+// Sandboxes must write this metadata file after any change to their internal
+// state.  The entire sandbox directory is deleted when the sandbox is
+// destroyed.
+//
+// TODO: Protect against concurrent changes to the sandbox metadata
+// file.
+type Sandbox struct {
+	// ID is the sandbox ID.
+	ID string `json:"id"`
+
+	// Spec is the OCI runtime spec that configures this sandbox.
+	Spec *specs.Spec `json:"spec"`
+
+	// BundleDir is the directory containing the sandbox bundle.
+	BundleDir string `json:"bundleDir"`
+
+	// SandboxRoot is the directory containing the sandbox metadata file.
+	SandboxRoot string `json:"sandboxRoot"`
+
+	// CreatedAt is the time the sandbox was created.
+	CreatedAt time.Time `json:"createdAt"`
+
+	// Owner is the sandbox owner.
+	Owner string `json:"owner"`
+
+	// ConsoleSocket is the path to a unix domain socket that will receive
+	// the console FD.  It is only used during create, so we don't need to
+	// store it in the metadata.
+	ConsoleSocket string `json:"-"`
+
+	// Pid is the pid of the running sandbox.  Only valid if Status is
+	// Created or Running.
+	Pid int `json:"pid"`
+
+	// GoferPid is the pid of the gofer running along side the sandbox. May be 0
+	// if the gofer has been killed or it's not being used.
+	GoferPid int `json:"goferPid"`
+
+	// Status is the current sandbox Status.
+	Status Status `json:"status"`
+}
+
+// Create creates the sandbox subprocess and writes the metadata file.  Args
+// are additional arguments that will be passed to the sandbox process.
+func Create(id string, spec *specs.Spec, conf *boot.Config, bundleDir, consoleSocket, pidFile string, args []string) (*Sandbox, error) {
+	log.Debugf("Create sandbox %q in root dir: %s", id, conf.RootDir)
+	if err := validateID(id); err != nil {
+		return nil, err
+	}
+	if err := validateSpec(spec); err != nil {
 		return nil, err
 	}
 
-	// Wait until the sandbox has booted.
-	b := make([]byte, 1)
-	if l, err := clientSyncFile.Read(b); err != nil || l != 1 {
-		return nil, fmt.Errorf("reading from the start-sync descriptor: %v", err)
+	sandboxRoot := filepath.Join(conf.RootDir, id)
+	if exists(sandboxRoot) {
+		return nil, fmt.Errorf("sandbox with id %q already exists: %q ", id, sandboxRoot)
 	}
 
-	c.Release()
+	s := &Sandbox{
+		ID:            id,
+		Spec:          spec,
+		ConsoleSocket: consoleSocket,
+		BundleDir:     bundleDir,
+		SandboxRoot:   sandboxRoot,
+		Status:        Creating,
+		Owner:         os.Getenv("USER"),
+	}
+
+	// Create sandbox process. If anything errors between now and the end of this
+	// function, we MUST clean up all sandbox resources.
+	if err := s.createProcesses(conf, args); err != nil {
+		s.Destroy()
+		return nil, err
+	}
+
+	// Wait for the control server to come up (or timeout).  The sandbox is
+	// not "created" until that happens.
+	if err := s.waitForCreated(10 * time.Second); err != nil {
+		s.Destroy()
+		return nil, err
+	}
+
+	s.Status = Created
+	s.CreatedAt = time.Now()
+
+	// Save the metadata file.
+	if err := s.save(); err != nil {
+		s.Destroy()
+		return nil, err
+	}
+
+	// Write the pid file.  Containerd consideres the create complete after
+	// this file is created, so it must be the last thing we do.
+	if pidFile != "" {
+		if err := ioutil.WriteFile(pidFile, []byte(strconv.Itoa(s.Pid)), 0644); err != nil {
+			s.Destroy()
+			return nil, fmt.Errorf("error writing pid file: %v", err)
+		}
+	}
+
 	return s, nil
 }
 
-// CreateContainer creates a non-root container inside the sandbox.
-func (s *Sandbox) CreateContainer(cid string) error {
-	log.Debugf("Create non-root container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid)
-	sandboxConn, err := s.sandboxConnect()
+// Run is a helper that calls Create + Start + Wait.
+func Run(id string, spec *specs.Spec, conf *boot.Config, bundleDir, consoleSocket, pidFile string, args []string) (syscall.WaitStatus, error) {
+	s, err := Create(id, spec, conf, bundleDir, consoleSocket, pidFile, args)
 	if err != nil {
-		return fmt.Errorf("couldn't connect to sandbox: %v", err)
+		return 0, fmt.Errorf("error creating sandbox: %v", err)
 	}
-	defer sandboxConn.Close()
-
-	if err := sandboxConn.Call(boot.ContainerCreate, &cid, nil); err != nil {
-		return fmt.Errorf("creating non-root container %q: %v", cid, err)
+	if err := s.Start(conf); err != nil {
+		return 0, fmt.Errorf("error starting sandbox: %v", err)
 	}
-	return nil
+	return s.Wait()
 }
 
-// StartRoot starts running the root container process inside the sandbox.
-func (s *Sandbox) StartRoot(spec *specs.Spec, conf *boot.Config) error {
-	log.Debugf("Start root sandbox %q, PID: %d", s.ID, s.Pid)
-	conn, err := s.sandboxConnect()
+// Load loads a sandbox from with the given id from a metadata file.
+func Load(rootDir, id string) (*Sandbox, error) {
+	log.Debugf("Load sandbox %q %q", rootDir, id)
+	if err := validateID(id); err != nil {
+		return nil, err
+	}
+	sandboxRoot := filepath.Join(rootDir, id)
+	if !exists(sandboxRoot) {
+		return nil, fmt.Errorf("sandbox with id %q does not exist", id)
+	}
+	metaFile := filepath.Join(sandboxRoot, metadataFilename)
+	if !exists(metaFile) {
+		return nil, fmt.Errorf("sandbox with id %q does not have metadata file %q", id, metaFile)
+	}
+	metaBytes, err := ioutil.ReadFile(metaFile)
 	if err != nil {
+		return nil, fmt.Errorf("error reading sandbox metadata file %q: %v", metaFile, err)
+	}
+	var s Sandbox
+	if err := json.Unmarshal(metaBytes, &s); err != nil {
+		return nil, fmt.Errorf("error unmarshaling sandbox metadata from %q: %v", metaFile, err)
+	}
+
+	// If the status is "Running" or "Created", check that the process
+	// still exists, and set it to Stopped if it does not.
+	//
+	// This is inherently racey.
+	if s.Status == Running || s.Status == Created {
+		// Send signal 0 to check if process exists.
+		if err := s.Signal(0); err != nil {
+			// Process no longer exists.
+			s.Status = Stopped
+			s.Pid = 0
+		}
+	}
+
+	return &s, nil
+}
+
+// List returns all sandbox ids in the given root directory.
+func List(rootDir string) ([]string, error) {
+	log.Debugf("List sandboxes %q", rootDir)
+	fs, err := ioutil.ReadDir(rootDir)
+	if err != nil {
+		return nil, fmt.Errorf("ReadDir(%s) failed: %v", rootDir, err)
+	}
+	var out []string
+	for _, f := range fs {
+		out = append(out, f.Name())
+	}
+	return out, nil
+}
+
+// State returns the metadata of the sandbox.
+func (s *Sandbox) State() specs.State {
+	return specs.State{
+		Version: specs.Version,
+		ID:      s.ID,
+		Status:  s.Status.String(),
+		Pid:     s.Pid,
+		Bundle:  s.BundleDir,
+	}
+}
+
+// Start starts running the containerized process inside the sandbox.
+func (s *Sandbox) Start(conf *boot.Config) error {
+	log.Debugf("Start sandbox %q, pid: %d", s.ID, s.Pid)
+	if s.Status != Created {
+		return fmt.Errorf("cannot start container in state %s", s.Status)
+	}
+
+	// "If any prestart hook fails, the runtime MUST generate an error,
+	// stop and destroy the container".
+	if s.Spec.Hooks != nil {
+		if err := executeHooks(s.Spec.Hooks.Prestart, s.State()); err != nil {
+			s.Destroy()
+			return err
+		}
+	}
+
+	c, err := s.connect()
+	if err != nil {
+		s.Destroy()
 		return err
 	}
-	defer conn.Close()
+	defer c.Close()
 
 	// Configure the network.
-	if err := setupNetwork(conn, s.Pid, spec, conf); err != nil {
-		return fmt.Errorf("setting up network: %v", err)
+	if err := setupNetwork(c, s.Pid, s.Spec, conf); err != nil {
+		s.Destroy()
+		return fmt.Errorf("error setting up network: %v", err)
 	}
 
-	// Send a message to the sandbox control server to start the root
-	// container.
-	if err := conn.Call(boot.RootContainerStart, &s.ID, nil); err != nil {
-		return fmt.Errorf("starting root container: %v", err)
+	// Send a message to the sandbox control server to start the
+	// application.
+	if err := c.Call(boot.ApplicationStart, nil, nil); err != nil {
+		s.Destroy()
+		return fmt.Errorf("error starting application %v: %v", s.Spec.Process.Args, err)
 	}
 
-	return nil
+	// "If any poststart hook fails, the runtime MUST log a warning, but
+	// the remaining hooks and lifecycle continue as if the hook had
+	// succeeded".
+	if s.Spec.Hooks != nil {
+		executeHooksBestEffort(s.Spec.Hooks.Poststart, s.State())
+	}
+
+	s.Status = Running
+	return s.save()
 }
 
-// StartContainer starts running a non-root container inside the sandbox.
-func (s *Sandbox) StartContainer(spec *specs.Spec, conf *boot.Config, cid string, goferFiles []*os.File) error {
-	for _, f := range goferFiles {
-		defer f.Close()
+// Processes retrieves the list of processes and associated metadata inside a
+// sandbox.
+func (s *Sandbox) Processes() ([]*control.Process, error) {
+	if s.Status != Running {
+		return nil, fmt.Errorf("cannot get processes of container %q because it isn't running. It is in state %v", s.ID, s.Status)
 	}
 
-	log.Debugf("Start non-root container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid)
-	sandboxConn, err := s.sandboxConnect()
-	if err != nil {
-		return fmt.Errorf("couldn't connect to sandbox: %v", err)
-	}
-	defer sandboxConn.Close()
-
-	// The payload must container stdin/stdout/stderr followed by gofer
-	// files.
-	files := append([]*os.File{os.Stdin, os.Stdout, os.Stderr}, goferFiles...)
-	// Start running the container.
-	args := boot.StartArgs{
-		Spec:        spec,
-		Conf:        conf,
-		CID:         cid,
-		FilePayload: urpc.FilePayload{Files: files},
-	}
-	if err := sandboxConn.Call(boot.ContainerStart, &args, nil); err != nil {
-		return fmt.Errorf("starting non-root container %v: %v", spec.Process.Args, err)
-	}
-	return nil
-}
-
-// Restore sends the restore call for a container in the sandbox.
-func (s *Sandbox) Restore(cid string, spec *specs.Spec, conf *boot.Config, filename string) error {
-	log.Debugf("Restore sandbox %q", s.ID)
-
-	rf, err := os.Open(filename)
-	if err != nil {
-		return fmt.Errorf("opening restore file %q failed: %v", filename, err)
-	}
-	defer rf.Close()
-
-	opt := boot.RestoreOpts{
-		FilePayload: urpc.FilePayload{
-			Files: []*os.File{rf},
-		},
-		SandboxID: s.ID,
-	}
-
-	// If the platform needs a device FD we must pass it in.
-	if deviceFile, err := deviceFileForPlatform(conf.Platform); err != nil {
-		return err
-	} else if deviceFile != nil {
-		defer deviceFile.Close()
-		opt.FilePayload.Files = append(opt.FilePayload.Files, deviceFile)
-	}
-
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	// Configure the network.
-	if err := setupNetwork(conn, s.Pid, spec, conf); err != nil {
-		return fmt.Errorf("setting up network: %v", err)
-	}
-
-	// Restore the container and start the root container.
-	if err := conn.Call(boot.ContainerRestore, &opt, nil); err != nil {
-		return fmt.Errorf("restoring container %q: %v", cid, err)
-	}
-
-	return nil
-}
-
-// Processes retrieves the list of processes and associated metadata for a
-// given container in this sandbox.
-func (s *Sandbox) Processes(cid string) ([]*control.Process, error) {
-	log.Debugf("Getting processes for container %q in sandbox %q", cid, s.ID)
-	conn, err := s.sandboxConnect()
+	c, err := s.connect()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer c.Close()
 
 	var pl []*control.Process
-	if err := conn.Call(boot.ContainerProcesses, &cid, &pl); err != nil {
-		return nil, fmt.Errorf("retrieving process data from sandbox: %v", err)
+	if err := c.Call(boot.ApplicationProcesses, nil, &pl); err != nil {
+		return nil, fmt.Errorf("error retrieving process data from sandbox: %v", err)
 	}
 	return pl, nil
 }
 
-// Execute runs the specified command in the container. It returns the PID of
-// the newly created process.
-func (s *Sandbox) Execute(args *control.ExecArgs) (int32, error) {
-	log.Debugf("Executing new process in container %q in sandbox %q", args.ContainerID, s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return 0, s.connError(err)
+// Execute runs the specified command in the sandbox.
+func (s *Sandbox) Execute(e *control.ExecArgs) (syscall.WaitStatus, error) {
+	log.Debugf("Execute in sandbox %q, pid: %d, args: %+v", s.ID, s.Pid, e)
+	if s.Status != Created && s.Status != Running {
+		return 0, fmt.Errorf("cannot exec in container in state %s", s.Status)
 	}
-	defer conn.Close()
 
-	// Send a message to the sandbox control server to start the container.
-	var pid int32
-	if err := conn.Call(boot.ContainerExecuteAsync, args, &pid); err != nil {
-		return 0, fmt.Errorf("executing command %q in sandbox: %v", args, err)
+	log.Debugf("Connecting to sandbox...")
+	c, err := s.connect()
+	if err != nil {
+		return 0, fmt.Errorf("error connecting to control server at pid %d: %v", s.Pid, err)
 	}
-	return pid, nil
+	defer c.Close()
+
+	// Send a message to the sandbox control server to start the application.
+	var waitStatus uint32
+	if err := c.Call(boot.ApplicationExecute, e, &waitStatus); err != nil {
+		return 0, fmt.Errorf("error executing in sandbox: %v", err)
+	}
+
+	return syscall.WaitStatus(waitStatus), nil
 }
 
 // Event retrieves stats about the sandbox such as memory and CPU utilization.
-func (s *Sandbox) Event(cid string) (*boot.Event, error) {
-	log.Debugf("Getting events for container %q in sandbox %q", cid, s.ID)
-	conn, err := s.sandboxConnect()
+func (s *Sandbox) Event() (*boot.Event, error) {
+	if s.Status != Running && s.Status != Created {
+		return nil, fmt.Errorf("cannot get events for container in state: %s", s.Status)
+	}
+
+	c, err := s.connect()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer c.Close()
 
 	var e boot.Event
-	// TODO: Pass in the container id (cid) here. The sandbox
-	// should return events only for that container.
-	if err := conn.Call(boot.ContainerEvent, nil, &e); err != nil {
-		return nil, fmt.Errorf("retrieving event data from sandbox: %v", err)
+	if err := c.Call(boot.ApplicationEvent, nil, &e); err != nil {
+		return nil, fmt.Errorf("error retrieving event data from sandbox: %v", err)
 	}
-	e.ID = cid
+	e.ID = s.ID
 	return &e, nil
 }
 
-func (s *Sandbox) sandboxConnect() (*urpc.Client, error) {
-	log.Debugf("Connecting to sandbox %q", s.ID)
-	conn, err := client.ConnectTo(boot.ControlSocketAddr(s.ID))
+func (s *Sandbox) connect() (*urpc.Client, error) {
+	log.Debugf("Connecting to sandbox...")
+	c, err := client.ConnectTo(boot.ControlSocketAddr(s.ID))
 	if err != nil {
-		return nil, s.connError(err)
+		return nil, fmt.Errorf("error connecting to control server at pid %d: %v", s.Pid, err)
 	}
-	return conn, nil
+	return c, nil
 }
 
-func (s *Sandbox) connError(err error) error {
-	return fmt.Errorf("connecting to control server at PID %d: %v", s.Pid, err)
+func (s *Sandbox) createProcesses(conf *boot.Config, args []string) error {
+	binPath, err := specutils.BinPath()
+	if err != nil {
+		return err
+	}
+
+	ioFiles, err := s.createGoferProcess(conf, binPath, args)
+	if err != nil {
+		return err
+	}
+	return s.createSandboxProcess(conf, binPath, args, ioFiles)
+}
+
+func (s *Sandbox) createGoferProcess(conf *boot.Config, binPath string, commonArgs []string) ([]*os.File, error) {
+	if conf.FileAccess != boot.FileAccessProxy {
+		// Don't start a gofer. The sandbox will access host FS directly.
+		return nil, nil
+	}
+
+	var args []string
+	args = append(args, commonArgs...)
+	args = append(args, "gofer", "--bundle", s.BundleDir)
+
+	// Start with root mount and then add any other additional mount.
+	mountCount := 1
+	for _, m := range s.Spec.Mounts {
+		if specutils.Is9PMount(m) {
+			mountCount++
+		}
+	}
+
+	sandEnds := make([]*os.File, 0, mountCount)
+	goferEnds := make([]*os.File, 0, mountCount)
+	for i := 0; i < mountCount; i++ {
+		// Create socket that connects the sandbox and gofer.
+		fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+		if err != nil {
+			return nil, err
+		}
+		sandEnds = append(sandEnds, os.NewFile(uintptr(fds[0]), "sandbox io fd"))
+
+		goferEnd := os.NewFile(uintptr(fds[1]), "gofer io fd")
+		defer goferEnd.Close()
+		goferEnds = append(goferEnds, goferEnd)
+
+		args = append(args, fmt.Sprintf("--io-fds=%d", 3+i))
+	}
+
+	cmd := exec.Command(binPath, args...)
+	cmd.ExtraFiles = goferEnds
+
+	// Setup any uid/gid mappings, and create or join the configured user
+	// namespace so the gofer's view of the filesystem aligns with the
+	// users in the sandbox.
+	setUIDGIDMappings(cmd, s.Spec)
+	nss := filterNS([]specs.LinuxNamespaceType{specs.UserNamespace}, s.Spec)
+
+	// Start the gofer in the given namespace.
+	log.Debugf("Starting gofer: %s %v", binPath, args)
+	if err := startInNS(cmd, nss); err != nil {
+		return nil, err
+	}
+	s.GoferPid = cmd.Process.Pid
+	log.Infof("Gofer started, pid: %d", cmd.Process.Pid)
+	return sandEnds, nil
 }
 
 // createSandboxProcess starts the sandbox as a subprocess by running the "boot"
 // command, passing in the bundle dir.
-func (s *Sandbox) createSandboxProcess(spec *specs.Spec, conf *boot.Config, bundleDir, consoleSocket, userLog string, ioFiles []*os.File, startSyncFile *os.File) error {
+func (s *Sandbox) createSandboxProcess(conf *boot.Config, binPath string, commonArgs []string, ioFiles []*os.File) error {
 	// nextFD is used to get unused FDs that we can pass to the sandbox.  It
 	// starts at 3 because 0, 1, and 2 are taken by stdin/out/err.
 	nextFD := 3
 
-	binPath := specutils.ExePath
-	cmd := exec.Command(binPath, conf.ToFlags()...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{}
-
-	// Open the log files to pass to the sandbox as FDs.
-	//
-	// These flags must come BEFORE the "boot" command in cmd.Args.
-	if conf.LogFilename != "" {
-		logFile, err := os.OpenFile(conf.LogFilename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			return fmt.Errorf("opening log file %q: %v", conf.LogFilename, err)
-		}
-		defer logFile.Close()
-		cmd.ExtraFiles = append(cmd.ExtraFiles, logFile)
-		cmd.Args = append(cmd.Args, "--log-fd="+strconv.Itoa(nextFD))
-		nextFD++
-	}
-	if conf.DebugLog != "" {
-		debugLogFile, err := specutils.DebugLogFile(conf.DebugLog, "boot")
-		if err != nil {
-			return fmt.Errorf("opening debug log file in %q: %v", conf.DebugLog, err)
-		}
-		defer debugLogFile.Close()
-		cmd.ExtraFiles = append(cmd.ExtraFiles, debugLogFile)
-		cmd.Args = append(cmd.Args, "--debug-log-fd="+strconv.Itoa(nextFD))
-		nextFD++
-	}
-
-	// Add the "boot" command to the args.
-	//
-	// All flags after this must be for the boot command
-	cmd.Args = append(cmd.Args, "boot", "--bundle="+bundleDir)
-
-	// Create a socket for the control server and donate it to the sandbox.
-	addr := boot.ControlSocketAddr(s.ID)
-	sockFD, err := server.CreateSocket(addr)
-	log.Infof("Creating sandbox process with addr: %s", addr[1:]) // skip "\00".
+	// Create control server socket here and donate FD to child process because
+	// it may be in a different network namespace and won't be reachable from
+	// outside.
+	fd, err := server.CreateSocket(boot.ControlSocketAddr(s.ID))
 	if err != nil {
-		return fmt.Errorf("creating control server socket for sandbox %q: %v", s.ID, err)
+		return fmt.Errorf("error creating control server socket for sandbox %q: %v", s.ID, err)
 	}
-	controllerFile := os.NewFile(uintptr(sockFD), "control_server_socket")
+
+	consoleEnabled := s.ConsoleSocket != ""
+
+	cmd := exec.Command(binPath, commonArgs...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{}
+	cmd.Args = append(cmd.Args,
+		"boot",
+		"--bundle", s.BundleDir,
+		"--controller-fd="+strconv.Itoa(nextFD),
+		fmt.Sprintf("--console=%t", consoleEnabled))
+	nextFD++
+
+	controllerFile := os.NewFile(uintptr(fd), "control_server_socket")
 	defer controllerFile.Close()
 	cmd.ExtraFiles = append(cmd.ExtraFiles, controllerFile)
-	cmd.Args = append(cmd.Args, "--controller-fd="+strconv.Itoa(nextFD))
-	nextFD++
-
-	// Open the spec file to donate to the sandbox.
-	specFile, err := specutils.OpenCleanSpec(bundleDir)
-	if err != nil {
-		return fmt.Errorf("opening spec file: %v", err)
-	}
-	defer specFile.Close()
-	cmd.ExtraFiles = append(cmd.ExtraFiles, specFile)
-	cmd.Args = append(cmd.Args, "--spec-fd="+strconv.Itoa(nextFD))
-	nextFD++
-
-	cmd.ExtraFiles = append(cmd.ExtraFiles, startSyncFile)
-	cmd.Args = append(cmd.Args, "--start-sync-fd="+strconv.Itoa(nextFD))
-	nextFD++
 
 	// If there is a gofer, sends all socket ends to the sandbox.
 	for _, f := range ioFiles {
@@ -360,76 +480,26 @@ func (s *Sandbox) createSandboxProcess(spec *specs.Spec, conf *boot.Config, bund
 		nextFD++
 	}
 
-	// If the platform needs a device FD we must pass it in.
-	if deviceFile, err := deviceFileForPlatform(conf.Platform); err != nil {
-		return err
-	} else if deviceFile != nil {
-		defer deviceFile.Close()
-		cmd.ExtraFiles = append(cmd.ExtraFiles, deviceFile)
-		cmd.Args = append(cmd.Args, "--device-fd="+strconv.Itoa(nextFD))
-		nextFD++
-	}
-
-	// The current process' stdio must be passed to the application via the
-	// --stdio-fds flag. The stdio of the sandbox process itself must not
-	// be connected to the same FDs, otherwise we risk leaking sandbox
-	// errors to the application, so we set the sandbox stdio to nil,
-	// causing them to read/write from the null device.
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-
 	// If the console control socket file is provided, then create a new
-	// pty master/slave pair and set the TTY on the sandbox process.
-	if consoleSocket != "" {
-		cmd.Args = append(cmd.Args, "--console=true")
-
-		// console.NewWithSocket will send the master on the given
-		// socket, and return the slave.
-		tty, err := console.NewWithSocket(consoleSocket)
+	// pty master/slave pair and set the tty on the sandox process.
+	if consoleEnabled {
+		// setupConsole will send the master on the socket, and return
+		// the slave.
+		tty, err := setupConsole(s.ConsoleSocket)
 		if err != nil {
-			return fmt.Errorf("setting up console with socket %q: %v", consoleSocket, err)
+			return fmt.Errorf("error setting up control socket %q: %v", s.ConsoleSocket, err)
 		}
 		defer tty.Close()
 
-		// Set the TTY as a controlling TTY on the sandbox process.
-		// Note that the Ctty field must be the FD of the TTY in the
-		// *new* process, not this process. Since we are about to
-		// assign the TTY to nextFD, we can use that value here.
-		// stdin, we can use FD 0 here.
+		cmd.Stdin = tty
+		cmd.Stdout = tty
+		cmd.Stderr = tty
 		cmd.SysProcAttr.Setctty = true
-		cmd.SysProcAttr.Ctty = nextFD
-
-		// Pass the tty as all stdio fds to sandbox.
-		for i := 0; i < 3; i++ {
-			cmd.ExtraFiles = append(cmd.ExtraFiles, tty)
-			cmd.Args = append(cmd.Args, "--stdio-fds="+strconv.Itoa(nextFD))
-			nextFD++
-		}
-
-		if conf.Debug {
-			// If debugging, send the boot process stdio to the
-			// TTY, so that it is easier to find.
-			cmd.Stdin = tty
-			cmd.Stdout = tty
-			cmd.Stderr = tty
-		}
+		cmd.SysProcAttr.Ctty = int(tty.Fd())
 	} else {
-		// If not using a console, pass our current stdio as the
-		// container stdio via flags.
-		for _, f := range []*os.File{os.Stdin, os.Stdout, os.Stderr} {
-			cmd.ExtraFiles = append(cmd.ExtraFiles, f)
-			cmd.Args = append(cmd.Args, "--stdio-fds="+strconv.Itoa(nextFD))
-			nextFD++
-		}
-
-		if conf.Debug {
-			// If debugging, send the boot process stdio to the
-			// this process' stdio, so that is is easier to find.
-			cmd.Stdin = os.Stdin
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-		}
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 	}
 
 	// Detach from this session, otherwise cmd will get SIGHUP and SIGCONT
@@ -437,46 +507,52 @@ func (s *Sandbox) createSandboxProcess(spec *specs.Spec, conf *boot.Config, bund
 	cmd.SysProcAttr.Setsid = true
 
 	// nss is the set of namespaces to join or create before starting the sandbox
-	// process. Mount, IPC and UTS namespaces from the host are not used as they
+	// process. IPC and UTS namespaces from the host are not used as they
 	// are virtualized inside the sandbox. Be paranoid and run inside an empty
-	// namespace for these. Don't unshare cgroup because sandbox is added to a
-	// cgroup in the caller's namespace.
-	log.Infof("Sandbox will be started in new mount, IPC and UTS namespaces")
+	// namespace for these.
+	log.Infof("Sandbox will be started in empty IPC and UTS namespaces")
 	nss := []specs.LinuxNamespace{
 		{Type: specs.IPCNamespace},
-		{Type: specs.MountNamespace},
 		{Type: specs.UTSNamespace},
 	}
 
 	if conf.Platform == boot.PlatformPtrace {
-		// TODO: Also set a new PID namespace so that we limit
+		// TODO: Also set an empty PID namespace so that we limit
 		// access to other host processes.
 		log.Infof("Sandbox will be started in the current PID namespace")
 	} else {
-		log.Infof("Sandbox will be started in a new PID namespace")
+		log.Infof("Sandbox will be started in empty PID namespace")
 		nss = append(nss, specs.LinuxNamespace{Type: specs.PIDNamespace})
-		cmd.Args = append(cmd.Args, "--pidns=true")
+	}
+
+	if conf.FileAccess == boot.FileAccessProxy {
+		log.Infof("Sandbox will be started in empty mount namespace")
+		nss = append(nss, specs.LinuxNamespace{Type: specs.MountNamespace})
+	} else {
+		log.Infof("Sandbox will be started in the current mount namespace")
 	}
 
 	// Joins the network namespace if network is enabled. the sandbox talks
 	// directly to the host network, which may have been configured in the
 	// namespace.
-	if ns, ok := specutils.GetNS(specs.NetworkNamespace, spec); ok && conf.Network != boot.NetworkNone {
+	if ns, ok := getNS(specs.NetworkNamespace, s.Spec); ok && conf.Network != boot.NetworkNone {
 		log.Infof("Sandbox will be started in the container's network namespace: %+v", ns)
 		nss = append(nss, ns)
 	} else {
-		log.Infof("Sandbox will be started in new network namespace")
+		log.Infof("Sandbox will be started in empty network namespace")
 		nss = append(nss, specs.LinuxNamespace{Type: specs.NetworkNamespace})
 	}
 
-	// User namespace depends on the network type. Host network requires to run
-	// inside the user namespace specified in the spec or the current namespace
-	// if none is configured.
-	if conf.Network == boot.NetworkHost {
-		if userns, ok := specutils.GetNS(specs.UserNamespace, spec); ok {
+	// User namespace depends on the following options:
+	//   - Host network/filesystem: requires to run inside the user namespace
+	//       specified in the spec or the current namespace if none is configured.
+	//   - Gofer: when using a Gofer, the sandbox process can run isolated in an
+	//       empty namespace.
+	if conf.Network == boot.NetworkHost || conf.FileAccess == boot.FileAccessDirect {
+		if userns, ok := getNS(specs.UserNamespace, s.Spec); ok {
 			log.Infof("Sandbox will be started in container's user namespace: %+v", userns)
 			nss = append(nss, userns)
-			specutils.SetUIDGIDMappings(cmd, spec)
+			setUIDGIDMappings(cmd, s.Spec)
 		} else {
 			log.Infof("Sandbox will be started in the current user namespace")
 		}
@@ -485,408 +561,124 @@ func (s *Sandbox) createSandboxProcess(spec *specs.Spec, conf *boot.Config, bund
 		// rules.
 		cmd.Args = append(cmd.Args, "--apply-caps=true")
 
-		// If we have CAP_SYS_ADMIN, we can create an empty chroot and
-		// bind-mount the executable inside it.
-		if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
-			log.Warningf("Running sandbox in test mode without chroot. This is only safe in tests!")
-
-		} else if specutils.HasCapabilities(capability.CAP_SYS_ADMIN) {
-			log.Infof("Sandbox will be started in minimal chroot")
-			cmd.Args = append(cmd.Args, "--setup-root")
-		} else {
-			return fmt.Errorf("can't run sandbox process in minimal chroot since we don't have CAP_SYS_ADMIN")
-		}
 	} else {
-		// If we have CAP_SETUID and CAP_SETGID, then we can also run
-		// as user nobody.
-		if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
-			log.Warningf("Running sandbox in test mode as current user (uid=%d gid=%d). This is only safe in tests!", os.Getuid(), os.Getgid())
-			log.Warningf("Running sandbox in test mode without chroot. This is only safe in tests!")
-		} else if specutils.HasCapabilities(capability.CAP_SETUID, capability.CAP_SETGID) {
-			log.Infof("Sandbox will be started in new user namespace")
-			nss = append(nss, specs.LinuxNamespace{Type: specs.UserNamespace})
-
-			// Map nobody in the new namespace to nobody in the parent namespace.
-			//
-			// A sandbox process will construct an empty
-			// root for itself, so it has to have the CAP_SYS_ADMIN
-			// capability.
-			//
-			// FIXME: The current implementations of
-			// os/exec doesn't allow to set ambient capabilities if
-			// a process is started in a new user namespace. As a
-			// workaround, we start the sandbox process with the 0
-			// UID and then it constructs a chroot and sets UID to
-			// nobody.  https://github.com/golang/go/issues/2315
-			const nobody = 65534
-			cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
-				{
-					ContainerID: int(0),
-					HostID:      int(nobody - 1),
-					Size:        int(1),
-				},
-				{
-					ContainerID: int(nobody),
-					HostID:      int(nobody),
-					Size:        int(1),
-				},
-			}
-			cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{
-				{
-					ContainerID: int(nobody),
-					HostID:      int(nobody),
-					Size:        int(1),
-				},
-			}
-
-			// Set credentials to run as user and group nobody.
-			cmd.SysProcAttr.Credential = &syscall.Credential{
-				Uid: 0,
-				Gid: nobody,
-			}
-			cmd.Args = append(cmd.Args, "--setup-root")
-		} else {
-			return fmt.Errorf("can't run sandbox process as user nobody since we don't have CAP_SETUID or CAP_SETGID")
-		}
-	}
-
-	cmd.Args[0] = "runsc-sandbox"
-
-	if s.Cgroup != nil {
-		cpuNum, err := s.Cgroup.NumCPU()
-		if err != nil {
-			return fmt.Errorf("getting cpu count from cgroups: %v", err)
-		}
-		cmd.Args = append(cmd.Args, "--cpu-num", strconv.Itoa(cpuNum))
-
-		mem, err := s.Cgroup.MemoryLimit()
-		if err != nil {
-			return fmt.Errorf("getting memory limit from cgroups: %v", err)
-		}
-		// When memory limit is unset, a "large" number is returned. In that case,
-		// just stick with the default.
-		if mem < 0x7ffffffffffff000 {
-			cmd.Args = append(cmd.Args, "--total-memory", strconv.FormatUint(mem, 10))
-		}
-	}
-
-	if userLog != "" {
-		f, err := os.OpenFile(userLog, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0664)
-		if err != nil {
-			return fmt.Errorf("opening compat log file: %v", err)
-		}
-		defer f.Close()
-
-		cmd.ExtraFiles = append(cmd.ExtraFiles, f)
-		cmd.Args = append(cmd.Args, "--user-log-fd", strconv.Itoa(nextFD))
-		nextFD++
-	}
-
-	// Add container as the last argument.
-	cmd.Args = append(cmd.Args, s.ID)
-
-	// Log the FDs we are donating to the sandbox process.
-	for i, f := range cmd.ExtraFiles {
-		log.Debugf("Donating FD %d: %q", i+3, f.Name())
+		log.Infof("Sandbox will be started in empty user namespace")
+		nss = append(nss, specs.LinuxNamespace{Type: specs.UserNamespace})
 	}
 
 	log.Debugf("Starting sandbox: %s %v", binPath, cmd.Args)
-	log.Debugf("SysProcAttr: %+v", cmd.SysProcAttr)
-	if err := specutils.StartInNS(cmd, nss); err != nil {
+	if err := startInNS(cmd, nss); err != nil {
 		return err
 	}
-	s.child = true
 	s.Pid = cmd.Process.Pid
-	log.Infof("Sandbox started, PID: %d", s.Pid)
+	log.Infof("Sandbox started, pid: %d", s.Pid)
+	return nil
+}
 
+// waitForCreated waits for the sandbox subprocess control server to be
+// running, at which point the sandbox is in Created state.
+func (s *Sandbox) waitForCreated(timeout time.Duration) error {
+	log.Debugf("Waiting for sandbox %q creation", s.ID)
+
+	ready := func() (bool, error) {
+		c, err := client.ConnectTo(boot.ControlSocketAddr(s.ID))
+		if err != nil {
+			return false, nil
+		}
+		// It's alive!
+		c.Close()
+		return true, nil
+	}
+	if err := specutils.WaitForReady(s.Pid, timeout, ready); err != nil {
+		return fmt.Errorf("unexpected error waiting for sandbox %q, err: %v", s.ID, err)
+	}
 	return nil
 }
 
 // Wait waits for the containerized process to exit, and returns its WaitStatus.
-func (s *Sandbox) Wait(cid string) (syscall.WaitStatus, error) {
-	log.Debugf("Waiting for container %q in sandbox %q", cid, s.ID)
-	var ws syscall.WaitStatus
-
-	if conn, err := s.sandboxConnect(); err != nil {
-		// The sandbox may have exited while before we had a chance to
-		// wait on it.
-		log.Warningf("Wait on container %q failed: %v. Will try waiting on the sandbox process instead.", cid, err)
-	} else {
-		defer conn.Close()
-		// Try the Wait RPC to the sandbox.
-		err = conn.Call(boot.ContainerWait, &cid, &ws)
-		if err == nil {
-			// It worked!
-			return ws, nil
-		}
-		// The sandbox may have exited after we connected, but before
-		// or during the Wait RPC.
-		log.Warningf("Wait RPC to container %q failed: %v. Will try waiting on the sandbox process instead.", cid, err)
-	}
-
-	// The sandbox may have already exited, or exited while handling the
-	// Wait RPC. The best we can do is ask Linux what the sandbox exit
-	// status was, since in most cases that will be the same as the
-	// container exit status.
+func (s *Sandbox) Wait() (syscall.WaitStatus, error) {
+	log.Debugf("Wait on sandbox %q with pid %d", s.ID, s.Pid)
 	p, err := os.FindProcess(s.Pid)
 	if err != nil {
 		// "On Unix systems, FindProcess always succeeds and returns a
-		// Process for the given pid, regardless of whether the process
-		// exists."
-		return ws, fmt.Errorf("Find process %d: %v", s.Pid, err)
+		// Process for the given pid."
+		panic(err)
 	}
 	ps, err := p.Wait()
 	if err != nil {
-		return ws, fmt.Errorf("sandbox no longer running, tried to get exit status, but Wait failed: %v", err)
+		return 0, err
 	}
 	return ps.Sys().(syscall.WaitStatus), nil
 }
 
-// WaitPID waits for process 'pid' in the container's sandbox and returns its
-// WaitStatus.
-func (s *Sandbox) WaitPID(cid string, pid int32, clearStatus bool) (syscall.WaitStatus, error) {
-	log.Debugf("Waiting for PID %d in sandbox %q", pid, s.ID)
-	var ws syscall.WaitStatus
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return ws, err
-	}
-	defer conn.Close()
-
-	args := &boot.WaitPIDArgs{
-		PID:         pid,
-		CID:         cid,
-		ClearStatus: clearStatus,
-	}
-	if err := conn.Call(boot.ContainerWaitPID, args, &ws); err != nil {
-		return ws, fmt.Errorf("waiting on PID %d in sandbox %q: %v", pid, s.ID, err)
-	}
-	return ws, nil
-}
-
-// IsRootContainer returns true if the specified container ID belongs to the
-// root container.
-func (s *Sandbox) IsRootContainer(cid string) bool {
-	return s.ID == cid
-}
-
-// Destroy frees all resources associated with the sandbox. It fails fast and
-// is idempotent.
-func (s *Sandbox) destroy() error {
+// Destroy frees all resources associated with the sandbox.
+func (s *Sandbox) Destroy() error {
 	log.Debugf("Destroy sandbox %q", s.ID)
 	if s.Pid != 0 {
+		// TODO: Too harsh?
 		log.Debugf("Killing sandbox %q", s.ID)
-		if err := syscall.Kill(s.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-			return fmt.Errorf("killing sandbox %q PID %q: %v", s.ID, s.Pid, err)
-		}
-		if err := s.waitForStopped(); err != nil {
-			return fmt.Errorf("waiting sandbox %q stop: %v", s.ID, err)
-		}
+		sendSignal(s.Pid, unix.SIGKILL)
+		s.Pid = 0
+	}
+	if s.GoferPid != 0 {
+		log.Debugf("Killing gofer for sandbox %q", s.ID)
+		sendSignal(s.GoferPid, unix.SIGKILL)
+		s.GoferPid = 0
+	}
+	if err := os.RemoveAll(s.SandboxRoot); err != nil {
+		log.Warningf("Failed to delete sandbox root directory %q, err: %v", s.SandboxRoot, err)
 	}
 
+	// "If any poststop hook fails, the runtime MUST log a warning, but the
+	// remaining hooks and lifecycle continue as if the hook had succeeded".
+	if s.Spec.Hooks != nil && (s.Status == Created || s.Status == Running) {
+		executeHooksBestEffort(s.Spec.Hooks.Poststop, s.State())
+	}
+
+	s.Status = Stopped
 	return nil
 }
 
-// SignalContainer sends the signal to a container in the sandbox. If all is
-// true and signal is SIGKILL, then waits for all processes to exit before
-// returning.
-func (s *Sandbox) SignalContainer(cid string, sig syscall.Signal, all bool) error {
+// Signal sends the signal to the sandbox.
+func (s *Sandbox) Signal(sig syscall.Signal) error {
 	log.Debugf("Signal sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
+	if s.Status == Stopped {
+		log.Warningf("sandbox %q not running, not sending signal %v to pid %d", s.ID, sig, s.Pid)
+		return nil
 	}
-	defer conn.Close()
+	return sendSignal(s.Pid, sig)
+}
 
-	mode := boot.DeliverToProcess
-	if all {
-		mode = boot.DeliverToAllProcesses
-	}
-
-	args := boot.SignalArgs{
-		CID:   cid,
-		Signo: int32(sig),
-		Mode:  mode,
-	}
-	if err := conn.Call(boot.ContainerSignal, &args, nil); err != nil {
-		return fmt.Errorf("signaling container %q: %v", cid, err)
+func sendSignal(pid int, sig syscall.Signal) error {
+	if err := syscall.Kill(pid, sig); err != nil {
+		return fmt.Errorf("error sending signal %d to pid %d: %v", sig, pid, err)
 	}
 	return nil
 }
 
-// SignalProcess sends the signal to a particular process in the container. If
-// fgProcess is true, then the signal is sent to the foreground process group
-// in the same session that PID belongs to. This is only valid if the process
-// is attached to a host TTY.
-func (s *Sandbox) SignalProcess(cid string, pid int32, sig syscall.Signal, fgProcess bool) error {
-	log.Debugf("Signal sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
+// save saves the sandbox metadata to a file.
+func (s *Sandbox) save() error {
+	log.Debugf("Save sandbox %q", s.ID)
+	if err := os.MkdirAll(s.SandboxRoot, 0711); err != nil {
+		return fmt.Errorf("error creating sandbox root directory %q: %v", s.SandboxRoot, err)
+	}
+	meta, err := json.Marshal(s)
 	if err != nil {
-		return err
+		return fmt.Errorf("error marshaling sandbox metadata: %v", err)
 	}
-	defer conn.Close()
-
-	mode := boot.DeliverToProcess
-	if fgProcess {
-		mode = boot.DeliverToForegroundProcessGroup
-	}
-
-	args := boot.SignalArgs{
-		CID:   cid,
-		Signo: int32(sig),
-		PID:   pid,
-		Mode:  mode,
-	}
-	if err := conn.Call(boot.ContainerSignal, &args, nil); err != nil {
-		return fmt.Errorf("signaling container %q PID %d: %v", cid, pid, err)
+	metaFile := filepath.Join(s.SandboxRoot, metadataFilename)
+	if err := ioutil.WriteFile(metaFile, meta, 0640); err != nil {
+		return fmt.Errorf("error writing sandbox metadata: %v", err)
 	}
 	return nil
 }
 
-// Checkpoint sends the checkpoint call for a container in the sandbox.
-// The statefile will be written to f.
-func (s *Sandbox) Checkpoint(cid string, f *os.File) error {
-	log.Debugf("Checkpoint sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	opt := control.SaveOpts{
-		FilePayload: urpc.FilePayload{
-			Files: []*os.File{f},
-		},
-	}
-
-	if err := conn.Call(boot.ContainerCheckpoint, &opt, nil); err != nil {
-		return fmt.Errorf("checkpointing container %q: %v", cid, err)
-	}
-	return nil
-}
-
-// Pause sends the pause call for a container in the sandbox.
-func (s *Sandbox) Pause(cid string) error {
-	log.Debugf("Pause sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := conn.Call(boot.ContainerPause, nil, nil); err != nil {
-		return fmt.Errorf("pausing container %q: %v", cid, err)
-	}
-	return nil
-}
-
-// Resume sends the resume call for a container in the sandbox.
-func (s *Sandbox) Resume(cid string) error {
-	log.Debugf("Resume sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := conn.Call(boot.ContainerResume, nil, nil); err != nil {
-		return fmt.Errorf("resuming container %q: %v", cid, err)
-	}
-	return nil
-}
-
-// IsRunning returns true if the sandbox or gofer process is running.
-func (s *Sandbox) IsRunning() bool {
-	if s.Pid != 0 {
-		// Send a signal 0 to the sandbox process.
-		if err := syscall.Kill(s.Pid, 0); err == nil {
-			// Succeeded, process is running.
-			return true
-		}
+// exists returns true if the given file exists.
+func exists(f string) bool {
+	if _, err := os.Stat(f); err == nil {
+		return true
+	} else if !os.IsNotExist(err) {
+		log.Warningf("error checking for file %q: %v", f, err)
 	}
 	return false
-}
-
-// Stacks collects and returns all stacks for the sandbox.
-func (s *Sandbox) Stacks() (string, error) {
-	log.Debugf("Stacks sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return "", err
-	}
-	defer conn.Close()
-
-	var stacks string
-	if err := conn.Call(boot.SandboxStacks, nil, &stacks); err != nil {
-		return "", fmt.Errorf("getting sandbox %q stacks: %v", s.ID, err)
-	}
-	return stacks, nil
-}
-
-// DestroyContainer destroys the given container. If it is the root container,
-// then the entire sandbox is destroyed.
-func (s *Sandbox) DestroyContainer(cid string) error {
-	if s.IsRootContainer(cid) {
-		log.Debugf("Destroying root container %q by destroying sandbox", cid)
-		return s.destroy()
-	}
-
-	if !s.IsRunning() {
-		// Sandbox isn't running anymore, container is already destroyed.
-		return nil
-	}
-
-	log.Debugf("Destroying container %q in sandbox %q", cid, s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if err := conn.Call(boot.ContainerDestroy, &cid, nil); err != nil {
-		return fmt.Errorf("destroying container %q: %v", cid, err)
-	}
-	return nil
-}
-
-func (s *Sandbox) waitForStopped() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	b := backoff.WithContext(backoff.NewConstantBackOff(100*time.Millisecond), ctx)
-	op := func() error {
-		if s.child && s.Pid != 0 {
-			// The sandbox process is a child of the current process,
-			// so we can wait it and collect its zombie.
-			wpid, err := syscall.Wait4(int(s.Pid), nil, syscall.WNOHANG, nil)
-			if err != nil {
-				return fmt.Errorf("error waiting the sandbox process: %v", err)
-			}
-			if wpid == 0 {
-				return fmt.Errorf("sandbox is still running")
-			}
-			s.Pid = 0
-		} else if s.IsRunning() {
-			return fmt.Errorf("sandbox is still running")
-		}
-		return nil
-	}
-	return backoff.Retry(op, b)
-}
-
-// deviceFileForPlatform opens the device file for the given platform. If the
-// platform does not need a device file, then nil is returned.
-func deviceFileForPlatform(p boot.PlatformType) (*os.File, error) {
-	var (
-		f   *os.File
-		err error
-	)
-	switch p {
-	case boot.PlatformKVM:
-		f, err = kvm.OpenDevice()
-	default:
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("opening device file for platform %q: %v", p, err)
-	}
-	return f, err
 }

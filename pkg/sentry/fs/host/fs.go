@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -51,14 +51,10 @@ const maxTraversals = 10
 // to lock down the configurations. This filesystem should only be mounted at root.
 //
 // Think twice before exposing this to applications.
-//
-// +stateify savable
 type Filesystem struct {
 	// whitelist is a set of host paths to whitelist.
 	paths []string
 }
-
-var _ fs.Filesystem = (*Filesystem)(nil)
 
 // Name is the identifier of this file system.
 func (*Filesystem) Name() string {
@@ -68,11 +64,6 @@ func (*Filesystem) Name() string {
 // AllowUserMount prohibits users from using mount(2) with this file system.
 func (*Filesystem) AllowUserMount() bool {
 	return false
-}
-
-// AllowUserList allows this filesystem to be listed in /proc/filesystems.
-func (*Filesystem) AllowUserList() bool {
-	return true
 }
 
 // Flags returns that there is nothing special about this file system.
@@ -172,8 +163,7 @@ func installWhitelist(ctx context.Context, m *fs.MountNamespace, paths []string)
 			current := paths[i][:j]
 
 			// Lookup the given component in the tree.
-			remainingTraversals := uint(maxTraversals)
-			d, err := m.FindLink(ctx, root, nil, current, &remainingTraversals)
+			d, err := m.FindLink(ctx, root, nil, current, maxTraversals)
 			if err != nil {
 				log.Warningf("populate failed for %q: %v", current, err)
 				continue
@@ -271,10 +261,8 @@ func newMountSource(ctx context.Context, root string, mounter fs.FileOwner, file
 }
 
 // superOperations implements fs.MountSourceOperations.
-//
-// +stateify savable
 type superOperations struct {
-	fs.SimpleMountSourceOperations
+	fs.SimpleMountSourceOperations `state:"nosave"`
 
 	// root is the path of the mount point. All inode mappings
 	// are relative to this root.

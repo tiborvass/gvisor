@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import (
 	"debug/elf"
 	"fmt"
 	"io"
+	"syscall"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi"
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
@@ -270,11 +271,6 @@ func mapSegment(ctx context.Context, m *mm.MemoryManager, f *fs.File, phdr *elf.
 		Perms:    prot,
 		MaxPerms: usermem.AnyAccess,
 	}
-	defer func() {
-		if mopts.MappingIdentity != nil {
-			mopts.MappingIdentity.DecRef()
-		}
-	}()
 	if err := f.ConfigureMMap(ctx, &mopts); err != nil {
 		ctx.Infof("File is not memory-mappable: %v", err)
 		return err
@@ -404,11 +400,7 @@ func loadParsedELF(ctx context.Context, m *mm.MemoryManager, f *fs.File, info el
 			}
 
 		case elf.PT_INTERP:
-			if phdr.Filesz < 2 {
-				ctx.Infof("PT_INTERP path too small: %v", phdr.Filesz)
-				return loadedELF{}, syserror.ENOEXEC
-			}
-			if phdr.Filesz > linux.PATH_MAX {
+			if phdr.Filesz > syscall.PathMax {
 				ctx.Infof("PT_INTERP path too big: %v", phdr.Filesz)
 				return loadedELF{}, syserror.ENOEXEC
 			}
@@ -426,26 +418,8 @@ func loadParsedELF(ctx context.Context, m *mm.MemoryManager, f *fs.File, info el
 				return loadedELF{}, syserror.ENOEXEC
 			}
 
-			// Strip NUL-terminator and everything beyond from
-			// string. Note that there may be a NUL-terminator
-			// before len(path)-1.
-			interpreter = string(path[:bytes.IndexByte(path, '\x00')])
-			if interpreter == "" {
-				// Linux actually attempts to open_exec("\0").
-				// open_exec -> do_open_execat fails to check
-				// that name != '\0' before calling
-				// do_filp_open, which thus opens the working
-				// directory.  do_open_execat returns EACCES
-				// because the directory is not a regular file.
-				//
-				// We bypass that nonsense and simply
-				// short-circuit with EACCES. Those this does
-				// mean that there may be some edge cases where
-				// the open path would return a different
-				// error.
-				ctx.Infof("PT_INTERP path is empty: %v", path)
-				return loadedELF{}, syserror.EACCES
-			}
+			// Strip NUL-terminator from string.
+			interpreter = string(path[:len(path)-1])
 		}
 	}
 
@@ -610,7 +584,7 @@ func loadInterpreterELF(ctx context.Context, m *mm.MemoryManager, f *fs.File, in
 //
 // Preconditions:
 //  * f is an ELF file
-func loadELF(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, root, wd *fs.Dirent, maxTraversals *uint, fs *cpuid.FeatureSet, f *fs.File) (loadedELF, arch.Context, error) {
+func loadELF(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, root, wd *fs.Dirent, maxTraversals uint, fs *cpuid.FeatureSet, f *fs.File) (loadedELF, arch.Context, error) {
 	bin, ac, err := loadInitialELF(ctx, m, fs, f)
 	if err != nil {
 		ctx.Infof("Error loading binary: %v", err)
@@ -654,9 +628,6 @@ func loadELF(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace
 		// Start in the interpreter.
 		// N.B. AT_ENTRY above contains the *original* entry point.
 		bin.entry = interp.entry
-	} else {
-		// Always add AT_BASE even if there is no interpreter.
-		bin.auxv = append(bin.auxv, arch.AuxEntry{linux.AT_BASE, 0})
 	}
 
 	return bin, ac, nil

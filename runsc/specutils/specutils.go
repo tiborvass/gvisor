@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,177 +21,77 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
 )
 
-// ExePath must point to runsc binary, which is normally the same binary. It's
-// changed in tests that aren't linked in the same binary.
-var ExePath = "/proc/self/exe"
-
 // LogSpec logs the spec in a human-friendly way.
 func LogSpec(spec *specs.Spec) {
 	log.Debugf("Spec: %+v", spec)
 	log.Debugf("Spec.Hooks: %+v", spec.Hooks)
 	log.Debugf("Spec.Linux: %+v", spec.Linux)
-	if spec.Linux != nil && spec.Linux.Resources != nil {
-		res := spec.Linux.Resources
-		log.Debugf("Spec.Linux.Resources.Memory: %+v", res.Memory)
-		log.Debugf("Spec.Linux.Resources.CPU: %+v", res.CPU)
-		log.Debugf("Spec.Linux.Resources.BlockIO: %+v", res.BlockIO)
-		log.Debugf("Spec.Linux.Resources.Network: %+v", res.Network)
-	}
 	log.Debugf("Spec.Process: %+v", spec.Process)
 	log.Debugf("Spec.Root: %+v", spec.Root)
-	log.Debugf("Spec.Mounts: %+v", spec.Mounts)
-}
-
-// ValidateSpec validates that the spec is compatible with runsc.
-func ValidateSpec(spec *specs.Spec) error {
-	// Mandatory fields.
-	if spec.Process == nil {
-		return fmt.Errorf("Spec.Process must be defined: %+v", spec)
-	}
-	if len(spec.Process.Args) == 0 {
-		return fmt.Errorf("Spec.Process.Arg must be defined: %+v", spec.Process)
-	}
-	if spec.Root == nil {
-		return fmt.Errorf("Spec.Root must be defined: %+v", spec)
-	}
-	if len(spec.Root.Path) == 0 {
-		return fmt.Errorf("Spec.Root.Path must be defined: %+v", spec.Root)
-	}
-
-	// Unsupported fields.
-	if spec.Solaris != nil {
-		return fmt.Errorf("Spec.Solaris is not supported: %+v", spec)
-	}
-	if spec.Windows != nil {
-		return fmt.Errorf("Spec.Windows is not supported: %+v", spec)
-	}
-	if len(spec.Process.SelinuxLabel) != 0 {
-		return fmt.Errorf("SELinux is not supported: %s", spec.Process.SelinuxLabel)
-	}
-
-	// Docker uses AppArmor by default, so just log that it's being ignored.
-	if spec.Process.ApparmorProfile != "" {
-		log.Warningf("AppArmor profile %q is being ignored", spec.Process.ApparmorProfile)
-	}
-
-	// TODO: Apply seccomp to application inside sandbox.
-	if spec.Linux != nil && spec.Linux.Seccomp != nil {
-		log.Warningf("Seccomp spec is being ignored")
-	}
-
-	for i, m := range spec.Mounts {
-		if !path.IsAbs(m.Destination) {
-			return fmt.Errorf("Spec.Mounts[%d] Mount.Destination must be an absolute path: %v", i, m)
-		}
-	}
-
-	// Two annotations are use by containerd to support multi-container pods.
-	//   "io.kubernetes.cri.container-type"
-	//   "io.kubernetes.cri.sandbox-id"
-	containerType, hasContainerType := spec.Annotations[ContainerdContainerTypeAnnotation]
-	_, hasSandboxID := spec.Annotations[ContainerdSandboxIDAnnotation]
-	switch {
-	// Non-containerd use won't set a container type.
-	case !hasContainerType:
-	case containerType == ContainerdContainerTypeSandbox:
-	// When starting a container in an existing sandbox, the sandbox ID
-	// must be set.
-	case containerType == ContainerdContainerTypeContainer:
-		if !hasSandboxID {
-			return fmt.Errorf("spec has container-type of %s, but no sandbox ID set", containerType)
-		}
-	default:
-		return fmt.Errorf("unknown container-type: %s", containerType)
-	}
-
-	return nil
-}
-
-// absPath turns the given path into an absolute path (if it is not already
-// absolute) by prepending the base path.
-func absPath(base, rel string) string {
-	if filepath.IsAbs(rel) {
-		return rel
-	}
-	return filepath.Join(base, rel)
 }
 
 // ReadSpec reads an OCI runtime spec from the given bundle directory.
-// ReadSpec also normalizes all potential relative paths into absolute
-// path, e.g. spec.Root.Path, mount.Source.
+//
+// TODO: This should validate the spec.
 func ReadSpec(bundleDir string) (*specs.Spec, error) {
 	// The spec file must be in "config.json" inside the bundle directory.
-	specPath := filepath.Join(bundleDir, "config.json")
-	specFile, err := os.Open(specPath)
+	specFile := filepath.Join(bundleDir, "config.json")
+	specBytes, err := ioutil.ReadFile(specFile)
 	if err != nil {
-		return nil, fmt.Errorf("error opening spec file %q: %v", specPath, err)
-	}
-	defer specFile.Close()
-	return ReadSpecFromFile(bundleDir, specFile)
-}
-
-// ReadSpecFromFile reads an OCI runtime spec from the given File, and
-// normalizes all relative paths into absolute by prepending the bundle dir.
-func ReadSpecFromFile(bundleDir string, specFile *os.File) (*specs.Spec, error) {
-	if _, err := specFile.Seek(0, os.SEEK_SET); err != nil {
-		return nil, fmt.Errorf("error seeking to beginning of file %q: %v", specFile.Name(), err)
-	}
-	specBytes, err := ioutil.ReadAll(specFile)
-	if err != nil {
-		return nil, fmt.Errorf("error reading spec from file %q: %v", specFile.Name(), err)
+		return nil, fmt.Errorf("error reading spec from file %q: %v", specFile, err)
 	}
 	var spec specs.Spec
 	if err := json.Unmarshal(specBytes, &spec); err != nil {
-		return nil, fmt.Errorf("error unmarshaling spec from file %q: %v\n %s", specFile.Name(), err, string(specBytes))
-	}
-	if err := ValidateSpec(&spec); err != nil {
-		return nil, err
-	}
-	// Turn any relative paths in the spec to absolute by prepending the bundleDir.
-	spec.Root.Path = absPath(bundleDir, spec.Root.Path)
-	for i := range spec.Mounts {
-		m := &spec.Mounts[i]
-		if m.Source != "" {
-			m.Source = absPath(bundleDir, m.Source)
-		}
+		return nil, fmt.Errorf("error unmarshaling spec from file %q: %v\n %s", specFile, err, string(specBytes))
 	}
 	return &spec, nil
 }
 
-// OpenCleanSpec opens spec file that has destination mount paths resolved to
-// their absolute location.
-func OpenCleanSpec(bundleDir string) (*os.File, error) {
-	f, err := os.Open(filepath.Join(bundleDir, "config.clean.json"))
-	if err != nil {
-		return nil, err
-	}
-	if _, err := f.Seek(0, os.SEEK_SET); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("error seeking to beginning of file %q: %v", f.Name(), err)
-	}
-	return f, nil
-}
+// GetExecutablePath returns the absolute path to the executable, relative to
+// the root.  It searches the environment PATH for the first file that exists
+// with the given name.
+func GetExecutablePath(exec, root string, env []string) (string, error) {
+	exec = filepath.Clean(exec)
 
-// WriteCleanSpec writes a spec file that has destination mount paths resolved.
-func WriteCleanSpec(bundleDir string, spec *specs.Spec) error {
-	bytes, err := json.Marshal(spec)
-	if err != nil {
-		return err
+	// Don't search PATH if exec is a path to a file (absolute or relative).
+	if strings.IndexByte(exec, '/') >= 0 {
+		return exec, nil
 	}
-	return ioutil.WriteFile(filepath.Join(bundleDir, "config.clean.json"), bytes, 0755)
+
+	// Get the PATH from the environment.
+	const prefix = "PATH="
+	var path []string
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			path = strings.Split(strings.TrimPrefix(e, prefix), ":")
+			break
+		}
+	}
+
+	// Search the PATH for a file whose name matches the one we are looking
+	// for.
+	for _, p := range path {
+		abs := filepath.Join(root, p, exec)
+		if _, err := os.Stat(abs); err == nil {
+			// We found it!  Return the path relative to the root.
+			return filepath.Join("/", p, exec), nil
+		}
+	}
+
+	// Could not find a suitable path, just return the original string.
+	log.Warningf("could not find executable %s in path %s", exec, path)
+	return exec, nil
 }
 
 // Capabilities takes in spec and returns a TaskCapabilities corresponding to
@@ -215,21 +115,6 @@ func Capabilities(specCaps *specs.LinuxCapabilities) (*auth.TaskCapabilities, er
 		// TODO: Support ambient capabilities.
 	}
 	return &caps, nil
-}
-
-// AllCapabilities returns a LinuxCapabilities struct with all capabilities.
-func AllCapabilities() *specs.LinuxCapabilities {
-	var names []string
-	for n := range capFromName {
-		names = append(names, n)
-	}
-	return &specs.LinuxCapabilities{
-		Bounding:    names,
-		Effective:   names,
-		Inheritable: names,
-		Permitted:   names,
-		Ambient:     names,
-	}
 }
 
 var capFromName = map[string]linux.Capability{
@@ -287,197 +172,45 @@ func capsFromNames(names []string) (auth.CapabilitySet, error) {
 
 // Is9PMount returns true if the given mount can be mounted as an external gofer.
 func Is9PMount(m specs.Mount) bool {
-	return m.Type == "bind" && m.Source != "" && IsSupportedDevMount(m)
+	return m.Type == "bind" && m.Source != "" && !strings.HasPrefix(m.Destination, "/dev")
 }
 
-// IsSupportedDevMount returns true if the mount is a supported /dev mount.
-// Only mount that does not conflict with runsc default /dev mount is
-// supported.
-func IsSupportedDevMount(m specs.Mount) bool {
-	// These are devices exist inside sentry. See pkg/sentry/fs/dev/dev.go
-	var existingDevices = []string{
-		"/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr",
-		"/dev/null", "/dev/zero", "/dev/full", "/dev/random",
-		"/dev/urandom", "/dev/shm", "/dev/pts", "/dev/ptmx",
+// BinPath returns the real path to self, resolving symbolink links. This is done
+// to make the process name appears as 'runsc', instead of 'exe'.
+func BinPath() (string, error) {
+	binPath, err := filepath.EvalSymlinks("/proc/self/exe")
+	if err != nil {
+		return "", fmt.Errorf(`error resolving "/proc/self/exe" symlink: %v`, err)
 	}
-	dst := filepath.Clean(m.Destination)
-	if dst == "/dev" {
-		// OCI spec uses many different mounts for the things inside of '/dev'. We
-		// have a single mount at '/dev' that is always mounted, regardless of
-		// whether it was asked for, as the spec says we SHOULD.
-		return false
-	}
-	for _, dev := range existingDevices {
-		if dst == dev || strings.HasPrefix(dst, dev+"/") {
-			return false
-		}
-	}
-	return true
-}
-
-const (
-	// ContainerdContainerTypeAnnotation is the OCI annotation set by
-	// containerd to indicate whether the container to create should have
-	// its own sandbox or a container within an existing sandbox.
-	ContainerdContainerTypeAnnotation = "io.kubernetes.cri.container-type"
-	// ContainerdContainerTypeContainer is the container type value
-	// indicating the container should be created in an existing sandbox.
-	ContainerdContainerTypeContainer = "container"
-	// ContainerdContainerTypeSandbox is the container type value
-	// indicating the container should be created in a new sandbox.
-	ContainerdContainerTypeSandbox = "sandbox"
-
-	// ContainerdSandboxIDAnnotation is the OCI annotation set to indicate
-	// which sandbox the container should be created in when the container
-	// is not the first container in the sandbox.
-	ContainerdSandboxIDAnnotation = "io.kubernetes.cri.sandbox-id"
-)
-
-// ShouldCreateSandbox returns true if the spec indicates that a new sandbox
-// should be created for the container. If false, the container should be
-// started in an existing sandbox.
-func ShouldCreateSandbox(spec *specs.Spec) bool {
-	t, ok := spec.Annotations[ContainerdContainerTypeAnnotation]
-	return !ok || t == ContainerdContainerTypeSandbox
-}
-
-// SandboxID returns the ID of the sandbox to join and whether an ID was found
-// in the spec.
-func SandboxID(spec *specs.Spec) (string, bool) {
-	id, ok := spec.Annotations[ContainerdSandboxIDAnnotation]
-	return id, ok
+	return binPath, nil
 }
 
 // WaitForReady waits for a process to become ready. The process is ready when
 // the 'ready' function returns true. It continues to wait if 'ready' returns
 // false. It returns error on timeout, if the process stops or if 'ready' fails.
 func WaitForReady(pid int, timeout time.Duration, ready func() (bool, error)) error {
-	b := backoff.NewExponentialBackOff()
-	b.InitialInterval = 1 * time.Millisecond
-	b.MaxInterval = 1 * time.Second
-	b.MaxElapsedTime = timeout
-
-	op := func() error {
+	backoff := 1 * time.Millisecond
+	for start := time.Now(); time.Now().Sub(start) < timeout; {
 		if ok, err := ready(); err != nil {
-			return backoff.Permanent(err)
+			return err
 		} else if ok {
 			return nil
 		}
 
 		// Check if the process is still running.
-		// If the process is alive, child is 0 because of the NOHANG option.
-		// If the process has terminated, child equals the process id.
 		var ws syscall.WaitStatus
 		var ru syscall.Rusage
 		child, err := syscall.Wait4(pid, &ws, syscall.WNOHANG, &ru)
-		if err != nil {
-			return backoff.Permanent(fmt.Errorf("error waiting for process: %v", err))
-		} else if child == pid {
-			return backoff.Permanent(fmt.Errorf("process %d has terminated", pid))
+		if err != nil || child == pid {
+			return fmt.Errorf("process (%d) is not running, err: %v", pid, err)
 		}
-		return fmt.Errorf("process %d not running yet", pid)
-	}
-	return backoff.Retry(op, b)
-}
 
-// DebugLogFile opens a log file using 'logPattern' as location. If 'logPattern'
-// ends with '/', it's used as a directory with default file name.
-// 'logPattern' can contain variables that are substitued:
-//   - %TIMESTAMP%: is replaced with a timestamp using the following format:
-//			<yyyymmdd-hhmmss.uuuuuu>
-//	 - %COMMAND%: is replaced with 'command'
-func DebugLogFile(logPattern, command string) (*os.File, error) {
-	if strings.HasSuffix(logPattern, "/") {
-		// Default format: <debug-log>/runsc.log.<yyyymmdd-hhmmss.uuuuuu>.<command>
-		logPattern += "runsc.log.%TIMESTAMP%.%COMMAND%"
-	}
-	logPattern = strings.Replace(logPattern, "%TIMESTAMP%", time.Now().Format("20060102-150405.000000"), -1)
-	logPattern = strings.Replace(logPattern, "%COMMAND%", command, -1)
-
-	dir := filepath.Dir(logPattern)
-	if err := os.MkdirAll(dir, 0775); err != nil {
-		return nil, fmt.Errorf("error creating dir %q: %v", dir, err)
-	}
-	return os.OpenFile(logPattern, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0664)
-}
-
-// Mount creates the mount point and calls Mount with the given flags.
-func Mount(src, dst, typ string, flags uint32) error {
-	// Create the mount point inside. The type must be the same as the
-	// source (file or directory).
-	var isDir bool
-	if typ == "proc" {
-		// Special case, as there is no source directory for proc
-		// mounts.
-		isDir = true
-	} else if fi, err := os.Stat(src); err != nil {
-		return fmt.Errorf("Stat(%q) failed: %v", src, err)
-	} else {
-		isDir = fi.IsDir()
-	}
-
-	if isDir {
-		// Create the destination directory.
-		if err := os.MkdirAll(dst, 0777); err != nil {
-			return fmt.Errorf("Mkdir(%q) failed: %v", dst, err)
-		}
-	} else {
-		// Create the parent destination directory.
-		parent := path.Dir(dst)
-		if err := os.MkdirAll(parent, 0777); err != nil {
-			return fmt.Errorf("Mkdir(%q) failed: %v", parent, err)
-		}
-		// Create the destination file if it does not exist.
-		f, err := os.OpenFile(dst, syscall.O_CREAT, 0777)
-		if err != nil {
-			return fmt.Errorf("Open(%q) failed: %v", dst, err)
-		}
-		f.Close()
-	}
-
-	// Do the mount.
-	if err := syscall.Mount(src, dst, typ, uintptr(flags), ""); err != nil {
-		return fmt.Errorf("Mount(%q, %q, %d) failed: %v", src, dst, flags, err)
-	}
-	return nil
-}
-
-// ContainsStr returns true if 'str' is inside 'strs'.
-func ContainsStr(strs []string, str string) bool {
-	for _, s := range strs {
-		if s == str {
-			return true
+		// Process continues to run, backoff and retry.
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > 1*time.Second {
+			backoff = 1 * time.Second
 		}
 	}
-	return false
-}
-
-// Cleanup allows defers to be aborted when cleanup needs to happen
-// conditionally. Usage:
-// c := MakeCleanup(func() { f.Close() })
-// defer c.Clean() // any failure before release is called will close the file.
-// ...
-// c.Release() // on success, aborts closing the file and return it.
-// return f
-type Cleanup struct {
-	clean func()
-}
-
-// MakeCleanup creates a new Cleanup object.
-func MakeCleanup(f func()) Cleanup {
-	return Cleanup{clean: f}
-}
-
-// Clean calls the cleanup function.
-func (c *Cleanup) Clean() {
-	if c.clean != nil {
-		c.clean()
-		c.clean = nil
-	}
-}
-
-// Release releases the cleanup from its duties, i.e. cleanup function is not
-// called after this point.
-func (c *Cleanup) Release() {
-	c.clean = nil
+	return fmt.Errorf("timed out waiting for process (%d)", pid)
 }

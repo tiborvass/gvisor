@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,8 +29,6 @@ import (
 
 // An idMapSeqSource is a seqfile.SeqSource that returns UID or GID mappings
 // from a task's user namespace.
-//
-// +stateify savable
 type idMapSeqSource struct {
 	t    *kernel.Task
 	gids bool
@@ -42,7 +40,7 @@ func (imss *idMapSeqSource) NeedsUpdate(generation int64) bool {
 }
 
 // ReadSeqFileData implements seqfile.SeqSource.ReadSeqFileData.
-func (imss *idMapSeqSource) ReadSeqFileData(ctx context.Context, handle seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
+func (imss *idMapSeqSource) ReadSeqFileData(handle seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
 	var start int
 	if handle != nil {
 		start = handle.(*idMapSeqHandle).value
@@ -68,13 +66,10 @@ func (imss *idMapSeqSource) ReadSeqFileData(ctx context.Context, handle seqfile.
 }
 
 // TODO: Fix issue requiring idMapSeqHandle wrapping an int.
-//
-// +stateify savable
 type idMapSeqHandle struct {
 	value int
 }
 
-// +stateify savable
 type idMapSeqFile struct {
 	seqfile.SeqFile
 }
@@ -90,13 +85,12 @@ func newGIDMap(t *kernel.Task, msrc *fs.MountSource) *fs.Inode {
 }
 
 func newIDMap(t *kernel.Task, msrc *fs.MountSource, gids bool) *fs.Inode {
-	imsf := &idMapSeqFile{
-		*seqfile.NewSeqFile(t, &idMapSeqSource{
-			t:    t,
-			gids: gids,
-		}),
-	}
-	return newProcInode(imsf, msrc, fs.SpecialFile, t)
+	imsf := &idMapSeqFile{seqfile.SeqFile{SeqSource: &idMapSeqSource{
+		t:    t,
+		gids: gids,
+	}}}
+	imsf.InitEntry(t, fs.RootOwner, fs.FilePermsFromMode(0644))
+	return newFile(imsf, msrc, fs.SpecialFile, t)
 }
 
 func (imsf *idMapSeqFile) source() *idMapSeqSource {
@@ -107,8 +101,8 @@ func (imsf *idMapSeqFile) source() *idMapSeqSource {
 // Linux 3.18, the limit is five lines." - user_namespaces(7)
 const maxIDMapLines = 5
 
-// Write implements fs.FileOperations.Write.
-func (imsf *idMapSeqFile) Write(ctx context.Context, _ *fs.File, src usermem.IOSequence, offset int64) (int64, error) {
+// DeprecatedPwritev implements fs.InodeOperations.DeprecatedPwritev.
+func (imsf *idMapSeqFile) DeprecatedPwritev(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
 	// "In addition, the number of bytes written to the file must be less than
 	// the system page size, and the write must be performed at the start of
 	// the file ..." - user_namespaces(7)

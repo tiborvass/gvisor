@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -86,7 +86,7 @@ func (r *Route) toTcpipRoute(id tcpip.NICID) tcpip.Route {
 	return tcpip.Route{
 		Destination: ipToAddress(r.Destination),
 		Gateway:     ipToAddress(r.Gateway),
-		Mask:        ipToAddressMask(net.IP(r.Mask)),
+		Mask:        ipToAddress(net.IP(r.Mask)),
 		NIC:         id,
 	}
 }
@@ -133,16 +133,15 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 			return fmt.Errorf("failed to dup FD %v: %v", oldFD, err)
 		}
 
-		mac := tcpip.LinkAddress(generateRndMac())
 		linkEP := fdbased.New(&fdbased.Options{
-			FD:             newFD,
-			MTU:            uint32(link.MTU),
-			EthernetHeader: true,
-			HandleLocal:    true,
-			Address:        mac,
+			FD:              newFD,
+			MTU:             uint32(link.MTU),
+			ChecksumOffload: false,
+			EthernetHeader:  true,
+			Address:         tcpip.LinkAddress(generateRndMac()),
 		})
 
-		log.Infof("Enabling interface %q with id %d on addresses %+v (%v)", link.Name, nicID, link.Addresses, mac)
+		log.Infof("Enabling interface %q with id %d on addresses %+v", link.Name, nicID, link.Addresses)
 		if err := n.createNICWithAddrs(nicID, link.Name, linkEP, link.Addresses); err != nil {
 			return err
 		}
@@ -201,12 +200,6 @@ func ipToAddressAndProto(ip net.IP) (tcpip.NetworkProtocolNumber, tcpip.Address)
 func ipToAddress(ip net.IP) tcpip.Address {
 	_, addr := ipToAddressAndProto(ip)
 	return addr
-}
-
-// ipToAddressMask converts IP to tcpip.AddressMask, ignoring the protocol.
-func ipToAddressMask(ip net.IP) tcpip.AddressMask {
-	_, addr := ipToAddressAndProto(ip)
-	return tcpip.AddressMask(addr)
 }
 
 // generateRndMac returns a random local MAC address.

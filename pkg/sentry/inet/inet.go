@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -67,9 +67,6 @@ type Interface struct {
 
 	// Addr is the hardware device address.
 	Addr []byte
-
-	// MTU is the maximum transmission unit.
-	MTU uint32
 }
 
 // InterfaceAddr contains information about a network interface address.
@@ -90,8 +87,6 @@ type InterfaceAddr struct {
 }
 
 // TCPBufferSize contains settings controlling TCP buffer sizing.
-//
-// +stateify savable
 type TCPBufferSize struct {
 	// Min is the minimum size.
 	Min int

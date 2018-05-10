@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,8 +23,6 @@ import (
 // syslog represents a sentry-global kernel log.
 //
 // Currently, it contains only fun messages for a dmesg easter egg.
-//
-// +stateify savable
 type syslog struct {
 	// mu protects the below.
 	mu sync.Mutex `state:"nosave"`
@@ -86,18 +84,14 @@ func (s *syslog) Log() []byte {
 		return m
 	}
 
-	const format = "<6>[%11.6f] %s\n"
-
-	s.msg = append(s.msg, []byte(fmt.Sprintf(format, 0.0, "Starting gVisor..."))...)
-
-	time := 0.1
+	time := 0.0
 	for i := 0; i < 10; i++ {
 		time += rand.Float64() / 2
-		s.msg = append(s.msg, []byte(fmt.Sprintf(format, time, selectMessage()))...)
+		s.msg = append(s.msg, []byte(fmt.Sprintf("<6>[%11.6f] %s\n", time, selectMessage()))...)
 	}
 
 	time += rand.Float64() / 2
-	s.msg = append(s.msg, []byte(fmt.Sprintf(format, time, "Ready!"))...)
+	s.msg = append(s.msg, []byte(fmt.Sprintf("<6>[%11.6f] Ready!\n", time))...)
 
 	// Return a copy.
 	o := make([]byte, len(s.msg))

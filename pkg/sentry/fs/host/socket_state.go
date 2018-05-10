@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,26 +17,23 @@ package host
 import (
 	"fmt"
 	"syscall"
-
-	"gvisor.googlesource.com/gvisor/pkg/fd"
 )
 
 // beforeSave is invoked by stateify.
-func (c *ConnectedEndpoint) beforeSave() {
-	if c.srfd < 0 {
+func (ep *endpoint) beforeSave() {
+	if ep.srfd < 0 {
 		panic("only host file descriptors provided at sentry startup can be saved")
 	}
 }
 
 // afterLoad is invoked by stateify.
-func (c *ConnectedEndpoint) afterLoad() {
-	f, err := syscall.Dup(c.srfd)
+func (ep *endpoint) afterLoad() {
+	fd, err := syscall.Dup(ep.srfd)
 	if err != nil {
-		panic(fmt.Sprintf("failed to dup restored FD %d: %v", c.srfd, err))
+		panic(fmt.Sprintf("failed to dup restored fd %d: %v", ep.srfd, err))
 	}
-	c.file = fd.New(f)
-	if err := c.init(); err != nil {
-		panic(fmt.Sprintf("Could not restore host socket FD %d: %v", c.srfd, err))
+	ep.fd = fd
+	if err := ep.init(); err != nil {
+		panic(fmt.Sprintf("Could not restore host socket fd %d: %v", ep.srfd, err))
 	}
-	c.Init()
 }

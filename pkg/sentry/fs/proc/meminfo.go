@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"fmt"
 
-	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/proc/seqfile"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usage"
@@ -26,8 +25,6 @@ import (
 )
 
 // meminfoData backs /proc/meminfo.
-//
-// +stateify savable
 type meminfoData struct {
 	// k is the owning Kernel.
 	k *kernel.Kernel
@@ -39,7 +36,7 @@ func (*meminfoData) NeedsUpdate(generation int64) bool {
 }
 
 // ReadSeqFileData implements seqfile.SeqSource.ReadSeqFileData.
-func (d *meminfoData) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
+func (d *meminfoData) ReadSeqFileData(h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
 	if h != nil {
 		return nil, 0
 	}

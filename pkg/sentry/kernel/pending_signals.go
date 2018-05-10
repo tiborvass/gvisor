@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,44 +38,36 @@ const (
 // pendingSignals holds a collection of pending signals. The zero value of
 // pendingSignals is a valid empty collection. pendingSignals is thread-unsafe;
 // users must provide synchronization.
-//
-// +stateify savable
 type pendingSignals struct {
 	// signals contains all pending signals.
 	//
 	// Note that signals is zero-indexed, but signal 1 is the first valid
 	// signal, so signals[0] contains signals with signo 1 etc. This offset is
 	// usually handled by using Signal.index().
-	signals [linux.SignalMaximum]pendingSignalQueue `state:".([]savedPendingSignal)"`
+	signals [linux.SignalMaximum]pendingSignalQueue
 
 	// Bit i of pendingSet is set iff there is at least one signal with signo
 	// i+1 pending.
-	pendingSet linux.SignalSet `state:"manual"`
+	pendingSet linux.SignalSet
 }
 
 // pendingSignalQueue holds a pendingSignalList for a single signal number.
-//
-// +stateify savable
 type pendingSignalQueue struct {
 	pendingSignalList
 	length int
 }
 
-// +stateify savable
 type pendingSignal struct {
 	// pendingSignalEntry links into a pendingSignalList.
 	pendingSignalEntry
 	*arch.SignalInfo
-
-	// If timer is not nil, it is the IntervalTimer which sent this signal.
-	timer *IntervalTimer
 }
 
 // enqueue enqueues the given signal. enqueue returns true on success and false
 // on failure (if the given signal's queue is full).
 //
 // Preconditions: info represents a valid signal.
-func (p *pendingSignals) enqueue(info *arch.SignalInfo, timer *IntervalTimer) bool {
+func (p *pendingSignals) enqueue(info *arch.SignalInfo) bool {
 	sig := linux.Signal(info.Signo)
 	q := &p.signals[sig.Index()]
 	if sig.IsStandard() {
@@ -85,7 +77,7 @@ func (p *pendingSignals) enqueue(info *arch.SignalInfo, timer *IntervalTimer) bo
 	} else if q.length >= rtSignalCap {
 		return false
 	}
-	q.pendingSignalList.PushBack(&pendingSignal{SignalInfo: info, timer: timer})
+	q.pendingSignalList.PushBack(&pendingSignal{SignalInfo: info})
 	q.length++
 	p.pendingSet |= linux.SignalSetOf(sig)
 	return true
@@ -122,20 +114,12 @@ func (p *pendingSignals) dequeueSpecific(sig linux.Signal) *arch.SignalInfo {
 	if q.length == 0 {
 		p.pendingSet &^= linux.SignalSetOf(sig)
 	}
-	if ps.timer != nil {
-		ps.timer.updateDequeuedSignalLocked(ps.SignalInfo)
-	}
 	return ps.SignalInfo
 }
 
 // discardSpecific causes all pending signals with number sig to be discarded.
 func (p *pendingSignals) discardSpecific(sig linux.Signal) {
 	q := &p.signals[sig.Index()]
-	for ps := q.pendingSignalList.Front(); ps != nil; ps = ps.Next() {
-		if ps.timer != nil {
-			ps.timer.signalRejectedLocked()
-		}
-	}
 	q.pendingSignalList.Reset()
 	q.length = 0
 	p.pendingSet &^= linux.SignalSetOf(sig)

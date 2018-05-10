@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,10 +24,10 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/fsutil"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/tmpfs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/memmap"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/platform"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usage"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
-	"gvisor.googlesource.com/gvisor/pkg/waiter"
 )
 
 const (
@@ -39,13 +39,10 @@ const (
 )
 
 // Area implements fs.FileOperations.
-//
-// +stateify savable
 type Area struct {
-	waiter.AlwaysReady       `state:"nosave"`
-	fsutil.FileNoFsync       `state:"nosave"`
-	fsutil.FileNoopFlush     `state:"nosave"`
-	fsutil.FileNotDirReaddir `state:"nosave"`
+	fsutil.NoFsync
+	fsutil.DeprecatedFileOperations
+	fsutil.NotDirReaddir
 
 	ad *Device
 
@@ -99,6 +96,11 @@ func (a *Area) Write(ctx context.Context, file *fs.File, src usermem.IOSequence,
 	return 0, syserror.ENOSYS
 }
 
+// Flush implements fs.FileOperations.Flush.
+func (a *Area) Flush(ctx context.Context, file *fs.File) error {
+	return nil
+}
+
 // ConfigureMMap implements fs.FileOperations.ConfigureMMap.
 func (a *Area) ConfigureMMap(ctx context.Context, file *fs.File, opts *memmap.MMapOpts) error {
 	a.mu.Lock()
@@ -113,8 +115,13 @@ func (a *Area) ConfigureMMap(ctx context.Context, file *fs.File, opts *memmap.MM
 	opts.MaxPerms = opts.MaxPerms.Intersect(a.perms)
 
 	if a.tmpfsFile == nil {
-		tmpfsInodeOps := tmpfs.NewInMemoryFile(ctx, usage.Tmpfs, fs.UnstableAttr{})
-		tmpfsInode := fs.NewInode(tmpfsInodeOps, fs.NewPseudoMountSource(), fs.StableAttr{})
+		p := platform.FromContext(ctx)
+		if p == nil {
+			return syserror.ENOMEM
+		}
+		tmpfsInodeOps := tmpfs.NewInMemoryFile(ctx, usage.Tmpfs, fs.UnstableAttr{}, p)
+		// This is not backed by a real filesystem, so we pass in nil.
+		tmpfsInode := fs.NewInode(tmpfsInodeOps, fs.NewNonCachingMountSource(nil, fs.MountSourceFlags{}), fs.StableAttr{})
 		dirent := fs.NewDirent(tmpfsInode, namePrefix+"/"+a.name)
 		tmpfsFile, err := tmpfsInode.GetFile(ctx, dirent, fs.FileFlags{Read: true, Write: true})
 		// Drop the extra reference on the Dirent.

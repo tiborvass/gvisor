@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,12 +19,11 @@ import (
 	"syscall"
 
 	"gvisor.googlesource.com/gvisor/pkg/refs"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 )
 
-// +stateify savable
 type abstractEndpoint struct {
-	ep   transport.BoundEndpoint
+	ep   unix.BoundEndpoint
 	wr   *refs.WeakRef
 	name string
 	ns   *AbstractSocketNamespace
@@ -40,8 +39,6 @@ func (e *abstractEndpoint) WeakRefGone() {
 }
 
 // AbstractSocketNamespace is used to implement the Linux abstract socket functionality.
-//
-// +stateify savable
 type AbstractSocketNamespace struct {
 	mu sync.Mutex `state:"nosave"`
 
@@ -56,14 +53,14 @@ func NewAbstractSocketNamespace() *AbstractSocketNamespace {
 	}
 }
 
-// A boundEndpoint wraps a transport.BoundEndpoint to maintain a reference on
-// its backing object.
+// A boundEndpoint wraps a unix.BoundEndpoint to maintain a reference on its
+// backing object.
 type boundEndpoint struct {
-	transport.BoundEndpoint
+	unix.BoundEndpoint
 	rc refs.RefCounter
 }
 
-// Release implements transport.BoundEndpoint.Release.
+// Release implements unix.BoundEndpoint.Release.
 func (e *boundEndpoint) Release() {
 	e.rc.DecRef()
 	e.BoundEndpoint.Release()
@@ -71,7 +68,7 @@ func (e *boundEndpoint) Release() {
 
 // BoundEndpoint retrieves the endpoint bound to the given name. The return
 // value is nil if no endpoint was bound.
-func (a *AbstractSocketNamespace) BoundEndpoint(name string) transport.BoundEndpoint {
+func (a *AbstractSocketNamespace) BoundEndpoint(name string) unix.BoundEndpoint {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -93,7 +90,7 @@ func (a *AbstractSocketNamespace) BoundEndpoint(name string) transport.BoundEndp
 //
 // When the last reference managed by rc is dropped, ep may be removed from the
 // namespace.
-func (a *AbstractSocketNamespace) Bind(name string, ep transport.BoundEndpoint, rc refs.RefCounter) error {
+func (a *AbstractSocketNamespace) Bind(name string, ep unix.BoundEndpoint, rc refs.RefCounter) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 

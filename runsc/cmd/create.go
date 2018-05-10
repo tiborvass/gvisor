@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,11 +16,10 @@ package cmd
 
 import (
 	"context"
-
 	"flag"
 	"github.com/google/subcommands"
 	"gvisor.googlesource.com/gvisor/runsc/boot"
-	"gvisor.googlesource.com/gvisor/runsc/container"
+	"gvisor.googlesource.com/gvisor/runsc/sandbox"
 	"gvisor.googlesource.com/gvisor/runsc/specutils"
 )
 
@@ -31,8 +30,8 @@ type Create struct {
 	bundleDir string
 
 	// pidFile is the filename that the sandbox pid will be written to.
-	// This file should only be created once the container process inside
-	// the sandbox is ready to use.
+	// This file should only be created once the sandbox process is ready
+	// to use (i.e. control server has started and is listening).
 	pidFile string
 
 	// consoleSocket is the path to an AF_UNIX socket which will receive a
@@ -40,13 +39,6 @@ type Create struct {
 	// pseudoterminal.  This is ignored unless spec.Process.Terminal is
 	// true.
 	consoleSocket string
-
-	// userLog is the path to send user-visible logs to. This log is different
-	// from debug logs. The former is meant to be consumed by the users and should
-	// contain only information that is relevant to the person running the
-	// container, e.g. unsuported syscalls, while the later is more verbose and
-	// consumed by developers.
-	userLog string
 }
 
 // Name implements subcommands.Command.Name.
@@ -69,8 +61,7 @@ func (*Create) Usage() string {
 func (c *Create) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.bundleDir, "bundle", "", "path to the root of the bundle directory, defaults to the current directory")
 	f.StringVar(&c.consoleSocket, "console-socket", "", "path to an AF_UNIX socket which will receive a file descriptor referencing the master end of the console's pseudoterminal")
-	f.StringVar(&c.pidFile, "pid-file", "", "filename that the container pid will be written to")
-	f.StringVar(&c.userLog, "user-log", "", "filename to send user-visible logs to. Empty means no logging.")
+	f.StringVar(&c.pidFile, "pid-file", "", "filename that the sandbox pid will be written to")
 }
 
 // Execute implements subcommands.Command.Execute.
@@ -89,15 +80,14 @@ func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}
 	}
 	spec, err := specutils.ReadSpec(bundleDir)
 	if err != nil {
-		Fatalf("reading spec: %v", err)
+		Fatalf("error reading spec: %v", err)
 	}
 	specutils.LogSpec(spec)
 
-	// Create the container. A new sandbox will be created for the
-	// container unless the metadata specifies that it should be run in an
-	// existing container.
-	if _, err := container.Create(id, spec, conf, bundleDir, c.consoleSocket, c.pidFile, c.userLog); err != nil {
-		Fatalf("creating container: %v", err)
+	// Create the sandbox process, passing additional command line
+	// arguments to the sandbox process.
+	if _, err := sandbox.Create(id, spec, conf, bundleDir, c.consoleSocket, c.pidFile, commandLineFlags()); err != nil {
+		Fatalf("error creating sandbox: %v", err)
 	}
 	return subcommands.ExitSuccess
 }

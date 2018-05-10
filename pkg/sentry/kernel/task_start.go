@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 package kernel
 
 import (
-	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/futex"
@@ -27,34 +26,19 @@ import (
 // TaskConfig defines the configuration of a new Task (see below).
 type TaskConfig struct {
 	// Kernel is the owning Kernel.
-	Kernel *Kernel
+	*Kernel
 
 	// Parent is the new task's parent. Parent may be nil.
 	Parent *Task
 
-	// If InheritParent is not nil, use InheritParent's parent as the new
-	// task's parent.
-	InheritParent *Task
-
 	// ThreadGroup is the ThreadGroup the new task belongs to.
-	ThreadGroup *ThreadGroup
+	*ThreadGroup
 
-	// SignalMask is the new task's initial signal mask.
-	SignalMask linux.SignalSet
+	// TaskContext is the TaskContext of the new task.
+	*TaskContext
 
-	// TaskContext is the TaskContext of the new task. Ownership of the
-	// TaskContext is transferred to TaskSet.NewTask, whether or not it
-	// succeeds.
-	TaskContext *TaskContext
-
-	// FSContext is the FSContext of the new task. A reference must be held on
-	// FSContext, which is transferred to TaskSet.NewTask whether or not it
-	// succeeds.
-	FSContext *FSContext
-
-	// FDMap is the FDMap of the new task. A reference must be held on FDMap,
-	// which is transferred to TaskSet.NewTask whether or not it succeeds.
-	FDMap *FDMap
+	// TaskResources is the TaskResources of the new task.
+	*TaskResources
 
 	// Credentials is the Credentials of the new task.
 	Credentials *auth.Credentials
@@ -74,30 +58,25 @@ type TaskConfig struct {
 
 	// IPCNamespace is the IPCNamespace of the new task.
 	IPCNamespace *IPCNamespace
-
-	// AbstractSocketNamespace is the AbstractSocketNamespace of the new task.
-	AbstractSocketNamespace *AbstractSocketNamespace
-
-	// ContainerID is the container the new task belongs to.
-	ContainerID string
 }
 
-// NewTask creates a new task defined by cfg.
+// NewTask creates a new task defined by TaskConfig.
+// Whether or not NewTask is successful, it takes ownership of both TaskContext
+// and TaskResources of the TaskConfig.
 //
 // NewTask does not start the returned task; the caller must call Task.Start.
 func (ts *TaskSet) NewTask(cfg *TaskConfig) (*Task, error) {
 	t, err := ts.newTask(cfg)
 	if err != nil {
 		cfg.TaskContext.release()
-		cfg.FSContext.DecRef()
-		cfg.FDMap.DecRef()
+		cfg.TaskResources.release()
 		return nil, err
 	}
 	return t, nil
 }
 
-// newTask is a helper for TaskSet.NewTask that only takes ownership of parts
-// of cfg if it succeeds.
+// newTask is a helper for TaskSet.NewTask that only takes ownership of TaskContext
+// and TaskResources of the TaskConfig if it succeeds.
 func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 	tg := cfg.ThreadGroup
 	tc := cfg.TaskContext
@@ -107,27 +86,23 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 			parent:   cfg.Parent,
 			children: make(map[*Task]struct{}),
 		},
-		runState:        (*runApp)(nil),
-		interruptChan:   make(chan struct{}, 1),
-		signalMask:      cfg.SignalMask,
-		signalStack:     arch.SignalStack{Flags: arch.SignalStackFlagDisable},
-		tc:              *tc,
-		fsc:             cfg.FSContext,
-		fds:             cfg.FDMap,
-		p:               cfg.Kernel.Platform.NewContext(),
-		k:               cfg.Kernel,
-		ptraceTracees:   make(map[*Task]struct{}),
-		allowedCPUMask:  cfg.AllowedCPUMask.Copy(),
-		ioUsage:         &usage.IO{},
-		creds:           cfg.Credentials,
-		niceness:        cfg.Niceness,
-		netns:           cfg.NetworkNamespaced,
-		utsns:           cfg.UTSNamespace,
-		ipcns:           cfg.IPCNamespace,
-		abstractSockets: cfg.AbstractSocketNamespace,
-		rseqCPU:         -1,
-		futexWaiter:     futex.NewWaiter(),
-		containerID:     cfg.ContainerID,
+		runState:       (*runApp)(nil),
+		interruptChan:  make(chan struct{}, 1),
+		signalStack:    arch.SignalStack{Flags: arch.SignalStackFlagDisable},
+		tc:             *tc,
+		tr:             *cfg.TaskResources,
+		p:              cfg.Kernel.Platform.NewContext(),
+		k:              cfg.Kernel,
+		ptraceTracees:  make(map[*Task]struct{}),
+		allowedCPUMask: cfg.AllowedCPUMask.Copy(),
+		ioUsage:        &usage.IO{},
+		creds:          cfg.Credentials,
+		niceness:       cfg.Niceness,
+		netns:          cfg.NetworkNamespaced,
+		utsns:          cfg.UTSNamespace,
+		ipcns:          cfg.IPCNamespace,
+		rseqCPU:        -1,
+		futexWaiter:    futex.NewWaiter(),
 	}
 	t.endStopCond.L = &t.tg.signalHandlers.mu
 	t.ptraceTracer.Store((*Task)(nil))
@@ -158,9 +133,6 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 	// IDs).
 	t.updateLogPrefixLocked()
 
-	if cfg.InheritParent != nil {
-		t.parent = cfg.InheritParent.parent
-	}
 	if t.parent != nil {
 		t.parent.children[t] = struct{}{}
 	}

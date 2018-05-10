@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -48,6 +48,9 @@ var (
 // TODO: Support metric fields.
 //
 type Uint64Metric struct {
+	// metadata describes the metric. It is immutable.
+	metadata *pb.MetricMetadata
+
 	// value is the actual value of the metric. It must be accessed
 	// atomically.
 	value uint64
@@ -98,35 +101,24 @@ func Disable() {
 	}
 }
 
-type customUint64Metric struct {
-	// metadata describes the metric. It is immutable.
-	metadata *pb.MetricMetadata
-
-	// value returns the current value of the metric.
-	value func() uint64
-}
-
-// RegisterCustomUint64Metric registers a metric with the given name.
+// NewUint64Metric creates a new metric with the given name.
 //
-// Register must only be called at init and will return and error if called
-// after Initialized.
-//
-// All metrics must be cumulative, meaning that the return values of value must
-// only increase over time.
+// Metrics must be statically defined (i.e., at startup). NewUint64Metric will
+// return an error if called after Initialized.
 //
 // Preconditions:
 //  * name must be globally unique.
 //  * Initialize/Disable have not been called.
-func RegisterCustomUint64Metric(name string, sync bool, description string, value func() uint64) error {
+func NewUint64Metric(name string, sync bool, description string) (*Uint64Metric, error) {
 	if initialized {
-		return ErrInitializationDone
+		return nil, ErrInitializationDone
 	}
 
 	if _, ok := allMetrics.m[name]; ok {
-		return ErrNameInUse
+		return nil, ErrNameInUse
 	}
 
-	allMetrics.m[name] = customUint64Metric{
+	m := &Uint64Metric{
 		metadata: &pb.MetricMetadata{
 			Name:        name,
 			Description: description,
@@ -134,25 +126,9 @@ func RegisterCustomUint64Metric(name string, sync bool, description string, valu
 			Sync:        sync,
 			Type:        pb.MetricMetadata_UINT64,
 		},
-		value: value,
 	}
-	return nil
-}
-
-// MustRegisterCustomUint64Metric calls RegisterCustomUint64Metric and panics
-// if it returns an error.
-func MustRegisterCustomUint64Metric(name string, sync bool, description string, value func() uint64) {
-	if err := RegisterCustomUint64Metric(name, sync, description, value); err != nil {
-		panic(fmt.Sprintf("Unable to register metric %q: %v", name, err))
-	}
-}
-
-// NewUint64Metric creates and registers a new metric with the given name.
-//
-// Metrics must be statically defined (i.e., at init).
-func NewUint64Metric(name string, sync bool, description string) (*Uint64Metric, error) {
-	var m Uint64Metric
-	return &m, RegisterCustomUint64Metric(name, sync, description, m.Value)
+	allMetrics.m[name] = m
+	return m, nil
 }
 
 // MustCreateNewUint64Metric calls NewUint64Metric and panics if it returns an
@@ -182,13 +158,13 @@ func (m *Uint64Metric) IncrementBy(v uint64) {
 
 // metricSet holds named metrics.
 type metricSet struct {
-	m map[string]customUint64Metric
+	m map[string]*Uint64Metric
 }
 
 // makeMetricSet returns a new metricSet.
 func makeMetricSet() metricSet {
 	return metricSet{
-		m: make(map[string]customUint64Metric),
+		m: make(map[string]*Uint64Metric),
 	}
 }
 
@@ -196,7 +172,7 @@ func makeMetricSet() metricSet {
 func (m *metricSet) Values() metricValues {
 	vals := make(metricValues)
 	for k, v := range m.m {
-		vals[k] = v.value()
+		vals[k] = v.Value()
 	}
 	return vals
 }

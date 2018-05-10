@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -57,6 +57,7 @@ import (
 
 	"gvisor.googlesource.com/gvisor/pkg/binary"
 	"gvisor.googlesource.com/gvisor/pkg/compressio"
+	"gvisor.googlesource.com/gvisor/pkg/hashio"
 )
 
 // keySize is the AES-256 key length.
@@ -138,11 +139,13 @@ func NewWriter(w io.Writer, key []byte, metadata map[string]string) (io.WriteClo
 		}
 	}
 
+	w = hashio.NewWriter(w, h)
+
 	// Wrap in compression. We always use "best speed" mode here. When using
 	// "best compression" mode, there is usually only a little gain in file
 	// size reduction, which translate to even smaller gain in restore
 	// latency reduction, while inccuring much more CPU usage at save time.
-	return compressio.NewWriter(w, key, compressionChunkSize, flate.BestSpeed)
+	return compressio.NewWriter(w, compressionChunkSize, flate.BestSpeed)
 }
 
 // MetadataUnsafe reads out the metadata from a state file without verifying any
@@ -201,7 +204,7 @@ func metadata(r io.Reader, h hash.Hash) (map[string]string, error) {
 			return nil, err
 		}
 		if !hmac.Equal(cur, buf) {
-			return nil, compressio.ErrHashMismatch
+			return nil, hashio.ErrHashMismatch
 		}
 	}
 
@@ -223,8 +226,10 @@ func NewReader(r io.Reader, key []byte) (io.Reader, map[string]string, error) {
 		return nil, nil, err
 	}
 
+	r = hashio.NewReader(r, h)
+
 	// Wrap in compression.
-	rc, err := compressio.NewReader(r, key)
+	rc, err := compressio.NewReader(r)
 	if err != nil {
 		return nil, nil, err
 	}

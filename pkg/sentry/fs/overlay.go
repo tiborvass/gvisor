@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@ package fs
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 
 	"gvisor.googlesource.com/gvisor/pkg/log"
@@ -77,31 +76,21 @@ func XattrOverlayWhiteout(name string) string {
 	return XattrOverlayWhiteoutPrefix + name
 }
 
-// isXattrOverlay returns whether the given extended attribute configures the
-// overlay.
-func isXattrOverlay(name string) bool {
-	return strings.HasPrefix(name, XattrOverlayPrefix)
-}
-
 // NewOverlayRoot produces the root of an overlay.
 //
 // Preconditions:
 //
 // - upper and lower must be non-nil.
-// - upper must not be an overlay.
 // - lower should not expose character devices, pipes, or sockets, because
 //   copying up these types of files is not supported.
-// - lower must not require that file objects be revalidated.
-// - lower must not have dynamic file/directory content.
+// - upper and lower must not require that file objects be revalidated.
+// - upper and lower must not have dynamic file/directory content.
 func NewOverlayRoot(ctx context.Context, upper *Inode, lower *Inode, flags MountSourceFlags) (*Inode, error) {
 	if !IsDir(upper.StableAttr) {
-		return nil, fmt.Errorf("upper Inode is a %v, not a directory", upper.StableAttr.Type)
+		return nil, fmt.Errorf("upper Inode is not a directory")
 	}
 	if !IsDir(lower.StableAttr) {
-		return nil, fmt.Errorf("lower Inode is a %v, not a directory", lower.StableAttr.Type)
-	}
-	if upper.overlay != nil {
-		return nil, fmt.Errorf("cannot nest overlay in upper file of another overlay")
+		return nil, fmt.Errorf("lower Inode is not a directory")
 	}
 
 	msrc := newOverlayMountSource(upper.MountSource, lower.MountSource, flags)
@@ -111,28 +100,6 @@ func NewOverlayRoot(ctx context.Context, upper *Inode, lower *Inode, flags Mount
 		return nil, err
 	}
 
-	return newOverlayInode(ctx, overlay, msrc), nil
-}
-
-// NewOverlayRootFile produces the root of an overlay that points to a file.
-//
-// Preconditions:
-//
-// - lower must be non-nil.
-// - lower should not expose character devices, pipes, or sockets, because
-//   copying up these types of files is not supported. Neither it can be a dir.
-// - lower must not require that file objects be revalidated.
-// - lower must not have dynamic file/directory content.
-func NewOverlayRootFile(ctx context.Context, upperMS *MountSource, lower *Inode, flags MountSourceFlags) (*Inode, error) {
-	if !IsRegular(lower.StableAttr) {
-		return nil, fmt.Errorf("lower Inode is not a regular file")
-	}
-	msrc := newOverlayMountSource(upperMS, lower.MountSource, flags)
-	overlay, err := newOverlayEntry(ctx, nil, lower, true)
-	if err != nil {
-		msrc.DecRef()
-		return nil, err
-	}
 	return newOverlayInode(ctx, overlay, msrc), nil
 }
 
@@ -149,8 +116,6 @@ func newOverlayInode(ctx context.Context, o *overlayEntry, msrc *MountSource) *I
 }
 
 // overlayEntry is the overlay metadata of an Inode. It implements Mappable.
-//
-// +stateify savable
 type overlayEntry struct {
 	// lowerExists is true if an Inode exists for this file in the lower
 	// filesystem. If lowerExists is true, then the overlay must create
@@ -259,32 +224,32 @@ func (o *overlayEntry) isMappableLocked() bool {
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
-func (o *overlayEntry) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64, writable bool) error {
+func (o *overlayEntry) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) error {
 	o.mapsMu.Lock()
 	defer o.mapsMu.Unlock()
-	if err := o.inodeLocked().Mappable().AddMapping(ctx, ms, ar, offset, writable); err != nil {
+	if err := o.inodeLocked().Mappable().AddMapping(ctx, ms, ar, offset); err != nil {
 		return err
 	}
-	o.mappings.AddMapping(ms, ar, offset, writable)
+	o.mappings.AddMapping(ms, ar, offset)
 	return nil
 }
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
-func (o *overlayEntry) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64, writable bool) {
+func (o *overlayEntry) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) {
 	o.mapsMu.Lock()
 	defer o.mapsMu.Unlock()
-	o.inodeLocked().Mappable().RemoveMapping(ctx, ms, ar, offset, writable)
-	o.mappings.RemoveMapping(ms, ar, offset, writable)
+	o.inodeLocked().Mappable().RemoveMapping(ctx, ms, ar, offset)
+	o.mappings.RemoveMapping(ms, ar, offset)
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
-func (o *overlayEntry) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64, writable bool) error {
+func (o *overlayEntry) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64) error {
 	o.mapsMu.Lock()
 	defer o.mapsMu.Unlock()
-	if err := o.inodeLocked().Mappable().CopyMapping(ctx, ms, srcAR, dstAR, offset, writable); err != nil {
+	if err := o.inodeLocked().Mappable().CopyMapping(ctx, ms, srcAR, dstAR, offset); err != nil {
 		return err
 	}
-	o.mappings.AddMapping(ms, dstAR, offset, writable)
+	o.mappings.AddMapping(ms, dstAR, offset)
 	return nil
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package boot
 
 import (
 	"fmt"
+	"syscall"
 
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
@@ -25,62 +26,33 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/limits"
 )
 
-// createFDMap creates an FD map that contains stdin, stdout, and stderr. If
-// console is true, then ioctl calls will be passed through to the host FD.
-// Upon success, createFDMap dups then closes stdioFDs.
-func createFDMap(ctx context.Context, k *kernel.Kernel, l *limits.LimitSet, console bool, stdioFDs []int) (*kernel.FDMap, error) {
-	if len(stdioFDs) != 3 {
-		return nil, fmt.Errorf("stdioFDs should contain exactly 3 FDs (stdin, stdout, and stderr), but %d FDs received", len(stdioFDs))
-	}
-
+// createFDMap creates an fd map that contains stdin, stdout, and stderr. If
+// console is true, then ioctl calls will be passed through to the host fd.
+//
+// TODO: We currently arn't passing any FDs in to the sandbox, so
+// there's not much else for this function to do.  It will get more complicated
+// when gofers enter the picture.  Also the LISTEN_FDS environment variable
+// allows passing arbitrary FDs to the sandbox, which we do not yet support.
+func createFDMap(ctx context.Context, k *kernel.Kernel, l *limits.LimitSet, console bool) (*kernel.FDMap, error) {
 	fdm := k.NewFDMap()
 	defer fdm.DecRef()
+
+	// Maps sandbox fd to host fd.
+	fdMap := map[int]int{
+		0: syscall.Stdin,
+		1: syscall.Stdout,
+		2: syscall.Stderr,
+	}
 	mounter := fs.FileOwnerFromContext(ctx)
 
-	// Maps sandbox FD to host FD.
-	fdMap := map[int]int{
-		0: stdioFDs[0],
-		1: stdioFDs[1],
-		2: stdioFDs[2],
-	}
-
-	var ttyFile *fs.File
-	for appFD, hostFD := range fdMap {
-		var appFile *fs.File
-
-		if console && appFD < 3 {
-			// Import the file as a host TTY file.
-			if ttyFile == nil {
-				var err error
-				appFile, err = host.ImportFile(ctx, hostFD, mounter, true /* isTTY */)
-				if err != nil {
-					return nil, err
-				}
-				defer appFile.DecRef()
-
-				// Remember this in the TTY file, as we will
-				// use it for the other stdio FDs.
-				ttyFile = appFile
-			} else {
-				// Re-use the existing TTY file, as all three
-				// stdio FDs must point to the same fs.File in
-				// order to share TTY state, specifically the
-				// foreground process group id.
-				appFile = ttyFile
-			}
-		} else {
-			// Import the file as a regular host file.
-			var err error
-			appFile, err = host.ImportFile(ctx, hostFD, mounter, false /* isTTY */)
-			if err != nil {
-				return nil, err
-			}
-			defer appFile.DecRef()
+	for sfd, hfd := range fdMap {
+		file, err := host.ImportFile(ctx, hfd, mounter, console /* allow ioctls */)
+		if err != nil {
+			return nil, fmt.Errorf("failed to import fd %d: %v", hfd, err)
 		}
-
-		// Add the file to the FD map.
-		if err := fdm.NewFDAt(kdefs.FD(appFD), appFile, kernel.FDFlags{}, l); err != nil {
-			return nil, err
+		defer file.DecRef()
+		if err := fdm.NewFDAt(kdefs.FD(sfd), file, kernel.FDFlags{}, l); err != nil {
+			return nil, fmt.Errorf("failed to add imported fd %d to FDMap: %v", hfd, err)
 		}
 	}
 

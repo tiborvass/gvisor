@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,8 +20,6 @@ import (
 
 // Reader satisfies the fs.FileOperations interface for read-only pipes.
 // Reader should be used with !fs.FileFlags.Write to reject writes.
-//
-// +stateify savable
 type Reader struct {
 	ReaderWriter
 }

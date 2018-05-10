@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -168,8 +168,6 @@ func Time(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 
 // clockNanosleepRestartBlock encapsulates the state required to restart
 // clock_nanosleep(2) via restart_syscall(2).
-//
-// +stateify savable
 type clockNanosleepRestartBlock struct {
 	c        ktime.Clock
 	duration time.Duration
