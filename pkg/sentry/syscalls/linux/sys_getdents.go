@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -150,7 +150,7 @@ func toType(nodeType fs.InodeType) uint8 {
 		return syscall.DT_REG
 	case fs.Symlink:
 		return syscall.DT_LNK
-	case fs.Directory:
+	case fs.Directory, fs.SpecialDirectory:
 		return syscall.DT_DIR
 	case fs.Pipe:
 		return syscall.DT_FIFO

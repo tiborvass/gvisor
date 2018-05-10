@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,10 +14,25 @@
 
 package linux
 
+import (
+	"unicode/utf8"
+)
+
 const (
 	// NumControlCharacters is the number of control characters in Termios.
 	NumControlCharacters = 19
+	// disabledChar is used to indicate that a control character is
+	// disabled.
+	disabledChar = 0
 )
+
+// Winsize is struct winsize, defined in uapi/asm-generic/termios.h.
+type Winsize struct {
+	Row    uint16
+	Col    uint16
+	Xpixel uint16
+	Ypixel uint16
+}
 
 // Termios is struct termios, defined in uapi/asm-generic/termbits.h.
 type Termios struct {
@@ -31,6 +46,8 @@ type Termios struct {
 
 // KernelTermios is struct ktermios/struct termios2, defined in
 // uapi/asm-generic/termbits.h.
+//
+// +stateify savable
 type KernelTermios struct {
 	InputFlags        uint32
 	OutputFlags       uint32
@@ -84,6 +101,27 @@ func (t *KernelTermios) FromTermios(term Termios) {
 	t.LocalFlags = term.LocalFlags
 	t.LineDiscipline = term.LineDiscipline
 	t.ControlCharacters = term.ControlCharacters
+}
+
+// IsTerminating returns whether c is a line terminating character.
+func (t *KernelTermios) IsTerminating(c rune) bool {
+	if t.IsEOF(c) {
+		return true
+	}
+	switch byte(c) {
+	case disabledChar:
+		return false
+	case '\n', t.ControlCharacters[VEOL]:
+		return true
+	case t.ControlCharacters[VEOL2]:
+		return t.LEnabled(IEXTEN)
+	}
+	return false
+}
+
+// IsEOF returns whether c is the EOF character.
+func (t *KernelTermios) IsEOF(c rune) bool {
+	return utf8.RuneLen(c) == 1 && byte(c) == t.ControlCharacters[VEOF] && t.ControlCharacters[VEOF] != disabledChar
 }
 
 // Input flags.
@@ -256,18 +294,18 @@ var DefaultControlCharacters = [NumControlCharacters]uint8{
 	'\x7f',                 // VERASE = DEL
 	ControlCharacter('U'),  // VKILL = ^U
 	ControlCharacter('D'),  // VEOF = ^D
-	0, // VTIME
-	1, // VMIN
-	0, // VSWTC
-	ControlCharacter('Q'), // VSTART = ^Q
-	ControlCharacter('S'), // VSTOP = ^S
-	ControlCharacter('Z'), // VSUSP = ^Z
-	0, // VEOL
-	ControlCharacter('R'), // VREPRINT = ^R
-	ControlCharacter('O'), // VDISCARD = ^O
-	ControlCharacter('W'), // VWERASE = ^W
-	ControlCharacter('V'), // VLNEXT = ^V
-	0, // VEOL2
+	0,                      // VTIME
+	1,                      // VMIN
+	0,                      // VSWTC
+	ControlCharacter('Q'),  // VSTART = ^Q
+	ControlCharacter('S'),  // VSTOP = ^S
+	ControlCharacter('Z'),  // VSUSP = ^Z
+	0,                      // VEOL
+	ControlCharacter('R'),  // VREPRINT = ^R
+	ControlCharacter('O'),  // VDISCARD = ^O
+	ControlCharacter('W'),  // VWERASE = ^W
+	ControlCharacter('V'),  // VLNEXT = ^V
+	0,                      // VEOL2
 }
 
 // MasterTermios is the terminal configuration of the master end of a Unix98
@@ -289,4 +327,14 @@ var DefaultSlaveTermios = KernelTermios{
 	ControlCharacters: DefaultControlCharacters,
 	InputSpeed:        38400,
 	OutputSpeed:       38400,
+}
+
+// WindowSize corresponds to struct winsize defined in
+// include/uapi/asm-generic/termios.h.
+//
+// +stateify savable
+type WindowSize struct {
+	Rows uint16
+	Cols uint16
+	_    [4]byte // Padding for 2 unused shorts.
 }

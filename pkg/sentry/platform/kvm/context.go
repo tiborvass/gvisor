@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +15,6 @@
 package kvm
 
 import (
-	"sync/atomic"
-
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform/interrupt"
@@ -31,22 +29,19 @@ type context struct {
 	// machine is the parent machine, and is immutable.
 	machine *machine
 
+	// info is the arch.SignalInfo cached for this context.
+	info arch.SignalInfo
+
 	// interrupt is the interrupt context.
 	interrupt interrupt.Forwarder
 }
 
 // Switch runs the provided context in the given address space.
 func (c *context) Switch(as platform.AddressSpace, ac arch.Context, _ int32) (*arch.SignalInfo, usermem.AccessType, error) {
-	// Extract data.
 	localAS := as.(*addressSpace)
-	regs := &ac.StateData().Regs
-	fp := (*byte)(ac.FloatingPointData())
 
 	// Grab a vCPU.
-	cpu, err := c.machine.Get()
-	if err != nil {
-		return nil, usermem.NoAccess, err
-	}
+	cpu := c.machine.Get()
 
 	// Enable interrupts (i.e. calls to vCPU.Notify).
 	if !c.interrupt.Enable(cpu) {
@@ -54,25 +49,36 @@ func (c *context) Switch(as platform.AddressSpace, ac arch.Context, _ int32) (*a
 		return nil, usermem.NoAccess, platform.ErrContextInterrupt
 	}
 
-	// Mark the address space as dirty.
-	flags := ring0.Flags(0)
-	dirty := localAS.Touch(cpu)
-	if v := atomic.SwapUint32(dirty, 1); v == 0 {
-		flags |= ring0.FlagFlush
-	}
-	if ac.FullRestore() {
-		flags |= ring0.FlagFull
+	// Set the active address space.
+	//
+	// This must be done prior to the call to Touch below. If the address
+	// space is invalidated between this line and the call below, we will
+	// flag on entry anyways. When the active address space below is
+	// cleared, it indicates that we don't need an explicit interrupt and
+	// that the flush can occur naturally on the next user entry.
+	cpu.active.set(localAS)
+
+	// Prepare switch options.
+	switchOpts := ring0.SwitchOpts{
+		Registers:          &ac.StateData().Regs,
+		FloatingPointState: (*byte)(ac.FloatingPointData()),
+		PageTables:         localAS.pageTables,
+		Flush:              localAS.Touch(cpu),
+		FullRestore:        ac.FullRestore(),
 	}
 
 	// Take the blue pill.
-	si, at, err := cpu.SwitchToUser(regs, fp, localAS.pageTables, flags)
+	at, err := cpu.SwitchToUser(switchOpts, &c.info)
+
+	// Clear the address space.
+	cpu.active.set(nil)
 
 	// Release resources.
 	c.machine.Put(cpu)
 
 	// All done.
 	c.interrupt.Disable()
-	return si, at, err
+	return &c.info, at, err
 }
 
 // Interrupt interrupts the running context.

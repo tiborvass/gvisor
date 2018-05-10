@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/pkg/urpc"
 	"gvisor.googlesource.com/gvisor/runsc/boot"
+	"gvisor.googlesource.com/gvisor/runsc/specutils"
 )
 
 const (
@@ -56,50 +57,23 @@ const (
 func setupNetwork(conn *urpc.Client, pid int, spec *specs.Spec, conf *boot.Config) error {
 	log.Infof("Setting up network")
 
-	// HACK!
-	//
-	// When kubernetes starts a pod, it first creates a sandbox with an
-	// application that just pauses forever.  Later, when a container is
-	// added to the pod, kubernetes will create another sandbox with a
-	// config that corresponds to the containerized application, and add it
-	// to the same namespaces as the pause sandbox.
-	//
-	// Running a second sandbox currently breaks because the two sandboxes
-	// have the same network namespace and configuration, and try to create
-	// a tap device on the same host device which fails.
-	//
-	// Runsc will eventually need to detect that this container is meant to
-	// be run in the same sandbox as the pausing application, and somehow
-	// make that happen.
-	//
-	// For now the following HACK disables networking for the "pause"
-	// sandbox, allowing the second sandbox to start up successfully.
-	//
-	// TODO: Remove this once multiple containers per sandbox
-	// is properly supported.
-	if spec.Annotations[crioContainerTypeAnnotation] == "sandbox" ||
-		spec.Annotations[containerdContainerTypeAnnotation] == "sandbox" {
-		log.Warningf("HACK: Disabling network")
-		conf.Network = boot.NetworkNone
-	}
-
 	switch conf.Network {
 	case boot.NetworkNone:
 		log.Infof("Network is disabled, create loopback interface only")
 		if err := createDefaultLoopbackInterface(conn); err != nil {
-			return fmt.Errorf("error creating default loopback interface: %v", err)
+			return fmt.Errorf("creating default loopback interface: %v", err)
 		}
 	case boot.NetworkSandbox:
 		// Build the path to the net namespace of the sandbox process.
 		// This is what we will copy.
 		nsPath := filepath.Join("/proc", strconv.Itoa(pid), "ns/net")
 		if err := createInterfacesAndRoutesFromNS(conn, nsPath); err != nil {
-			return fmt.Errorf("error creating interfaces from net namespace %q: %v", nsPath, err)
+			return fmt.Errorf("creating interfaces from net namespace %q: %v", nsPath, err)
 		}
 	case boot.NetworkHost:
 		// Nothing to do here.
 	default:
-		return fmt.Errorf("Invalid network type: %d", conf.Network)
+		return fmt.Errorf("invalid network type: %d", conf.Network)
 	}
 	return nil
 }
@@ -125,20 +99,20 @@ func createDefaultLoopbackInterface(conn *urpc.Client) error {
 	if err := conn.Call(boot.NetworkCreateLinksAndRoutes, &boot.CreateLinksAndRoutesArgs{
 		LoopbackLinks: []boot.LoopbackLink{link},
 	}, nil); err != nil {
-		return fmt.Errorf("error creating loopback link and routes: %v", err)
+		return fmt.Errorf("creating loopback link and routes: %v", err)
 	}
 	return nil
 }
 
 func joinNetNS(nsPath string) (func(), error) {
 	runtime.LockOSThread()
-	restoreNS, err := applyNS(specs.LinuxNamespace{
+	restoreNS, err := specutils.ApplyNS(specs.LinuxNamespace{
 		Type: specs.NetworkNamespace,
 		Path: nsPath,
 	})
 	if err != nil {
 		runtime.UnlockOSThread()
-		return nil, fmt.Errorf("error joining net namespace %q: %v", nsPath, err)
+		return nil, fmt.Errorf("joining net namespace %q: %v", nsPath, err)
 	}
 	return func() {
 		restoreNS()
@@ -173,7 +147,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string) error {
 	// Get all interfaces in the namespace.
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return fmt.Errorf("error querying interfaces: %v", err)
+		return fmt.Errorf("querying interfaces: %v", err)
 	}
 
 	if isRootNS(ifaces) {
@@ -188,25 +162,37 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string) error {
 			continue
 		}
 
-		ifaddrs, err := iface.Addrs()
+		allAddrs, err := iface.Addrs()
 		if err != nil {
-			return fmt.Errorf("error fetching interface addresses for %q: %v", iface.Name, err)
+			return fmt.Errorf("fetching interface addresses for %q: %v", iface.Name, err)
 		}
 
 		// We build our own loopback devices.
 		if iface.Flags&net.FlagLoopback != 0 {
-			links, err := loopbackLinks(iface, ifaddrs)
+			links, err := loopbackLinks(iface, allAddrs)
 			if err != nil {
-				return fmt.Errorf("error getting loopback routes and links for iface %q: %v", iface.Name, err)
+				return fmt.Errorf("getting loopback routes and links for iface %q: %v", iface.Name, err)
 			}
 			args.LoopbackLinks = append(args.LoopbackLinks, links...)
 			continue
 		}
 
-		// Get the link for the interface.
-		ifaceLink, err := netlink.LinkByName(iface.Name)
-		if err != nil {
-			return fmt.Errorf("error getting link for interface %q: %v", iface.Name, err)
+		// Keep only IPv4 addresses.
+		var ip4addrs []*net.IPNet
+		for _, ifaddr := range allAddrs {
+			ipNet, ok := ifaddr.(*net.IPNet)
+			if !ok {
+				return fmt.Errorf("address is not IPNet: %+v", ifaddr)
+			}
+			if ipNet.IP.To4() == nil {
+				log.Warningf("IPv6 is not supported, skipping: %v", ipNet)
+				continue
+			}
+			ip4addrs = append(ip4addrs, ipNet)
+		}
+		if len(ip4addrs) == 0 {
+			log.Warningf("No IPv4 address found for interface %q, skipping", iface.Name)
+			continue
 		}
 
 		// Create the socket.
@@ -220,7 +206,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string) error {
 		// Bind to the appropriate device.
 		ll := syscall.SockaddrLinklayer{
 			Protocol: protocol,
-			Ifindex:  ifaceLink.Attrs().Index,
+			Ifindex:  iface.Index,
 			Hatype:   0, // No ARP type.
 			Pkttype:  syscall.PACKET_OTHERHOST,
 		}
@@ -232,7 +218,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string) error {
 		// will remove the routes as well.
 		routes, def, err := routesForIface(iface)
 		if err != nil {
-			return fmt.Errorf("error getting routes for interface %q: %v", iface.Name, err)
+			return fmt.Errorf("getting routes for interface %q: %v", iface.Name, err)
 		}
 		if def != nil {
 			if !args.DefaultGateway.Route.Empty() {
@@ -248,18 +234,20 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string) error {
 			Routes: routes,
 		}
 
+		// Get the link for the interface.
+		ifaceLink, err := netlink.LinkByName(iface.Name)
+		if err != nil {
+			return fmt.Errorf("getting link for interface %q: %v", iface.Name, err)
+		}
+
 		// Collect the addresses for the interface, enable forwarding,
 		// and remove them from the host.
-		for _, ifaddr := range ifaddrs {
-			ipNet, ok := ifaddr.(*net.IPNet)
-			if !ok {
-				return fmt.Errorf("address is not IPNet: %t %+v", ifaddr, ifaddr)
-			}
-			link.Addresses = append(link.Addresses, ipNet.IP)
+		for _, addr := range ip4addrs {
+			link.Addresses = append(link.Addresses, addr.IP)
 
 			// Steal IP address from NIC.
-			if err := removeAddress(ifaceLink, ipNet.String()); err != nil {
-				return fmt.Errorf("error removing address %v from device %q: %v", iface.Name, ipNet, err)
+			if err := removeAddress(ifaceLink, addr.String()); err != nil {
+				return fmt.Errorf("removing address %v from device %q: %v", iface.Name, addr, err)
 			}
 		}
 
@@ -269,7 +257,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string) error {
 
 	log.Debugf("Setting up network, config: %+v", args)
 	if err := conn.Call(boot.NetworkCreateLinksAndRoutes, &args, nil); err != nil {
-		return fmt.Errorf("error creating links and routes: %v", err)
+		return fmt.Errorf("creating links and routes: %v", err)
 	}
 	return nil
 }
@@ -280,7 +268,7 @@ func loopbackLinks(iface net.Interface, addrs []net.Addr) ([]boot.LoopbackLink, 
 	for _, addr := range addrs {
 		ipNet, ok := addr.(*net.IPNet)
 		if !ok {
-			return nil, fmt.Errorf("address is not IPNet: %t %+v", addr, addr)
+			return nil, fmt.Errorf("address is not IPNet: %+v", addr)
 		}
 		links = append(links, boot.LoopbackLink{
 			Name:      iface.Name,
@@ -303,7 +291,7 @@ func routesForIface(iface net.Interface) ([]boot.Route, *boot.Route, error) {
 	}
 	rs, err := netlink.RouteList(link, netlink.FAMILY_ALL)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error getting routes from %q: %v", iface.Name, err)
+		return nil, nil, fmt.Errorf("getting routes from %q: %v", iface.Name, err)
 	}
 
 	var def *boot.Route
@@ -314,24 +302,29 @@ func routesForIface(iface net.Interface) ([]boot.Route, *boot.Route, error) {
 			if r.Gw == nil {
 				return nil, nil, fmt.Errorf("default route with no gateway %q: %+v", iface.Name, r)
 			}
+			if r.Gw.To4() == nil {
+				log.Warningf("IPv6 is not supported, skipping default route: %v", r)
+				continue
+			}
 			if def != nil {
 				return nil, nil, fmt.Errorf("more than one default route found %q, def: %+v, route: %+v", iface.Name, def, r)
 			}
-			emptyAddr := net.IPv6zero
-			if r.Gw.To4() != nil {
-				emptyAddr = net.IPv4zero
-			}
 			// Create a catch all route to the gateway.
 			def = &boot.Route{
-				Destination: emptyAddr,
-				Mask:        net.IPMask(emptyAddr),
+				Destination: net.IPv4zero,
+				Mask:        net.IPMask(net.IPv4zero),
 				Gateway:     r.Gw,
 			}
+			continue
+		}
+		if r.Dst.IP.To4() == nil {
+			log.Warningf("IPv6 is not supported, skipping route: %v", r)
 			continue
 		}
 		routes = append(routes, boot.Route{
 			Destination: r.Dst.IP.Mask(r.Dst.Mask),
 			Mask:        r.Dst.Mask,
+			Gateway:     r.Gw,
 		})
 	}
 	return routes, def, nil

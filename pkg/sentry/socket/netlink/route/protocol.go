@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 package route
 
 import (
+	"bytes"
+
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/inet"
@@ -43,20 +45,15 @@ func typeKind(typ uint16) commandKind {
 }
 
 // Protocol implements netlink.Protocol.
-type Protocol struct {
-	// stack is the network stack that this provider describes.
-	//
-	// May be nil.
-	stack inet.Stack
-}
+//
+// +stateify savable
+type Protocol struct{}
 
 var _ netlink.Protocol = (*Protocol)(nil)
 
 // NewProtocol creates a NETLINK_ROUTE netlink.Protocol.
 func NewProtocol(t *kernel.Task) (netlink.Protocol, *syserr.Error) {
-	return &Protocol{
-		stack: t.NetworkContext(),
-	}, nil
+	return &Protocol{}, nil
 }
 
 // Protocol implements netlink.Protocol.Protocol.
@@ -83,12 +80,13 @@ func (p *Protocol) dumpLinks(ctx context.Context, hdr linux.NetlinkMessageHeader
 	// We always send back an NLMSG_DONE.
 	ms.Multi = true
 
-	if p.stack == nil {
+	stack := inet.StackFromContext(ctx)
+	if stack == nil {
 		// No network devices.
 		return nil
 	}
 
-	for id, i := range p.stack.Interfaces() {
+	for id, i := range stack.Interfaces() {
 		m := ms.AddMessage(linux.NetlinkMessageHeader{
 			Type: linux.RTM_NEWLINK,
 		})
@@ -101,9 +99,18 @@ func (p *Protocol) dumpLinks(ctx context.Context, hdr linux.NetlinkMessageHeader
 		})
 
 		m.PutAttrString(linux.IFLA_IFNAME, i.Name)
+		m.PutAttr(linux.IFLA_MTU, i.MTU)
 
-		// TODO: There are many more attributes, such as
-		// MAC address.
+		mac := make([]byte, 6)
+		brd := mac
+		if len(i.Addr) > 0 {
+			mac = i.Addr
+			brd = bytes.Repeat([]byte{0xff}, len(i.Addr))
+		}
+		m.PutAttr(linux.IFLA_ADDRESS, mac)
+		m.PutAttr(linux.IFLA_BROADCAST, brd)
+
+		// TODO: There are many more attributes.
 	}
 
 	return nil
@@ -124,12 +131,13 @@ func (p *Protocol) dumpAddrs(ctx context.Context, hdr linux.NetlinkMessageHeader
 	// We always send back an NLMSG_DONE.
 	ms.Multi = true
 
-	if p.stack == nil {
+	stack := inet.StackFromContext(ctx)
+	if stack == nil {
 		// No network devices.
 		return nil
 	}
 
-	for id, as := range p.stack.InterfaceAddrs() {
+	for id, as := range stack.InterfaceAddrs() {
 		for _, a := range as {
 			m := ms.AddMessage(linux.NetlinkMessageHeader{
 				Type: linux.RTM_NEWADDR,

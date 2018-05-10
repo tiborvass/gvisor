@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,12 +22,14 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/lock"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/memmap"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
-	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 )
 
 // Inode is a file system object that can be simultaneously referenced by different
 // components of the VFS (Dirent, fs.File, etc).
+//
+// +stateify savable
 type Inode struct {
 	// AtomicRefCount is our reference count.
 	refs.AtomicRefCount
@@ -58,6 +60,8 @@ type Inode struct {
 // Note that in Linux fcntl(2) and flock(2) locks are _not_ cooperative, because race and
 // deadlock conditions make merging them prohibitive. We do the same and keep them oblivious
 // to each other but provide a "context" as a convenient container.
+//
+// +stateify savable
 type LockCtx struct {
 	// Posix is a set of POSIX-style regional advisory locks, see fcntl(2).
 	Posix lock.Locks
@@ -106,20 +110,13 @@ func (i *Inode) destroy() {
 	// wouldn't be in the destructor.
 	i.Watches.targetDestroyed()
 
-	// Overlay resources should be released synchronously, since they may
-	// trigger more Inode.destroy calls which must themselves be handled
-	// synchronously, like the WriteOut call above.
 	if i.overlay != nil {
 		i.overlay.release()
-		i.MountSource.DecRef()
-		return
+	} else {
+		i.InodeOperations.Release(ctx)
 	}
 
-	// Regular (non-overlay) resources may be released asynchronously.
-	Async(func() {
-		i.InodeOperations.Release(ctx)
-		i.MountSource.DecRef()
-	})
+	i.MountSource.DecRef()
 }
 
 // Mappable calls i.InodeOperations.Mappable.
@@ -219,7 +216,7 @@ func (i *Inode) Rename(ctx context.Context, oldParent *Dirent, renamed *Dirent, 
 }
 
 // Bind calls i.InodeOperations.Bind with i as the directory.
-func (i *Inode) Bind(ctx context.Context, name string, data unix.BoundEndpoint, perm FilePermissions) error {
+func (i *Inode) Bind(ctx context.Context, name string, data transport.BoundEndpoint, perm FilePermissions) (*Dirent, error) {
 	if i.overlay != nil {
 		return overlayBind(ctx, i.overlay, name, data, perm)
 	}
@@ -227,7 +224,7 @@ func (i *Inode) Bind(ctx context.Context, name string, data unix.BoundEndpoint, 
 }
 
 // BoundEndpoint calls i.InodeOperations.BoundEndpoint with i as the Inode.
-func (i *Inode) BoundEndpoint(path string) unix.BoundEndpoint {
+func (i *Inode) BoundEndpoint(path string) transport.BoundEndpoint {
 	if i.overlay != nil {
 		return overlayBoundEndpoint(i.overlay, path)
 	}
@@ -359,11 +356,10 @@ func (i *Inode) AddLink() {
 	if i.overlay != nil {
 		// FIXME: Remove this from InodeOperations altogether.
 		//
-		// This interface (including DropLink and NotifyStatusChange)
-		// is only used by ramfs to update metadata of children. These
-		// filesystems should _never_ have overlay Inodes cached as
-		// children. So explicitly disallow this scenario and avoid plumbing
-		// Dirents through to do copy up.
+		// This interface is only used by ramfs to update metadata of
+		// children. These filesystems should _never_ have overlay
+		// Inodes cached as children. So explicitly disallow this
+		// scenario and avoid plumbing Dirents through to do copy up.
 		panic("overlay Inodes cached in ramfs directories are not supported")
 	}
 	i.InodeOperations.AddLink()
@@ -376,15 +372,6 @@ func (i *Inode) DropLink() {
 		panic("overlay Inodes cached in ramfs directories are not supported")
 	}
 	i.InodeOperations.DropLink()
-}
-
-// NotifyStatusChange calls i.InodeOperations.NotifyStatusChange.
-func (i *Inode) NotifyStatusChange(ctx context.Context) {
-	if i.overlay != nil {
-		// Same as AddLink.
-		panic("overlay Inodes cached in ramfs directories are not supported")
-	}
-	i.InodeOperations.NotifyStatusChange(ctx)
 }
 
 // IsVirtual calls i.InodeOperations.IsVirtual.
@@ -402,17 +389,6 @@ func (i *Inode) StatFS(ctx context.Context) (Info, error) {
 		return overlayStatFS(ctx, i.overlay)
 	}
 	return i.InodeOperations.StatFS(ctx)
-}
-
-// HandleOps extracts HandleOperations from i.
-func (i *Inode) HandleOps() HandleOperations {
-	if i.overlay != nil {
-		return overlayHandleOps(i.overlay)
-	}
-	if h, ok := i.InodeOperations.(HandleOperations); ok {
-		return h
-	}
-	return nil
 }
 
 // CheckOwnership checks whether `ctx` owns this Inode or may act as its owner.
@@ -435,10 +411,7 @@ func (i *Inode) CheckOwnership(ctx context.Context) bool {
 // CheckCapability checks whether `ctx` has capability `cp` with respect to
 // operations on this Inode.
 //
-// Compare Linux's kernel/capability.c:capable_wrt_inode_uidgid(). Note that
-// this function didn't exist in Linux 3.11.10, but was added by upstream
-// 23adbe12ef7d "fs,userns: Change inode_capable to capable_wrt_inode_uidgid"
-// to fix local privilege escalation CVE-2014-4014.
+// Compare Linux's kernel/capability.c:capable_wrt_inode_uidgid().
 func (i *Inode) CheckCapability(ctx context.Context, cp linux.Capability) bool {
 	uattr, err := i.UnstableAttr(ctx)
 	if err != nil {

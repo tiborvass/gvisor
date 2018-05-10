@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -115,6 +115,12 @@ type Context interface {
 	// SetStack sets the current stack pointer.
 	SetStack(value uintptr)
 
+	// TLS returns the current TLS pointer.
+	TLS() uintptr
+
+	// SetTLS sets the current TLS pointer. Returns false if value is invalid.
+	SetTLS(value uintptr) bool
+
 	// SetRSEQInterruptedIP sets the register that contains the old IP when a
 	// restartable sequence is interrupted.
 	SetRSEQInterruptedIP(value uintptr)
@@ -158,7 +164,7 @@ type Context interface {
 	// rt is true if SignalRestore is being entered from rt_sigreturn and
 	// false if SignalRestore is being entered from sigreturn.
 	// SignalRestore returns the thread's new signal mask.
-	SignalRestore(st *Stack, rt bool) (linux.SignalSet, error)
+	SignalRestore(st *Stack, rt bool) (linux.SignalSet, SignalStack, error)
 
 	// CPUIDEmulate emulates a CPUID instruction according to current register state.
 	CPUIDEmulate(l log.Logger)
@@ -254,6 +260,8 @@ const (
 // MemoryManager.
 //
 // Note that "highest address" below is always exclusive.
+//
+// +stateify savable
 type MmapLayout struct {
 	// MinAddr is the lowest mappable address.
 	MinAddr usermem.Addr

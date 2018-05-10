@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,6 +32,8 @@ import (
 const maxPorts = 10000
 
 // Manager allocates netlink port IDs.
+//
+// +stateify savable
 type Manager struct {
 	// mu protects the fields below.
 	mu sync.Mutex `state:"nosave"`

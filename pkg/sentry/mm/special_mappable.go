@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,6 +28,8 @@ import (
 // semantics similar to Linux's mm/mmap.c:_install_special_mapping(), except
 // that SpecialMappable takes ownership of the memory that it represents
 // (_install_special_mapping() does not.)
+//
+// +stateify savable
 type SpecialMappable struct {
 	refs.AtomicRefCount
 
@@ -74,16 +76,16 @@ func (m *SpecialMappable) Msync(ctx context.Context, mr memmap.MappableRange) er
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
-func (m *SpecialMappable) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) error {
+func (*SpecialMappable) AddMapping(context.Context, memmap.MappingSpace, usermem.AddrRange, uint64, bool) error {
 	return nil
 }
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
-func (m *SpecialMappable) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) {
+func (*SpecialMappable) RemoveMapping(context.Context, memmap.MappingSpace, usermem.AddrRange, uint64, bool) {
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
-func (m *SpecialMappable) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64) error {
+func (*SpecialMappable) CopyMapping(context.Context, memmap.MappingSpace, usermem.AddrRange, usermem.AddrRange, uint64, bool) error {
 	return nil
 }
 
@@ -136,10 +138,15 @@ func (m *SpecialMappable) Length() uint64 {
 // uses an ephemeral file created by mm/shmem.c:shmem_zero_setup(); we should
 // do the same to get non-zero device and inode IDs.
 func NewSharedAnonMappable(length uint64, p platform.Platform) (*SpecialMappable, error) {
-	if length == 0 || length != uint64(usermem.Addr(length).RoundDown()) {
+	if length == 0 {
 		return nil, syserror.EINVAL
 	}
-	fr, err := p.Memory().Allocate(length, usage.Anonymous)
+	alignedLen, ok := usermem.Addr(length).RoundUp()
+	if !ok {
+		return nil, syserror.EINVAL
+	}
+
+	fr, err := p.Memory().Allocate(uint64(alignedLen), usage.Anonymous)
 	if err != nil {
 		return nil, err
 	}

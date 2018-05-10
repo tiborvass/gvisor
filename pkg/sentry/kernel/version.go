@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ type Version struct {
 	// Operating system name (e.g. "Linux").
 	Sysname string
 
-	// Operating system release (e.g. "3.11.10-amd64").
+	// Operating system release (e.g. "4.4-amd64").
 	Release string
 
 	// Operating system version. On Linux this takes the shape

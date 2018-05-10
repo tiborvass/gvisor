@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,6 +45,7 @@ func Mmap(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 	private := flags&linux.MAP_PRIVATE != 0
 	shared := flags&linux.MAP_SHARED != 0
 	anon := flags&linux.MAP_ANONYMOUS != 0
+	map32bit := flags&linux.MAP_32BIT != 0
 
 	// Require exactly one of MAP_PRIVATE and MAP_SHARED.
 	if private == shared {
@@ -52,12 +53,13 @@ func Mmap(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 	}
 
 	opts := memmap.MMapOpts{
-		Length:  args[1].Uint64(),
-		Offset:  args[5].Uint64(),
-		Addr:    args[0].Pointer(),
-		Fixed:   fixed,
-		Unmap:   fixed,
-		Private: private,
+		Length:   args[1].Uint64(),
+		Offset:   args[5].Uint64(),
+		Addr:     args[0].Pointer(),
+		Fixed:    fixed,
+		Unmap:    fixed,
+		Map32Bit: map32bit,
+		Private:  private,
 		Perms: usermem.AccessType{
 			Read:    linux.PROT_READ&prot != 0,
 			Write:   linux.PROT_WRITE&prot != 0,
@@ -66,6 +68,9 @@ func Mmap(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 		MaxPerms:  usermem.AnyAccess,
 		GrowsDown: linux.MAP_GROWSDOWN&flags != 0,
 		Precommit: linux.MAP_POPULATE&flags != 0,
+	}
+	if linux.MAP_LOCKED&flags != 0 {
+		opts.MLockMode = memmap.MLockEager
 	}
 	defer func() {
 		if opts.MappingIdentity != nil {
@@ -178,6 +183,10 @@ func Madvise(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysca
 	case linux.MADV_HUGEPAGE, linux.MADV_NOHUGEPAGE:
 		fallthrough
 	case linux.MADV_MERGEABLE, linux.MADV_UNMERGEABLE:
+		fallthrough
+	case linux.MADV_DONTDUMP, linux.MADV_DODUMP:
+		// TODO: Core dumping isn't implemented, so these are
+		// no-ops.
 		fallthrough
 	case linux.MADV_NORMAL, linux.MADV_RANDOM, linux.MADV_SEQUENTIAL, linux.MADV_WILLNEED:
 		// Do nothing, we totally ignore the suggestions above.
@@ -302,28 +311,31 @@ func SetMempolicy(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.
 	nodemask := args[1].Pointer()
 	maxnode := args[2].Uint()
 
-	if maxnode < 1 {
+	if nodemask != 0 && maxnode < 1 {
 		return 0, nil, syserror.EINVAL
 	}
 
 	if modeWithFlags&linux.MPOL_MODE_FLAGS == linux.MPOL_MODE_FLAGS {
-		// Can't specify multiple modes simultaneously. Must also contain a
-		// valid mode, which we check below.
+		// Can't specify multiple modes simultaneously.
 		return 0, nil, syserror.EINVAL
 	}
 
 	mode := modeWithFlags &^ linux.MPOL_MODE_FLAGS
 	if mode < 0 || mode >= linux.MPOL_MAX {
+		// Must specify a valid mode.
 		return 0, nil, syserror.EINVAL
 	}
 
 	var nodemaskVal uint32
-	if _, err := t.CopyIn(nodemask, &nodemaskVal); err != nil {
-		return 0, nil, syserror.EFAULT
+	// Nodemask may be empty for some policy modes.
+	if nodemask != 0 && maxnode > 0 {
+		if _, err := t.CopyIn(nodemask, &nodemaskVal); err != nil {
+			return 0, nil, syserror.EFAULT
+		}
 	}
 
-	// When setting MPOL_INTERLEAVE, nodemask must not be empty.
-	if mode == linux.MPOL_INTERLEAVE && nodemaskVal == 0 {
+	if (mode == linux.MPOL_INTERLEAVE || mode == linux.MPOL_BIND) && nodemaskVal == 0 {
+		// Mode requires a non-empty nodemask, but got an empty nodemask.
 		return 0, nil, syserror.EINVAL
 	}
 
@@ -375,16 +387,6 @@ func Msync(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	length := args[1].SizeT()
 	flags := args[2].Int()
 
-	if addr != addr.RoundDown() {
-		return 0, nil, syserror.EINVAL
-	}
-	if length == 0 {
-		return 0, nil, nil
-	}
-	la, ok := usermem.Addr(length).RoundUp()
-	if !ok {
-		return 0, nil, syserror.ENOMEM
-	}
 	// "The flags argument should specify exactly one of MS_ASYNC and MS_SYNC,
 	// and may additionally include the MS_INVALIDATE bit. ... However, Linux
 	// permits a call to msync() that specifies neither of these flags, with
@@ -397,39 +399,72 @@ func Msync(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	if sync && flags&linux.MS_ASYNC != 0 {
 		return 0, nil, syserror.EINVAL
 	}
+	err := t.MemoryManager().MSync(t, addr, uint64(length), mm.MSyncOpts{
+		Sync:       sync,
+		Invalidate: flags&linux.MS_INVALIDATE != 0,
+	})
+	// MSync calls fsync, the same interrupt conversion rules apply, see
+	// mm/msync.c, fsync POSIX.1-2008.
+	return 0, nil, syserror.ConvertIntr(err, kernel.ERESTARTSYS)
+}
 
-	// MS_INVALIDATE "asks to invalidate other mappings of the same file (so
-	// that they can be updated with the fresh values just written)". This is a
-	// no-op given that shared memory exists. However, MS_INVALIDATE can also
-	// be used to detect mlocks: "EBUSY: MS_INVALIDATE was specified in flags,
-	// and a memory lock exists for the specified address range." Given that
-	// mlock is stubbed out, it's unsafe to pass MS_INVALIDATE silently since
-	// some user program could be using it for synchronization.
-	if flags&linux.MS_INVALIDATE != 0 {
+// Mlock implements linux syscall mlock(2).
+func Mlock(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	addr := args[0].Pointer()
+	length := args[1].SizeT()
+
+	return 0, nil, t.MemoryManager().MLock(t, addr, uint64(length), memmap.MLockEager)
+}
+
+// Mlock2 implements linux syscall mlock2(2).
+func Mlock2(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	addr := args[0].Pointer()
+	length := args[1].SizeT()
+	flags := args[2].Int()
+
+	if flags&^(linux.MLOCK_ONFAULT) != 0 {
 		return 0, nil, syserror.EINVAL
 	}
-	// MS_SYNC "requests an update and waits for it to complete."
-	if sync {
-		err := t.MemoryManager().Sync(t, addr, uint64(la))
-		// Sync calls fsync, the same interrupt conversion rules apply, see
-		// mm/msync.c, fsync POSIX.1-2008.
-		return 0, nil, syserror.ConvertIntr(err, kernel.ERESTARTSYS)
+
+	mode := memmap.MLockEager
+	if flags&linux.MLOCK_ONFAULT != 0 {
+		mode = memmap.MLockLazy
 	}
-	// MS_ASYNC "specifies that an update be scheduled, but the call returns
-	// immediately". As long as dirty pages are tracked and eventually written
-	// back, this is a no-op. (Correspondingly: "Since Linux 2.6.19, MS_ASYNC
-	// is in fact a no-op, since the kernel properly tracks dirty pages and
-	// flushes them to storage as necessary.")
-	//
-	// However: "ENOMEM: The indicated memory (or part of it) was not mapped."
-	// This applies even for MS_ASYNC.
-	ar, ok := addr.ToRange(uint64(la))
-	if !ok {
-		return 0, nil, syserror.ENOMEM
+	return 0, nil, t.MemoryManager().MLock(t, addr, uint64(length), mode)
+}
+
+// Munlock implements linux syscall munlock(2).
+func Munlock(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	addr := args[0].Pointer()
+	length := args[1].SizeT()
+
+	return 0, nil, t.MemoryManager().MLock(t, addr, uint64(length), memmap.MLockNone)
+}
+
+// Mlockall implements linux syscall mlockall(2).
+func Mlockall(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	flags := args[0].Int()
+
+	if flags&^(linux.MCL_CURRENT|linux.MCL_FUTURE|linux.MCL_ONFAULT) != 0 {
+		return 0, nil, syserror.EINVAL
 	}
-	mapped := t.MemoryManager().VirtualMemorySizeRange(ar)
-	if mapped != uint64(la) {
-		return 0, nil, syserror.ENOMEM
+
+	mode := memmap.MLockEager
+	if flags&linux.MCL_ONFAULT != 0 {
+		mode = memmap.MLockLazy
 	}
-	return 0, nil, nil
+	return 0, nil, t.MemoryManager().MLockAll(t, mm.MLockAllOpts{
+		Current: flags&linux.MCL_CURRENT != 0,
+		Future:  flags&linux.MCL_FUTURE != 0,
+		Mode:    mode,
+	})
+}
+
+// Munlockall implements linux syscall munlockall(2).
+func Munlockall(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	return 0, nil, t.MemoryManager().MLockAll(t, mm.MLockAllOpts{
+		Current: true,
+		Future:  true,
+		Mode:    memmap.MLockNone,
+	})
 }

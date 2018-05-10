@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -44,6 +44,7 @@ var (
 	ELIBBAD      = error(syscall.ELIBBAD)
 	ELOOP        = error(syscall.ELOOP)
 	EMFILE       = error(syscall.EMFILE)
+	EMSGSIZE     = error(syscall.EMSGSIZE)
 	ENAMETOOLONG = error(syscall.ENAMETOOLONG)
 	ENOATTR      = ENODATA
 	ENODATA      = error(syscall.ENODATA)

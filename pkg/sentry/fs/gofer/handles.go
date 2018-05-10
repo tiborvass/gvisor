@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -62,43 +62,28 @@ func newHandles(ctx context.Context, file contextFile, flags fs.FileFlags) (*han
 		return nil, err
 	}
 
+	var p9flags p9.OpenFlags
 	switch {
 	case flags.Read && flags.Write:
-		hostFile, _, _, err := newFile.open(ctx, p9.ReadWrite)
-		if err != nil {
-			newFile.close(ctx)
-			return nil, err
-		}
-		h := &handles{
-			File: newFile,
-			Host: hostFile,
-		}
-		return h, nil
+		p9flags = p9.ReadWrite
 	case flags.Read && !flags.Write:
-		hostFile, _, _, err := newFile.open(ctx, p9.ReadOnly)
-		if err != nil {
-			newFile.close(ctx)
-			return nil, err
-		}
-		h := &handles{
-			File: newFile,
-			Host: hostFile,
-		}
-		return h, nil
+		p9flags = p9.ReadOnly
 	case !flags.Read && flags.Write:
-		hostFile, _, _, err := newFile.open(ctx, p9.WriteOnly)
-		if err != nil {
-			newFile.close(ctx)
-			return nil, err
-		}
-		h := &handles{
-			File: newFile,
-			Host: hostFile,
-		}
-		return h, nil
+		p9flags = p9.WriteOnly
 	default:
 		panic("impossible fs.FileFlags")
 	}
+
+	hostFile, _, _, err := newFile.open(ctx, p9flags)
+	if err != nil {
+		newFile.close(ctx)
+		return nil, err
+	}
+	h := &handles{
+		File: newFile,
+		Host: hostFile,
+	}
+	return h, nil
 }
 
 type handleReadWriter struct {

@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,10 +35,11 @@ import (
 )
 
 // inodeOperations implements fs.InodeOperations.
+//
+// +stateify savable
 type inodeOperations struct {
 	fsutil.InodeNotVirtual           `state:"nosave"`
 	fsutil.InodeNoExtendedAttributes `state:"nosave"`
-	fsutil.DeprecatedFileOperations  `state:"nosave"`
 
 	// fileState implements fs.CachedFileObject. It exists
 	// to break a circular load dependency between inodeOperations
@@ -68,6 +69,8 @@ type inodeOperations struct {
 // circular load dependency between it and inodeOperations). Even with
 // lazy loading, this approach defines the dependencies between objects
 // and the expected load behavior more concretely.
+//
+// +stateify savable
 type inodeFileState struct {
 	// s is common file system state for Gofers.
 	s *session `state:"wait"`
@@ -122,6 +125,10 @@ type inodeFileState struct {
 	// failures. S/R is transparent to Sentry and the latter will continue
 	// using its cached values after restore.
 	savedUAttr *fs.UnstableAttr
+
+	// hostMappable is created when using 'cacheRemoteRevalidating' to map pages
+	// directly from host.
+	hostMappable *fsutil.HostMappable
 }
 
 // Release releases file handles.
@@ -162,6 +169,9 @@ func (i *inodeFileState) setHandlesForCachedIO(flags fs.FileFlags, h *handles) {
 		if flags.Read {
 			i.writebackRW = true
 		}
+	}
+	if i.hostMappable != nil {
+		i.hostMappable.UpdateFD(i.fdLocked())
 	}
 }
 
@@ -206,7 +216,7 @@ func (i *inodeFileState) WriteFromBlocksAt(ctx context.Context, srcs safemem.Blo
 
 // SetMaskedAttributes implements fsutil.CachedFileObject.SetMaskedAttributes.
 func (i *inodeFileState) SetMaskedAttributes(ctx context.Context, mask fs.AttrMask, attr fs.UnstableAttr) error {
-	if mask.Empty() {
+	if i.skipSetAttr(mask) {
 		return nil
 	}
 	as, ans := attr.AccessTime.Unix()
@@ -237,6 +247,35 @@ func (i *inodeFileState) SetMaskedAttributes(ctx context.Context, mask fs.AttrMa
 		})
 }
 
+// skipSetAttr checks if attribute change can be skipped. It can be skipped
+// when:
+//   - Mask is empty
+//   - Mask contains only atime and/or mtime, and host FD exists
+//
+// Updates to atime and mtime can be skipped because cached value will be
+// "close enough" to host value, given that operation went directly to host FD.
+// Skipping atime updates is particularly important to reduce the number of
+// operations sent to the Gofer for readonly files.
+func (i *inodeFileState) skipSetAttr(mask fs.AttrMask) bool {
+	if mask.Empty() {
+		return true
+	}
+
+	cpy := mask
+	cpy.AccessTime = false
+	cpy.ModificationTime = false
+	if !cpy.Empty() {
+		// More than just atime and mtime is being set.
+		return false
+	}
+
+	i.handlesMu.RLock()
+	defer i.handlesMu.RUnlock()
+	return (i.readonly != nil && i.readonly.Host != nil) ||
+		(i.readthrough != nil && i.readthrough.Host != nil) ||
+		(i.writeback != nil && i.writeback.Host != nil)
+}
+
 // Sync implements fsutil.CachedFileObject.Sync.
 func (i *inodeFileState) Sync(ctx context.Context) error {
 	i.handlesMu.RLock()
@@ -255,7 +294,10 @@ func (i *inodeFileState) Sync(ctx context.Context) error {
 func (i *inodeFileState) FD() int {
 	i.handlesMu.RLock()
 	defer i.handlesMu.RUnlock()
+	return i.fdLocked()
+}
 
+func (i *inodeFileState) fdLocked() int {
 	// Assert that the file was actually opened.
 	if i.writeback == nil && i.readthrough == nil {
 		panic("cannot get host FD for a file that was never opened")
@@ -300,29 +342,31 @@ func (i *inodeOperations) session() *session {
 
 // Release implements fs.InodeOperations.Release.
 func (i *inodeOperations) Release(ctx context.Context) {
-	i.fileState.Release(ctx)
 	i.cachingInodeOps.Release()
+
+	// Releasing the fileState may make RPCs to the gofer. There is
+	// no need to wait for those to return, so we can do this
+	// asynchronously.
+	fs.Async(func() {
+		i.fileState.Release(ctx)
+	})
 }
 
 // Mappable implements fs.InodeOperations.Mappable.
 func (i *inodeOperations) Mappable(inode *fs.Inode) memmap.Mappable {
-	if i.session().cachePolicy == cacheNone || !fs.IsFile(inode.StableAttr) {
-		return nil
+	if i.session().cachePolicy.useCachingInodeOps(inode) {
+		return i.cachingInodeOps
 	}
-	return i.cachingInodeOps
-}
-
-func isCachable(session *session, inode *fs.Inode) bool {
-	return session.cachePolicy != cacheNone && (fs.IsFile(inode.StableAttr) || fs.IsDir(inode.StableAttr))
-}
-
-func isFileCachable(session *session, inode *fs.Inode) bool {
-	return session.cachePolicy != cacheNone && fs.IsFile(inode.StableAttr)
+	// This check is necessary because it's returning an interface type.
+	if i.fileState.hostMappable != nil {
+		return i.fileState.hostMappable
+	}
+	return nil
 }
 
 // UnstableAttr implements fs.InodeOperations.UnstableAttr.
 func (i *inodeOperations) UnstableAttr(ctx context.Context, inode *fs.Inode) (fs.UnstableAttr, error) {
-	if isCachable(i.session(), inode) {
+	if i.session().cachePolicy.cacheUAttrs(inode) {
 		return i.cachingInodeOps.UnstableAttr(ctx, inode)
 	}
 	return i.fileState.unstableAttr(ctx)
@@ -370,7 +414,7 @@ func (i *inodeOperations) getFilePipe(ctx context.Context, d *fs.Dirent, flags f
 	if err != nil {
 		return nil, err
 	}
-	return NewFile(ctx, d, flags, i, h), nil
+	return NewFile(ctx, d, d.BaseName(), flags, i, h), nil
 }
 
 // errNotHostFile indicates that the file is not a host file.
@@ -404,12 +448,12 @@ func (i *inodeOperations) NonBlockingOpen(ctx context.Context, p fs.PermMask) (*
 }
 
 func (i *inodeOperations) getFileDefault(ctx context.Context, d *fs.Dirent, flags fs.FileFlags) (*fs.File, error) {
-	if !isFileCachable(i.session(), d.Inode) {
+	if !i.session().cachePolicy.cacheHandles(d.Inode) {
 		h, err := newHandles(ctx, i.fileState.file, flags)
 		if err != nil {
 			return nil, err
 		}
-		return NewFile(ctx, d, flags, i, h), nil
+		return NewFile(ctx, d, d.BaseName(), flags, i, h), nil
 	}
 
 	h, ok := i.fileState.getCachedHandles(ctx, flags, d.Inode.MountSource)
@@ -422,12 +466,12 @@ func (i *inodeOperations) getFileDefault(ctx context.Context, d *fs.Dirent, flag
 	}
 	i.fileState.setHandlesForCachedIO(flags, h)
 
-	return NewFile(ctx, d, flags, i, h), nil
+	return NewFile(ctx, d, d.BaseName(), flags, i, h), nil
 }
 
 // SetPermissions implements fs.InodeOperations.SetPermissions.
 func (i *inodeOperations) SetPermissions(ctx context.Context, inode *fs.Inode, p fs.FilePermissions) bool {
-	if isCachable(i.session(), inode) {
+	if i.session().cachePolicy.cacheUAttrs(inode) {
 		return i.cachingInodeOps.SetPermissions(ctx, inode, p)
 	}
 
@@ -444,7 +488,7 @@ func (i *inodeOperations) SetOwner(ctx context.Context, inode *fs.Inode, owner f
 		return nil
 	}
 
-	if isCachable(i.session(), inode) {
+	if i.session().cachePolicy.cacheUAttrs(inode) {
 		return i.cachingInodeOps.SetOwner(ctx, inode, owner)
 	}
 
@@ -463,7 +507,7 @@ func (i *inodeOperations) SetOwner(ctx context.Context, inode *fs.Inode, owner f
 
 // SetTimestamps implements fs.InodeOperations.SetTimestamps.
 func (i *inodeOperations) SetTimestamps(ctx context.Context, inode *fs.Inode, ts fs.TimeSpec) error {
-	if isCachable(i.session(), inode) {
+	if i.session().cachePolicy.cacheUAttrs(inode) {
 		return i.cachingInodeOps.SetTimestamps(ctx, inode, ts)
 	}
 
@@ -473,7 +517,7 @@ func (i *inodeOperations) SetTimestamps(ctx context.Context, inode *fs.Inode, ts
 // Truncate implements fs.InodeOperations.Truncate.
 func (i *inodeOperations) Truncate(ctx context.Context, inode *fs.Inode, length int64) error {
 	// This can only be called for files anyway.
-	if isFileCachable(i.session(), inode) {
+	if i.session().cachePolicy.useCachingInodeOps(inode) {
 		return i.cachingInodeOps.Truncate(ctx, inode, length)
 	}
 
@@ -482,7 +526,7 @@ func (i *inodeOperations) Truncate(ctx context.Context, inode *fs.Inode, length 
 
 // WriteOut implements fs.InodeOperations.WriteOut.
 func (i *inodeOperations) WriteOut(ctx context.Context, inode *fs.Inode) error {
-	if !isCachable(i.session(), inode) {
+	if !i.session().cachePolicy.cacheUAttrs(inode) {
 		return nil
 	}
 
@@ -529,6 +573,16 @@ func (i *inodeOperations) StatFS(ctx context.Context) (fs.Info, error) {
 	}
 
 	return info, nil
+}
+
+func (i *inodeOperations) configureMMap(file *fs.File, opts *memmap.MMapOpts) error {
+	if i.session().cachePolicy.useCachingInodeOps(file.Dirent.Inode) {
+		return fsutil.GenericConfigureMMap(file, i.cachingInodeOps, opts)
+	}
+	if i.fileState.hostMappable != nil {
+		return fsutil.GenericConfigureMMap(file, i.fileState.hostMappable, opts)
+	}
+	return syserror.ENODEV
 }
 
 func init() {

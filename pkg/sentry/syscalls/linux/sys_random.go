@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@
 package linux
 
 import (
-	"crypto/rand"
 	"io"
 	"math"
 
+	"gvisor.googlesource.com/gvisor/pkg/rand"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/safemem"

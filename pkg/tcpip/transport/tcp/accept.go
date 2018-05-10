@@ -1,11 +1,20 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package tcp
 
 import (
-	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
 	"hash"
@@ -13,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"gvisor.googlesource.com/gvisor/pkg/rand"
 	"gvisor.googlesource.com/gvisor/pkg/sleep"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip/header"
@@ -68,7 +78,8 @@ func encodeMSS(mss uint16) uint32 {
 // to go above a threshold.
 var synRcvdCount struct {
 	sync.Mutex
-	value uint64
+	value   uint64
+	pending sync.WaitGroup
 }
 
 // listenContext is used by a listening endpoint to store state used while
@@ -102,6 +113,7 @@ func incSynRcvdCount() bool {
 		return false
 	}
 
+	synRcvdCount.pending.Add(1)
 	synRcvdCount.value++
 
 	return true
@@ -115,6 +127,7 @@ func decSynRcvdCount() {
 	defer synRcvdCount.Unlock()
 
 	synRcvdCount.value--
+	synRcvdCount.pending.Done()
 }
 
 // newListenContext creates a new listen context.
@@ -202,7 +215,7 @@ func (l *listenContext) createConnectedEndpoint(s *segment, iss seqnum.Value, ir
 	n.maybeEnableSACKPermitted(rcvdSynOpts)
 
 	// Register new endpoint so that packets are routed to it.
-	if err := n.stack.RegisterTransportEndpoint(n.boundNICID, n.effectiveNetProtos, ProtocolNumber, n.id, n); err != nil {
+	if err := n.stack.RegisterTransportEndpoint(n.boundNICID, n.effectiveNetProtos, ProtocolNumber, n.id, n, n.reusePort); err != nil {
 		n.Close()
 		return nil, err
 	}
@@ -232,11 +245,7 @@ func (l *listenContext) createEndpointAndPerformHandshake(s *segment, opts *head
 	}
 
 	// Perform the 3-way handshake.
-	h, err := newHandshake(ep, l.rcvWnd)
-	if err != nil {
-		ep.Close()
-		return nil, err
-	}
+	h := newHandshake(ep, l.rcvWnd)
 
 	h.resetToSynRcvd(cookie, irs, opts)
 	if err := h.execute(); err != nil {
@@ -292,7 +301,7 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) {
 		opts := parseSynSegmentOptions(s)
 		if incSynRcvdCount() {
 			s.incRef()
-			go e.handleSynSegment(ctx, s, &opts) // S/R-FIXME
+			go e.handleSynSegment(ctx, s, &opts) // S/R-SAFE: synRcvdCount is the barrier.
 		} else {
 			cookie := ctx.createCookie(s.id, s.sequenceNumber, encodeMSS(opts.MSS))
 			// Send SYN with window scaling because we currently
@@ -349,13 +358,17 @@ func (e *endpoint) protocolListenLoop(rcvWnd seqnum.Size) *tcpip.Error {
 		// to the endpoint.
 		e.mu.Lock()
 		e.state = stateClosed
+
+		// Do cleanup if needed.
+		e.completeWorkerLocked()
+
+		if e.drainDone != nil {
+			close(e.drainDone)
+		}
 		e.mu.Unlock()
 
 		// Notify waiters that the endpoint is shutdown.
 		e.waiterQueue.Notify(waiter.EventIn | waiter.EventOut)
-
-		// Do cleanup if needed.
-		e.completeWorker()
 	}()
 
 	e.mu.Lock()
@@ -375,12 +388,14 @@ func (e *endpoint) protocolListenLoop(rcvWnd seqnum.Size) *tcpip.Error {
 				return nil
 			}
 			if n&notifyDrain != 0 {
-				for s := e.segmentQueue.dequeue(); s != nil; s = e.segmentQueue.dequeue() {
+				for !e.segmentQueue.empty() {
+					s := e.segmentQueue.dequeue()
 					e.handleListenSegment(ctx, s)
 					s.decRef()
 				}
-				e.drainDone <- struct{}{}
-				return nil
+				synRcvdCount.pending.Wait()
+				close(e.drainDone)
+				<-e.undrain
 			}
 
 		case wakerForNewSegment:

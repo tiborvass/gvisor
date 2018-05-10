@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package gofer
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"gvisor.googlesource.com/gvisor/pkg/p9"
@@ -66,7 +67,7 @@ func (i *inodeFileState) beforeSave() {
 	if i.sattr.Type == fs.RegularFile {
 		uattr, err := i.unstableAttr(&dummyClockContext{context.Background()})
 		if err != nil {
-			panic(fmt.Sprintf("failed to get unstable atttribute of %s: %v", i.s.inodeMappings[i.sattr.InodeID], err))
+			panic(fs.ErrSaveRejection{fmt.Errorf("failed to get unstable atttribute of %s: %v", i.s.inodeMappings[i.sattr.InodeID], err)})
 		}
 		i.savedUAttr = &uattr
 	}
@@ -77,6 +78,29 @@ func (i *inodeFileState) saveLoading() struct{} {
 	return struct{}{}
 }
 
+// splitAbsolutePath splits the path on slashes ignoring the leading slash.
+func splitAbsolutePath(path string) []string {
+	if len(path) == 0 {
+		panic("There is no path!")
+	}
+	if path != filepath.Clean(path) {
+		panic(fmt.Sprintf("path %q is not clean", path))
+	}
+	// This case is to return {} rather than {""}
+	if path == "/" {
+		return []string{}
+	}
+	if path[0] != '/' {
+		panic(fmt.Sprintf("path %q is not absolute", path))
+	}
+
+	s := strings.Split(path, "/")
+
+	// Since p is absolute, the first component of s
+	// is an empty string. We must remove that.
+	return s[1:]
+}
+
 // loadLoading is invoked by stateify.
 func (i *inodeFileState) loadLoading(_ struct{}) {
 	i.loading.Lock()
@@ -84,9 +108,13 @@ func (i *inodeFileState) loadLoading(_ struct{}) {
 
 // afterLoad is invoked by stateify.
 func (i *inodeFileState) afterLoad() {
-	load := func() error {
+	load := func() (err error) {
 		// See comment on i.loading().
-		defer i.loading.Unlock()
+		defer func() {
+			if err == nil {
+				i.loading.Unlock()
+			}
+		}()
 
 		// Manually restore the p9.File.
 		name, ok := i.s.inodeMappings[i.sattr.InodeID]
@@ -97,10 +125,10 @@ func (i *inodeFileState) afterLoad() {
 		}
 		// TODO: Context is not plumbed to save/restore.
 		ctx := &dummyClockContext{context.Background()}
-		var err error
-		_, i.file, err = i.s.attach.walk(ctx, strings.Split(name, "/"))
+
+		_, i.file, err = i.s.attach.walk(ctx, splitAbsolutePath(name))
 		if err != nil {
-			return fmt.Errorf("failed to walk to %q: %v", name, err)
+			return fs.ErrCorruption{fmt.Errorf("failed to walk to %q: %v", name, err)}
 		}
 
 		// Remap the saved inode number into the gofer device using the
@@ -108,7 +136,7 @@ func (i *inodeFileState) afterLoad() {
 		// environment.
 		qid, mask, attrs, err := i.file.getAttr(ctx, p9.AttrMaskAll())
 		if err != nil {
-			return fmt.Errorf("failed to get file attributes of %s: %v", name, err)
+			return fs.ErrCorruption{fmt.Errorf("failed to get file attributes of %s: %v", name, err)}
 		}
 		if !mask.RDev {
 			return fs.ErrCorruption{fmt.Errorf("file %s lacks device", name)}

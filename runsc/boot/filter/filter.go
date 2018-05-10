@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,38 +27,37 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform/ptrace"
 )
 
+// Options are seccomp filter related options.
+type Options struct {
+	Platform     platform.Platform
+	HostNetwork  bool
+	ControllerFD int
+}
+
 // Install installs seccomp filters for based on the given platform.
-func Install(p platform.Platform, whitelistFS, console, hostNetwork bool) error {
+func Install(opt Options) error {
 	s := allowedSyscalls
+	s.Merge(controlServerFilters(opt.ControllerFD))
 
 	// Set of additional filters used by -race and -msan. Returns empty
 	// when not enabled.
-	s = append(s, instrumentationFilters()...)
+	s.Merge(instrumentationFilters())
 
-	if whitelistFS {
-		Report("direct file access allows unrestricted file access!")
-		s = append(s, whitelistFSFilters()...)
-	}
-	if console {
-		Report("console is enabled: syscall filters less restrictive!")
-		s = append(s, consoleFilters()...)
-	}
-	if hostNetwork {
+	if opt.HostNetwork {
 		Report("host networking enabled: syscall filters less restrictive!")
-		s = append(s, hostInetFilters()...)
+		s.Merge(hostInetFilters())
 	}
 
-	switch p := p.(type) {
+	switch p := opt.Platform.(type) {
 	case *ptrace.PTrace:
-		s = append(s, ptraceFilters()...)
+		s.Merge(ptraceFilters())
 	case *kvm.KVM:
-		s = append(s, kvmFilters()...)
+		s.Merge(kvmFilters())
 	default:
 		return fmt.Errorf("unknown platform type %T", p)
 	}
 
-	// TODO: Set kill=true when SECCOMP_RET_KILL_PROCESS is supported.
-	return seccomp.Install(s, false)
+	return seccomp.Install(s)
 }
 
 // Report writes a warning message to the log.

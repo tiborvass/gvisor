@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,8 +20,6 @@ import (
 	"reflect"
 	"sync"
 	"sync/atomic"
-
-	"gvisor.googlesource.com/gvisor/pkg/ilist"
 )
 
 // RefCounter is the interface to be implemented by objects that are reference
@@ -58,8 +56,10 @@ type WeakRefUser interface {
 }
 
 // WeakRef is a weak reference.
+//
+// +stateify savable
 type WeakRef struct {
-	ilist.Entry `state:"nosave"`
+	weakRefEntry `state:"nosave"`
 
 	// obj is an atomic value that points to the refCounter.
 	obj atomic.Value `state:".(savedReference)"`
@@ -177,6 +177,8 @@ func (w *WeakRef) zap() {
 //
 // N.B. To allow the zero-object to be initialized, the count is offset by
 //      1, that is, when refCount is n, there are really n+1 references.
+//
+// +stateify savable
 type AtomicRefCount struct {
 	// refCount is composed of two fields:
 	//
@@ -191,12 +193,14 @@ type AtomicRefCount struct {
 	mu sync.Mutex `state:"nosave"`
 
 	// weakRefs is our collection of weak references.
-	weakRefs ilist.List `state:"nosave"`
+	weakRefs weakRefList `state:"nosave"`
 }
 
-// TestReadRefs returns the current reference count of r. Use only for tests.
-func (r *AtomicRefCount) TestReadRefs() int64 {
-	return atomic.LoadInt64(&r.refCount)
+// ReadRefs returns the current number of references. The returned count is
+// inherently racy and is unsafe to use without external synchronization.
+func (r *AtomicRefCount) ReadRefs() int64 {
+	// Account for the internal -1 offset on refcounts.
+	return atomic.LoadInt64(&r.refCount) + 1
 }
 
 // IncRef increments this object's reference count. While the count is kept
@@ -270,7 +274,7 @@ func (r *AtomicRefCount) DecRefWithDestructor(destroy func()) {
 		// return false due to the reference count check.
 		r.mu.Lock()
 		for !r.weakRefs.Empty() {
-			w := r.weakRefs.Front().(*WeakRef)
+			w := r.weakRefs.Front()
 			// Capture the callback because w cannot be touched
 			// after it's zapped -- the owner is free it reuse it
 			// after that.

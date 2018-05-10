@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,8 @@ import (
 )
 
 // SignalHandlers holds information about signal actions.
+//
+// +stateify savable
 type SignalHandlers struct {
 	// mu protects actions, as well as the signal state of all tasks and thread
 	// groups using this SignalHandlers object. (See comment on

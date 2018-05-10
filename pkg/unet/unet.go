@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -201,7 +201,7 @@ func (s *Socket) enterFD() (int, bool) {
 // SocketPair creates a pair of connected sockets.
 func SocketPair(packet bool) (*Socket, *Socket, error) {
 	// Make a new pair.
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, socketType(packet), 0)
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, socketType(packet)|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, nil, err
 	}

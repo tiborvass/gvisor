@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,15 @@
 package linux
 
 import (
+	"time"
+
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/kdefs"
+	ktime "gvisor.googlesource.com/gvisor/pkg/sentry/kernel/time"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/socket"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 	"gvisor.googlesource.com/gvisor/pkg/waiter"
@@ -187,6 +191,68 @@ func Preadv(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	return uintptr(n), nil, handleIOError(t, n != 0, err, kernel.ERESTARTSYS, "preadv", file)
 }
 
+// Preadv2 implements linux syscall preadv2(2).
+// TODO: Implement RWF_HIPRI functionality.
+func Preadv2(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	// While the syscall is
+	// preadv2(int fd, struct iovec* iov, int iov_cnt, off_t offset, int flags)
+	// the linux internal call
+	// (https://elixir.bootlin.com/linux/v4.18/source/fs/read_write.c#L1248)
+	// splits the offset argument into a high/low value for compatibility with
+	// 32-bit architectures. The flags argument is the 5th argument.
+
+	fd := kdefs.FD(args[0].Int())
+	addr := args[1].Pointer()
+	iovcnt := int(args[2].Int())
+	offset := args[3].Int64()
+	flags := int(args[5].Int())
+
+	file := t.FDMap().GetFile(fd)
+	if file == nil {
+		return 0, nil, syserror.EBADF
+	}
+	defer file.DecRef()
+
+	// Check that the offset is legitimate.
+	if offset < -1 {
+		return 0, nil, syserror.EINVAL
+	}
+
+	// Is reading at an offset supported?
+	if offset > -1 && !file.Flags().Pread {
+		return 0, nil, syserror.ESPIPE
+	}
+
+	// Check that the file is readable.
+	if !file.Flags().Read {
+		return 0, nil, syserror.EBADF
+	}
+
+	// Check flags field.
+	if flags&^linux.RWF_VALID != 0 {
+		return 0, nil, syserror.EOPNOTSUPP
+	}
+
+	// Read the iovecs that specify the destination of the read.
+	dst, err := t.IovecsIOSequence(addr, iovcnt, usermem.IOOpts{
+		AddressSpaceActive: true,
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+
+	// If preadv2 is called with an offset of -1, readv is called.
+	if offset == -1 {
+		n, err := readv(t, file, dst)
+		t.IOUsage().AccountReadSyscall(n)
+		return uintptr(n), nil, handleIOError(t, n != 0, err, kernel.ERESTARTSYS, "preadv2", file)
+	}
+
+	n, err := preadv(t, file, dst, offset)
+	t.IOUsage().AccountReadSyscall(n)
+	return uintptr(n), nil, handleIOError(t, n != 0, err, kernel.ERESTARTSYS, "preadv2", file)
+}
+
 func readv(t *kernel.Task, f *fs.File, dst usermem.IOSequence) (int64, error) {
 	n, err := f.Readv(t, dst)
 	if err != syserror.ErrWouldBlock || f.Flags().NonBlocking {
@@ -195,6 +261,20 @@ func readv(t *kernel.Task, f *fs.File, dst usermem.IOSequence) (int64, error) {
 			f.Dirent.InotifyEvent(linux.IN_ACCESS, 0)
 		}
 		return n, err
+	}
+
+	// Sockets support read timeouts.
+	var haveDeadline bool
+	var deadline ktime.Time
+	if s, ok := f.FileOperations.(socket.Socket); ok {
+		dl := s.RecvTimeout()
+		if dl < 0 && err == syserror.ErrWouldBlock {
+			return n, err
+		}
+		if dl > 0 {
+			deadline = t.Kernel().MonotonicClock().Now().Add(time.Duration(dl) * time.Nanosecond)
+			haveDeadline = true
+		}
 	}
 
 	// Register for notifications.
@@ -215,7 +295,10 @@ func readv(t *kernel.Task, f *fs.File, dst usermem.IOSequence) (int64, error) {
 		}
 
 		// Wait for a notification that we should retry.
-		if err = t.Block(ch); err != nil {
+		if err = t.BlockWithDeadline(ch, haveDeadline, deadline); err != nil {
+			if err == syserror.ETIMEDOUT {
+				err = syserror.ErrWouldBlock
+			}
 			break
 		}
 	}

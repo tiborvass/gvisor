@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,10 @@ package mm
 import (
 	"fmt"
 
+	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/limits"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/memmap"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
@@ -34,9 +36,10 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 
 	// Find a useable range.
 	addr, err := mm.findAvailableLocked(opts.Length, findAvailableOpts{
-		Addr:  opts.Addr,
-		Fixed: opts.Fixed,
-		Unmap: opts.Unmap,
+		Addr:     opts.Addr,
+		Fixed:    opts.Fixed,
+		Unmap:    opts.Unmap,
+		Map32Bit: opts.Map32Bit,
 	})
 	if err != nil {
 		return vmaIterator{}, usermem.AddrRange{}, err
@@ -52,6 +55,23 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		return vmaIterator{}, usermem.AddrRange{}, syserror.ENOMEM
 	}
 
+	if opts.MLockMode != memmap.MLockNone {
+		// Check against RLIMIT_MEMLOCK.
+		if creds := auth.CredentialsFromContext(ctx); !creds.HasCapabilityIn(linux.CAP_IPC_LOCK, creds.UserNamespace.Root()) {
+			mlockLimit := limits.FromContext(ctx).Get(limits.MemoryLocked).Cur
+			if mlockLimit == 0 {
+				return vmaIterator{}, usermem.AddrRange{}, syserror.EPERM
+			}
+			newLockedAS := mm.lockedAS + opts.Length
+			if opts.Unmap {
+				newLockedAS -= mm.mlockedBytesRangeLocked(ar)
+			}
+			if newLockedAS > mlockLimit {
+				return vmaIterator{}, usermem.AddrRange{}, syserror.EAGAIN
+			}
+		}
+	}
+
 	// Remove overwritten mappings. This ordering is consistent with Linux:
 	// compare Linux's mm/mmap.c:mmap_region() => do_munmap(),
 	// file->f_op->mmap().
@@ -64,7 +84,9 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 
 	// Inform the Mappable, if any, of the new mapping.
 	if opts.Mappable != nil {
-		if err := opts.Mappable.AddMapping(ctx, mm, ar, opts.Offset); err != nil {
+		// The expression for writable is vma.canWriteMappableLocked(), but we
+		// don't yet have a vma.
+		if err := opts.Mappable.AddMapping(ctx, mm, ar, opts.Offset, !opts.Private && opts.MaxPerms.Write); err != nil {
 			return vmaIterator{}, usermem.AddrRange{}, err
 		}
 	}
@@ -84,33 +106,53 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		maxPerms:       opts.MaxPerms,
 		private:        opts.Private,
 		growsDown:      opts.GrowsDown,
+		mlockMode:      opts.MLockMode,
 		id:             opts.MappingIdentity,
 		hint:           opts.Hint,
 	})
 	mm.usageAS += opts.Length
+	if opts.MLockMode != memmap.MLockNone {
+		mm.lockedAS += opts.Length
+	}
 
 	return vseg, ar, nil
 }
 
 type findAvailableOpts struct {
-	// Addr is a suggested address. Addr must be page-aligned.
-	Addr usermem.Addr
+	// These fields are equivalent to those in memmap.MMapOpts, except that:
+	//
+	// - Addr must be page-aligned.
+	//
+	// - Unmap allows existing guard pages in the returned range.
 
-	// Fixed is true if only the suggested address is acceptable.
-	Fixed bool
-
-	// Unmap is true if existing vmas and guard pages may exist in the returned
-	// range.
-	Unmap bool
+	Addr     usermem.Addr
+	Fixed    bool
+	Unmap    bool
+	Map32Bit bool
 }
+
+// map32Start/End are the bounds to which MAP_32BIT mappings are constrained,
+// and are equivalent to Linux's MAP32_BASE and MAP32_MAX respectively.
+const (
+	map32Start = 0x40000000
+	map32End   = 0x80000000
+)
 
 // findAvailableLocked finds an allocatable range.
 //
 // Preconditions: mm.mappingMu must be locked.
 func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOpts) (usermem.Addr, error) {
+	if opts.Fixed {
+		opts.Map32Bit = false
+	}
+	allowedAR := mm.applicationAddrRange()
+	if opts.Map32Bit {
+		allowedAR = allowedAR.Intersect(usermem.AddrRange{map32Start, map32End})
+	}
+
 	// Does the provided suggestion work?
 	if ar, ok := opts.Addr.ToRange(length); ok {
-		if mm.applicationAddrRange().IsSupersetOf(ar) {
+		if allowedAR.IsSupersetOf(ar) {
 			if opts.Unmap {
 				return ar.Start, nil
 			}
@@ -132,6 +174,9 @@ func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOp
 		alignment = usermem.HugePageSize
 	}
 
+	if opts.Map32Bit {
+		return mm.findLowestAvailableLocked(length, alignment, allowedAR)
+	}
 	if mm.layout.DefaultDirection == arch.MmapBottomUp {
 		return mm.findLowestAvailableLocked(length, alignment, usermem.AddrRange{mm.layout.BottomUpBase, mm.layout.MaxAddr})
 	}
@@ -179,6 +224,17 @@ func (mm *MemoryManager) findHighestAvailableLocked(length, alignment uint64, bo
 		}
 	}
 	return 0, syserror.ENOMEM
+}
+
+// Preconditions: mm.mappingMu must be locked.
+func (mm *MemoryManager) mlockedBytesRangeLocked(ar usermem.AddrRange) uint64 {
+	var total uint64
+	for vseg := mm.vmas.LowerBoundSegment(ar.Start); vseg.Ok() && vseg.Start() < ar.End; vseg = vseg.NextSegment() {
+		if vseg.ValuePtr().mlockMode != memmap.MLockNone {
+			total += uint64(vseg.Range().Intersect(ar).Length())
+		}
+	}
+	return total
 }
 
 // getVMAsLocked ensures that vmas exist for all addresses in ar, and support
@@ -312,16 +368,32 @@ func (mm *MemoryManager) removeVMAsLocked(ctx context.Context, ar usermem.AddrRa
 		vmaAR := vseg.Range()
 		vma := vseg.ValuePtr()
 		if vma.mappable != nil {
-			vma.mappable.RemoveMapping(ctx, mm, vmaAR, vma.off)
+			vma.mappable.RemoveMapping(ctx, mm, vmaAR, vma.off, vma.canWriteMappableLocked())
 		}
 		if vma.id != nil {
 			vma.id.DecRef()
 		}
 		mm.usageAS -= uint64(vmaAR.Length())
+		if vma.mlockMode != memmap.MLockNone {
+			mm.lockedAS -= uint64(vmaAR.Length())
+		}
 		vgap = mm.vmas.Remove(vseg)
 		vseg = vgap.NextSegment()
 	}
 	return vgap
+}
+
+// canWriteMappableLocked returns true if it is possible for vma.mappable to be
+// written to via this vma, i.e. if it is possible that
+// vma.mappable.Translate(at.Write=true) may be called as a result of this vma.
+// This includes via I/O with usermem.IOOpts.IgnorePermissions = true, such as
+// PTRACE_POKEDATA.
+//
+// canWriteMappableLocked is equivalent to Linux's VM_SHARED.
+//
+// Preconditions: mm.mappingMu must be locked.
+func (vma *vma) canWriteMappableLocked() bool {
+	return !vma.private && vma.maxPerms.Write
 }
 
 // vmaSetFunctions implements segment.Functions for vmaSet.
@@ -348,6 +420,7 @@ func (vmaSetFunctions) Merge(ar1 usermem.AddrRange, vma1 vma, ar2 usermem.AddrRa
 		vma1.maxPerms != vma2.maxPerms ||
 		vma1.private != vma2.private ||
 		vma1.growsDown != vma2.growsDown ||
+		vma1.mlockMode != vma2.mlockMode ||
 		vma1.id != vma2.id ||
 		vma1.hint != vma2.hint {
 		return vma{}, false

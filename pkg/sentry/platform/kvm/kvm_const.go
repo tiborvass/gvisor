@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,11 +24,14 @@ const (
 	_KVM_CREATE_VCPU            = 0xae41
 	_KVM_SET_TSS_ADDR           = 0xae47
 	_KVM_RUN                    = 0xae80
+	_KVM_NMI                    = 0xae9a
+	_KVM_CHECK_EXTENSION        = 0xae03
 	_KVM_INTERRUPT              = 0x4004ae86
 	_KVM_SET_MSRS               = 0x4008ae89
 	_KVM_SET_USER_MEMORY_REGION = 0x4020ae46
 	_KVM_SET_REGS               = 0x4090ae82
 	_KVM_SET_SREGS              = 0x4138ae84
+	_KVM_GET_REGS               = 0x8090ae81
 	_KVM_GET_SUPPORTED_CPUID    = 0xc008ae05
 	_KVM_SET_CPUID2             = 0x4008ae90
 	_KVM_SET_SIGNAL_MASK        = 0x4004ae8b
@@ -48,9 +51,14 @@ const (
 	_KVM_EXIT_INTERNAL_ERROR  = 0x11
 )
 
+// KVM capability options.
+const (
+	_KVM_CAP_MAX_VCPUS = 0x42
+)
+
 // KVM limits.
 const (
-	_KVM_NR_VCPUS         = 0x100
+	_KVM_NR_VCPUS         = 0xff
 	_KVM_NR_INTERRUPTS    = 0x100
 	_KVM_NR_CPUID_ENTRIES = 0x100
 )

@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,6 +27,8 @@ type SessionID ThreadID
 type ProcessGroupID ThreadID
 
 // Session contains a leader threadgroup and a list of ProcessGroups.
+//
+// +stateify savable
 type Session struct {
 	refs refs.AtomicRefCount
 
@@ -76,6 +78,8 @@ func (s *Session) decRef() {
 }
 
 // ProcessGroup contains an originator threadgroup and a parent Session.
+//
+// +stateify savable
 type ProcessGroup struct {
 	refs refs.AtomicRefCount // not exported.
 
@@ -108,6 +112,11 @@ type ProcessGroup struct {
 	// processGroupEntry is the embedded entry for Sessions.groups. This is
 	// protected by TaskSet.mu.
 	processGroupEntry
+}
+
+// Originator retuns the originator of the process group.
+func (pg *ProcessGroup) Originator() *ThreadGroup {
+	return pg.originator
 }
 
 // incRefWithParent grabs a reference.
@@ -208,6 +217,11 @@ func (pg *ProcessGroup) handleOrphan() {
 	})
 
 	return
+}
+
+// Session returns the process group's session without taking a reference.
+func (pg *ProcessGroup) Session() *Session {
+	return pg.session
 }
 
 // CreateSession creates a new Session, with the ThreadGroup as the leader.
@@ -352,6 +366,9 @@ func (tg *ThreadGroup) CreateProcessGroup() error {
 	})
 	tg.processGroup.decRefWithParent(oldParentPG)
 	tg.processGroup = pg
+
+	// Add the new process group to the session.
+	pg.session.processGroups.PushBack(pg)
 
 	// Ensure this translation is added to all namespaces.
 	for ns := tg.pidns; ns != nil; ns = ns.parent {

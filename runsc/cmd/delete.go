@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,15 +16,19 @@ package cmd
 
 import (
 	"context"
+	"fmt"
+	"os"
+
 	"flag"
 	"github.com/google/subcommands"
+	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/runsc/boot"
-	"gvisor.googlesource.com/gvisor/runsc/sandbox"
+	"gvisor.googlesource.com/gvisor/runsc/container"
 )
 
 // Delete implements subcommands.Command for the "delete" command.
 type Delete struct {
-	// force indicates that the sandbox should be terminated if running.
+	// force indicates that the container should be terminated if running.
 	force bool
 }
 
@@ -45,7 +49,7 @@ func (*Delete) Usage() string {
 
 // SetFlags implements subcommands.Command.SetFlags.
 func (d *Delete) SetFlags(f *flag.FlagSet) {
-	f.BoolVar(&d.force, "force", false, "terminate sandbox if running")
+	f.BoolVar(&d.force, "force", false, "terminate container if running")
 }
 
 // Execute implements subcommands.Command.Execute.
@@ -56,19 +60,28 @@ func (d *Delete) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}
 	}
 
 	conf := args[0].(*boot.Config)
-
-	for i := 0; i < f.NArg(); i++ {
-		id := f.Arg(i)
-		s, err := sandbox.Load(conf.RootDir, id)
-		if err != nil {
-			Fatalf("error loading sandbox %q: %v", id, err)
-		}
-		if !d.force && (s.Status == sandbox.Running) {
-			Fatalf("cannot stop running sandbox without --force flag")
-		}
-		if err := s.Destroy(); err != nil {
-			Fatalf("error destroying sandbox: %v", err)
-		}
+	if err := d.execute(f.Args(), conf); err != nil {
+		Fatalf("%v", err)
 	}
 	return subcommands.ExitSuccess
+}
+
+func (d *Delete) execute(ids []string, conf *boot.Config) error {
+	for _, id := range ids {
+		c, err := container.Load(conf.RootDir, id)
+		if err != nil {
+			if os.IsNotExist(err) && d.force {
+				log.Warningf("couldn't find container %q: %v", id, err)
+				return nil
+			}
+			return fmt.Errorf("loading container %q: %v", id, err)
+		}
+		if !d.force && c.Status != container.Created && c.Status != container.Stopped {
+			return fmt.Errorf("cannot delete container that is not stopped without --force flag")
+		}
+		if err := c.Destroy(); err != nil {
+			return fmt.Errorf("destroying container: %v", err)
+		}
+	}
+	return nil
 }

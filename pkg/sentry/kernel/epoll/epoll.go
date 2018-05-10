@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -58,13 +58,17 @@ const (
 // potentially be reassigned. We also cannot use just the file pointer because
 // it is possible to have multiple entries for the same file object as long as
 // they are created with different FDs (i.e., the FDs point to the same file).
+//
+// +stateify savable
 type FileIdentifier struct {
-	File *fs.File
+	File *fs.File `state:"wait"`
 	Fd   kdefs.FD
 }
 
 // pollEntry holds all the state associated with an event poll entry, that is,
 // a file being observed by an event poll object.
+//
+// +stateify savable
 type pollEntry struct {
 	ilist.Entry
 	file     *refs.WeakRef  `state:"manual"`
@@ -92,17 +96,19 @@ func (p *pollEntry) WeakRefGone() {
 
 // EventPoll holds all the state associated with an event poll object, that is,
 // collection of files to observe and their current state.
+//
+// +stateify savable
 type EventPoll struct {
-	fsutil.PipeSeek      `state:"zerovalue"`
-	fsutil.NotDirReaddir `state:"zerovalue"`
-	fsutil.NoFsync       `state:"zerovalue"`
-	fsutil.NoopFlush     `state:"zerovalue"`
-	fsutil.NoMMap        `state:"zerovalue"`
-	fsutil.NoIoctl       `state:"zerovalue"`
+	fsutil.FilePipeSeek      `state:"zerovalue"`
+	fsutil.FileNotDirReaddir `state:"zerovalue"`
+	fsutil.FileNoFsync       `state:"zerovalue"`
+	fsutil.FileNoopFlush     `state:"zerovalue"`
+	fsutil.FileNoMMap        `state:"zerovalue"`
+	fsutil.FileNoIoctl       `state:"zerovalue"`
 
 	// Wait queue is used to notify interested parties when the event poll
 	// object itself becomes readable or writable.
-	waiter.Queue
+	waiter.Queue `state:"zerovalue"`
 
 	// files is the map of all the files currently being observed, it is
 	// protected by mu.

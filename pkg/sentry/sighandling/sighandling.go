@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,36 +16,52 @@
 package sighandling
 
 import (
+	"fmt"
 	"os"
 	"os/signal"
 	"reflect"
 	"syscall"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 )
 
 // numSignals is the number of normal (non-realtime) signals on Linux.
 const numSignals = 32
 
-// forwardSignals listens for incoming signals and delivers them to k. It stops
-// when the stop channel is closed.
-func forwardSignals(k *kernel.Kernel, sigchans []chan os.Signal, stop chan struct{}) {
+// handleSignals listens for incoming signals and calls the given handler
+// function.
+//
+// It starts when the start channel is closed, stops when the stop channel
+// is closed, and closes done once it will no longer deliver signals to k.
+func handleSignals(sigchans []chan os.Signal, handler func(linux.Signal), start, stop, done chan struct{}) {
 	// Build a select case.
-	sc := []reflect.SelectCase{{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(stop)}}
+	sc := []reflect.SelectCase{{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(start)}}
 	for _, sigchan := range sigchans {
 		sc = append(sc, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(sigchan)})
 	}
 
+	started := false
 	for {
 		// Wait for a notification.
 		index, _, ok := reflect.Select(sc)
 
-		// Was it the stop channel?
+		// Was it the start / stop channel?
 		if index == 0 {
 			if !ok {
-				break
+				if !started {
+					// start channel; start forwarding and
+					// swap this case for the stop channel
+					// to select stop requests.
+					started = true
+					sc[0] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(stop)}
+				} else {
+					// stop channel; stop forwarding and
+					// clear this case so it is never
+					// selected again.
+					started = false
+					close(done)
+					sc[0].Chan = reflect.Value{}
+				}
 			}
 			continue
 		}
@@ -57,37 +73,46 @@ func forwardSignals(k *kernel.Kernel, sigchans []chan os.Signal, stop chan struc
 
 		// Otherwise, it was a signal on channel N. Index 0 represents the stop
 		// channel, so index N represents the channel for signal N.
-		if !k.SendExternalSignal(&arch.SignalInfo{Signo: int32(index)}, "sentry") {
-			// Kernel is not ready to receive signals.
+		signal := linux.Signal(index)
+
+		if !started {
+			// Kernel cannot receive signals, either because it is
+			// not ready yet or is shutting down.
 			//
 			// Kill ourselves if this signal would have killed the
-			// process before StartForwarding was called. i.e., all
+			// process before PrepareForwarding was called. i.e., all
 			// _SigKill signals; see Go
 			// src/runtime/sigtab_linux_generic.go.
 			//
 			// Otherwise ignore the signal.
 			//
-			// TODO: Convert Go's runtime.raise from
-			// tkill to tgkill so StartForwarding doesn't need to
-			// be called until after filter installation.
-			switch linux.Signal(index) {
+			// TODO: Drop in Go 1.12, which uses tgkill
+			// in runtime.raise.
+			switch signal {
 			case linux.SIGHUP, linux.SIGINT, linux.SIGTERM:
-				dieFromSignal(linux.Signal(index))
+				dieFromSignal(signal)
+				panic(fmt.Sprintf("Failed to die from signal %d", signal))
+			default:
+				continue
 			}
 		}
-	}
 
-	// Close all individual channels.
-	for _, sigchan := range sigchans {
-		signal.Stop(sigchan)
-		close(sigchan)
+		// Pass the signal to the handler.
+		handler(signal)
 	}
 }
 
-// StartForwarding ensures that synchronous signals are forwarded to k and
-// returns a callback that stops signal forwarding.
-func StartForwarding(k *kernel.Kernel) func() {
+// PrepareHandler ensures that synchronous signals are passed to the given
+// handler function and returns a callback that starts signal delivery, which
+// itself returns a callback that stops signal handling.
+//
+// Note that this function permanently takes over signal handling. After the
+// stop callback, signals revert to the default Go runtime behavior, which
+// cannot be overridden with external calls to signal.Notify.
+func PrepareHandler(handler func(linux.Signal)) func() func() {
+	start := make(chan struct{})
 	stop := make(chan struct{})
+	done := make(chan struct{})
 
 	// Register individual channels. One channel per standard signal is
 	// required as os.Notify() is non-blocking and may drop signals. To avoid
@@ -100,17 +125,16 @@ func StartForwarding(k *kernel.Kernel) func() {
 	for sig := 1; sig <= numSignals+1; sig++ {
 		sigchan := make(chan os.Signal, 1)
 		sigchans = append(sigchans, sigchan)
-
-		// SignalPanic is handled by Run.
-		if linux.Signal(sig) == kernel.SignalPanic {
-			continue
-		}
-
 		signal.Notify(sigchan, syscall.Signal(sig))
 	}
 	// Start up our listener.
-	go forwardSignals(k, sigchans, stop) // S/R-SAFE: synchronized by Kernel.extMu
+	go handleSignals(sigchans, handler, start, stop, done) // S/R-SAFE: synchronized by Kernel.extMu.
 
-	// ... shouldn't this wait until the forwardSignals goroutine returns?
-	return func() { close(stop) }
+	return func() func() {
+		close(start)
+		return func() {
+			close(stop)
+			<-done
+		}
+	}
 }

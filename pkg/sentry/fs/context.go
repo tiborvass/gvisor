@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
 )
 
-// contextID is the kernel package's type for context.Context.Value keys.
+// contextID is the fs package's type for context.Context.Value keys.
 type contextID int
 
 const (

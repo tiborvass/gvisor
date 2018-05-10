@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,9 +26,9 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/refs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/uniqueid"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
-	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 )
 
 type globalDirentMap struct {
@@ -81,6 +81,8 @@ var renameMu sync.RWMutex
 //
 // Dirents currently do not attempt to free entries that lack application references under
 // memory pressure.
+//
+// +stateify savable
 type Dirent struct {
 	// AtomicRefCount is our reference count.
 	refs.AtomicRefCount
@@ -117,7 +119,7 @@ type Dirent struct {
 	parent *Dirent
 
 	// deleted may be set atomically when removed.
-	deleted int32 `state:"nosave"`
+	deleted int32
 
 	// frozen indicates this entry can't walk to unknown nodes.
 	frozen bool
@@ -199,7 +201,7 @@ type Dirent struct {
 	mu sync.Mutex `state:"nosave"`
 
 	// children are cached via weak references.
-	children map[string]*refs.WeakRef
+	children map[string]*refs.WeakRef `state:".(map[string]*Dirent)"`
 }
 
 // NewDirent returns a new root Dirent, taking the caller's reference on inode. The caller
@@ -213,7 +215,12 @@ func NewDirent(inode *Inode, name string) *Dirent {
 
 // NewTransientDirent creates a transient Dirent that shouldn't actually be
 // visible to users.
+//
+// An Inode is required.
 func NewTransientDirent(inode *Inode) *Dirent {
+	if inode == nil {
+		panic("an inode is required")
+	}
 	return newDirent(inode, "transient")
 }
 
@@ -329,6 +336,17 @@ func (d *Dirent) SyncAll(ctx context.Context) {
 	}
 }
 
+// BaseName returns the base name of the dirent.
+func (d *Dirent) BaseName() string {
+	p := d.parent
+	if p == nil {
+		return d.name
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return d.name
+}
+
 // FullName returns the fully-qualified name and a boolean value representing
 // whether this Dirent was a descendant of root.
 // If the root argument is nil it is assumed to be the root of the Dirent tree.
@@ -367,7 +385,31 @@ func (d *Dirent) fullName(root *Dirent) (string, bool) {
 	return s, reachable
 }
 
-func (d *Dirent) freeze() {
+// MountRoot finds and returns the mount-root for a given dirent.
+func (d *Dirent) MountRoot() *Dirent {
+	renameMu.RLock()
+	defer renameMu.RUnlock()
+
+	mountRoot := d
+	for !mountRoot.mounted && mountRoot.parent != nil {
+		mountRoot = mountRoot.parent
+	}
+	mountRoot.IncRef()
+	return mountRoot
+}
+
+// Freeze prevents this dirent from walking to more nodes. Freeze is applied
+// recursively to all children.
+//
+// If this particular Dirent represents a Virtual node, then Walks and Creates
+// may proceed as before.
+//
+// Freeze can only be called before the application starts running, otherwise
+// the root it might be out of sync with the application root if modified by
+// sys_chroot.
+func (d *Dirent) Freeze() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.frozen {
 		// Already frozen.
 		return
@@ -386,21 +428,6 @@ func (d *Dirent) freeze() {
 
 	// Drop all expired weak references.
 	d.flush()
-}
-
-// Freeze prevents this dirent from walking to more nodes. Freeze is applied
-// recursively to all children.
-//
-// If this particular Dirent represents a Virtual node, then Walks and Creates
-// may proceed as before.
-//
-// Freeze can only be called before the application starts running, otherwise
-// the root it might be out of sync with the application root if modified by
-// sys_chroot.
-func (d *Dirent) Freeze() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.freeze()
 }
 
 // descendantOf returns true if the receiver dirent is equal to, or a
@@ -424,32 +451,35 @@ func (d *Dirent) descendantOf(p *Dirent) bool {
 // Inode.Lookup, otherwise walk will keep d.mu locked.
 //
 // Preconditions:
+// - renameMu must be held for reading.
 // - d.mu must be held.
 // - name must must not contain "/"s.
 func (d *Dirent) walk(ctx context.Context, root *Dirent, name string, walkMayUnlock bool) (*Dirent, error) {
 	if !IsDir(d.Inode.StableAttr) {
 		return nil, syscall.ENOTDIR
 	}
+
+	// The component must be less than NAME_MAX.
+	if len(name) > linux.NAME_MAX {
+		return nil, syscall.ENAMETOOLONG
+	}
+
 	if name == "" || name == "." {
 		d.IncRef()
 		return d, nil
 	} else if name == ".." {
-		renameMu.RLock()
 		// Respect the chroot. Note that in Linux there is no check to enforce
 		// that d is a descendant of root.
 		if d == root {
 			d.IncRef()
-			renameMu.RUnlock()
 			return d, nil
 		}
 		// Are we already at the root? Then ".." is ".".
 		if d.IsRoot() {
 			d.IncRef()
-			renameMu.RUnlock()
 			return d, nil
 		}
 		d.parent.IncRef()
-		renameMu.RUnlock()
 		return d.parent, nil
 	}
 
@@ -472,7 +502,7 @@ func (d *Dirent) walk(ctx context.Context, root *Dirent, name string, walkMayUnl
 			//
 			// We never allow the file system to revalidate mounts, that could cause them
 			// to unexpectedly drop out before umount.
-			if cd.mounted || !cd.Inode.MountSource.Revalidate(cd) {
+			if cd.mounted || !cd.Inode.MountSource.Revalidate(ctx, name, d.Inode, cd.Inode) {
 				// Good to go. This is the fast-path.
 				return cd, nil
 			}
@@ -502,8 +532,8 @@ func (d *Dirent) walk(ctx context.Context, root *Dirent, name string, walkMayUnl
 		return nil, syscall.ENOENT
 	}
 
-	// Slow path: load the InodeOperations into memory. Since this is a hot path and the lookup may be expensive,
-	// if possible release the lock and re-acquire it.
+	// Slow path: load the InodeOperations into memory. Since this is a hot path and the lookup may be
+	// expensive, if possible release the lock and re-acquire it.
 	if walkMayUnlock {
 		d.mu.Unlock()
 	}
@@ -577,18 +607,27 @@ func (d *Dirent) Walk(ctx context.Context, root *Dirent, name string) (*Dirent, 
 		panic("Dirent.Walk: root must not be nil")
 	}
 
+	// We could use lockDirectory here, but this is a hot path and we want
+	// to avoid defer.
+	renameMu.RLock()
 	d.dirMu.RLock()
 	d.mu.Lock()
+
 	child, err := d.walk(ctx, root, name, true /* may unlock */)
+
 	d.mu.Unlock()
 	d.dirMu.RUnlock()
+	renameMu.RUnlock()
 
 	return child, err
 }
 
 // exists returns true if name exists in relation to d.
 //
-// Preconditions: d.mu must be held.
+// Preconditions:
+// - renameMu must be held for reading.
+// - d.mu must be held.
+// - name must must not contain "/"s.
 func (d *Dirent) exists(ctx context.Context, root *Dirent, name string) bool {
 	child, err := d.walk(ctx, root, name, true /* may unlock */)
 	if err != nil {
@@ -603,24 +642,13 @@ func (d *Dirent) exists(ctx context.Context, root *Dirent, name string) bool {
 // lockDirectory should be called for any operation that changes this `d`s
 // children (creating or removing them).
 func (d *Dirent) lockDirectory() func() {
-	if d.Inode.overlay != nil {
-		// overlay copyUp may need to look at Dirent parents, and hence
-		// may need renameMu.
-		renameMu.RLock()
-		d.dirMu.Lock()
-		d.mu.Lock()
-		return func() {
-			d.mu.Unlock()
-			d.dirMu.Unlock()
-			renameMu.RUnlock()
-		}
-	}
-
+	renameMu.RLock()
 	d.dirMu.Lock()
 	d.mu.Lock()
 	return func() {
 		d.mu.Unlock()
 		d.dirMu.Unlock()
+		renameMu.RUnlock()
 	}
 }
 
@@ -647,6 +675,16 @@ func (d *Dirent) Create(ctx context.Context, root *Dirent, name string, flags Fi
 	}
 	child := file.Dirent
 
+	d.finishCreate(child, name)
+
+	// Return the reference and the new file. When the last reference to
+	// the file is dropped, file.Dirent may no longer be cached.
+	return file, nil
+}
+
+// finishCreate validates the created file, adds it as a child of this dirent,
+// and notifies any watchers.
+func (d *Dirent) finishCreate(child *Dirent, name string) {
 	// Sanity check c, its name must be consistent.
 	if child.name != name {
 		panic(fmt.Sprintf("create from %q to %q returned unexpected name %q", d.name, name, child.name))
@@ -679,17 +717,14 @@ func (d *Dirent) Create(ctx context.Context, root *Dirent, name string, flags Fi
 
 	// Allow the file system to take extra references on c.
 	child.maybeExtendReference()
-
-	// Return the reference and the new file. When the last reference to
-	// the file is dropped, file.Dirent may no longer be cached.
-	return file, nil
 }
 
 // genericCreate executes create if name does not exist. Removes a negative Dirent at name if
 // create succeeds.
-//
-// Preconditions: d.mu must be held.
 func (d *Dirent) genericCreate(ctx context.Context, root *Dirent, name string, create func() error) error {
+	unlock := d.lockDirectory()
+	defer unlock()
+
 	// Does something already exist?
 	if d.exists(ctx, root, name) {
 		return syscall.EEXIST
@@ -698,11 +733,6 @@ func (d *Dirent) genericCreate(ctx context.Context, root *Dirent, name string, c
 	// Are we frozen?
 	if d.frozen && !d.Inode.IsVirtual() {
 		return syscall.ENOENT
-	}
-
-	// Execute the create operation.
-	if err := create(); err != nil {
-		return err
 	}
 
 	// Remove any negative Dirent. We've already asserted above with d.exists
@@ -727,14 +757,12 @@ func (d *Dirent) genericCreate(ctx context.Context, root *Dirent, name string, c
 		w.Drop()
 	}
 
-	return nil
+	// Execute the create operation.
+	return create()
 }
 
 // CreateLink creates a new link in this directory.
 func (d *Dirent) CreateLink(ctx context.Context, root *Dirent, oldname, newname string) error {
-	unlock := d.lockDirectory()
-	defer unlock()
-
 	return d.genericCreate(ctx, root, newname, func() error {
 		if err := d.Inode.CreateLink(ctx, d, oldname, newname); err != nil {
 			return err
@@ -746,12 +774,14 @@ func (d *Dirent) CreateLink(ctx context.Context, root *Dirent, oldname, newname 
 
 // CreateHardLink creates a new hard link in this directory.
 func (d *Dirent) CreateHardLink(ctx context.Context, root *Dirent, target *Dirent, name string) error {
-	unlock := d.lockDirectory()
-	defer unlock()
-
 	// Make sure that target does not span filesystems.
 	if d.Inode.MountSource != target.Inode.MountSource {
 		return syscall.EXDEV
+	}
+
+	// Directories are never linkable. See fs/namei.c:vfs_link.
+	if IsDir(target.Inode.StableAttr) {
+		return syscall.EPERM
 	}
 
 	return d.genericCreate(ctx, root, name, func() error {
@@ -766,9 +796,6 @@ func (d *Dirent) CreateHardLink(ctx context.Context, root *Dirent, target *Diren
 
 // CreateDirectory creates a new directory under this dirent.
 func (d *Dirent) CreateDirectory(ctx context.Context, root *Dirent, name string, perms FilePermissions) error {
-	unlock := d.lockDirectory()
-	defer unlock()
-
 	return d.genericCreate(ctx, root, name, func() error {
 		if err := d.Inode.CreateDirectory(ctx, d, name, perms); err != nil {
 			return err
@@ -779,30 +806,28 @@ func (d *Dirent) CreateDirectory(ctx context.Context, root *Dirent, name string,
 }
 
 // Bind satisfies the InodeOperations interface; otherwise same as GetFile.
-func (d *Dirent) Bind(ctx context.Context, root *Dirent, name string, socket unix.BoundEndpoint, perms FilePermissions) error {
-	d.dirMu.Lock()
-	defer d.dirMu.Unlock()
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
+func (d *Dirent) Bind(ctx context.Context, root *Dirent, name string, data transport.BoundEndpoint, perms FilePermissions) (*Dirent, error) {
+	var childDir *Dirent
 	err := d.genericCreate(ctx, root, name, func() error {
-		if err := d.Inode.Bind(ctx, name, socket, perms); err != nil {
-			return err
+		var e error
+		childDir, e = d.Inode.Bind(ctx, name, data, perms)
+		if e != nil {
+			return e
 		}
-		d.Inode.Watches.Notify(name, linux.IN_CREATE, 0)
+		d.finishCreate(childDir, name)
 		return nil
 	})
 	if err == syscall.EEXIST {
-		return syscall.EADDRINUSE
+		return nil, syscall.EADDRINUSE
 	}
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return childDir, err
 }
 
 // CreateFifo creates a new named pipe under this dirent.
 func (d *Dirent) CreateFifo(ctx context.Context, root *Dirent, name string, perms FilePermissions) error {
-	unlock := d.lockDirectory()
-	defer unlock()
-
 	return d.genericCreate(ctx, root, name, func() error {
 		if err := d.Inode.CreateFifo(ctx, d, name, perms); err != nil {
 			return err
@@ -812,14 +837,18 @@ func (d *Dirent) CreateFifo(ctx context.Context, root *Dirent, name string, perm
 	})
 }
 
-// getDotAttrs returns the DentAttrs corresponding to "." and ".." directories.
-func (d *Dirent) getDotAttrs(root *Dirent) (DentAttr, DentAttr) {
+// GetDotAttrs returns the DentAttrs corresponding to "." and ".." directories.
+func (d *Dirent) GetDotAttrs(root *Dirent) (DentAttr, DentAttr) {
 	// Get '.'.
 	sattr := d.Inode.StableAttr
 	dot := DentAttr{
 		Type:    sattr.Type,
 		InodeID: sattr.InodeID,
 	}
+
+	// Hold d.mu while we call d.descendantOf.
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
 	// Get '..'.
 	if !d.IsRoot() && d.descendantOf(root) {
@@ -841,7 +870,7 @@ func (d *Dirent) readdirFrozen(root *Dirent, offset int64, dirCtx *DirCtx) (int6
 	// Collect attrs for "." and  "..".
 	attrs := make(map[string]DentAttr)
 	names := []string{".", ".."}
-	attrs["."], attrs[".."] = d.getDotAttrs(root)
+	attrs["."], attrs[".."] = d.GetDotAttrs(root)
 
 	// Get info from all children.
 	d.mu.Lock()
@@ -936,7 +965,7 @@ func direntReaddir(ctx context.Context, d *Dirent, it DirIterator, root *Dirent,
 	}
 
 	// Collect attrs for "." and "..".
-	dot, dotdot := d.getDotAttrs(root)
+	dot, dotdot := d.GetDotAttrs(root)
 
 	// Emit "." and ".." if the offset is low enough.
 	if offset == 0 {
@@ -959,7 +988,7 @@ func direntReaddir(ctx context.Context, d *Dirent, it DirIterator, root *Dirent,
 	offset -= 2
 	newOffset, err := it.IterateDir(ctx, dirCtx, int(offset))
 	if int64(newOffset) < offset {
-		panic(fmt.Sprintf("node.Readdir returned offset %v less that input offset %v", offset, newOffset))
+		panic(fmt.Sprintf("node.Readdir returned offset %v less than input offset %v", newOffset, offset))
 	}
 	// Add the initial nodes back to the offset count.
 	newOffset += 2
@@ -1008,34 +1037,15 @@ func (d *Dirent) flush() {
 	}
 }
 
-// Busy indicates whether this Dirent is a mount point or root dirent, or has
-// active positive children.
-//
-// This is expensive, since it flushes the children cache.
-//
-// TODO: Fix this busy-ness check.
-func (d *Dirent) Busy() bool {
+// isMountPoint returns true if the dirent is a mount point or the root.
+func (d *Dirent) isMountPoint() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return d.isMountPointLocked()
+}
 
-	if d.mounted || d.parent == nil {
-		return true
-	}
-
-	// Flush any cached references to children that are doomed.
-	d.flush()
-
-	// Count positive children.
-	var nonNegative int
-	for _, w := range d.children {
-		if child := w.Get(); child != nil {
-			if !child.(*Dirent).IsNegative() {
-				nonNegative++
-			}
-			child.DecRef()
-		}
-	}
-	return nonNegative > 0
+func (d *Dirent) isMountPointLocked() bool {
+	return d.mounted || d.parent == nil
 }
 
 // mount mounts a new dirent with the given inode over d.
@@ -1140,7 +1150,7 @@ func (d *Dirent) Remove(ctx context.Context, root *Dirent, name string) error {
 	}
 
 	// Remove cannot remove a mount point.
-	if child.Busy() {
+	if child.isMountPoint() {
 		return syscall.EBUSY
 	}
 
@@ -1214,7 +1224,7 @@ func (d *Dirent) RemoveDirectory(ctx context.Context, root *Dirent, name string)
 	}
 
 	// Remove cannot remove a mount point.
-	if child.Busy() {
+	if child.isMountPoint() {
 		return syscall.EBUSY
 	}
 
@@ -1250,13 +1260,20 @@ func (d *Dirent) destroy() {
 		return
 	}
 
-	var wg sync.WaitGroup
-	defer wg.Wait()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	// Drop all weak references.
 	for _, w := range d.children {
+		if c := w.Get(); c != nil {
+			if c.(*Dirent).IsNegative() {
+				// The parent holds both weak and strong refs in the case of
+				// negative dirents.
+				c.DecRef()
+			}
+			// Drop the reference we just acquired in WeakRef.Get.
+			c.DecRef()
+		}
 		w.Drop()
 	}
 	d.children = nil
@@ -1328,7 +1345,15 @@ func (d *Dirent) InotifyEvent(events, cookie uint32) {
 
 	// The ordering below is important, Linux always notifies the parent first.
 	if d.parent != nil {
-		d.parent.Inode.Watches.Notify(d.name, events, cookie)
+		// name is immediately stale w.r.t. renames (renameMu doesn't
+		// protect against renames in the same directory). Holding
+		// d.parent.mu around Notify() wouldn't matter since Notify
+		// doesn't provide a synchronous mechanism for reading the name
+		// anyway.
+		d.parent.mu.Lock()
+		name := d.name
+		d.parent.mu.Unlock()
+		d.parent.Inode.Watches.Notify(name, events, cookie)
 	}
 	d.Inode.Watches.Notify("", events, cookie)
 
@@ -1436,6 +1461,10 @@ func checkSticky(ctx context.Context, dir *Dirent, victim *Dirent) error {
 //
 // Compare Linux kernel fs/namei.c:may_delete.
 func MayDelete(ctx context.Context, root, dir *Dirent, name string) error {
+	if err := dir.Inode.CheckPermission(ctx, PermMask{Write: true, Execute: true}); err != nil {
+		return err
+	}
+
 	victim, err := dir.Walk(ctx, root, name)
 	if err != nil {
 		return err
@@ -1445,12 +1474,20 @@ func MayDelete(ctx context.Context, root, dir *Dirent, name string) error {
 	return mayDelete(ctx, dir, victim)
 }
 
-func mayDelete(ctx context.Context, dir *Dirent, victim *Dirent) error {
-	if err := dir.Inode.CheckPermission(ctx, PermMask{Write: true, Execute: true}); err != nil {
+// mayDelete determines whether `victim`, a child of `dir`, can be deleted or
+// renamed by `ctx`.
+//
+// Preconditions: `dir` is writable and executable by `ctx`.
+func mayDelete(ctx context.Context, dir, victim *Dirent) error {
+	if err := checkSticky(ctx, dir, victim); err != nil {
 		return err
 	}
 
-	return checkSticky(ctx, dir, victim)
+	if victim.IsRoot() {
+		return syserror.EBUSY
+	}
+
+	return nil
 }
 
 // Rename atomically converts the child of oldParent named oldName to a
@@ -1479,31 +1516,35 @@ func Rename(ctx context.Context, root *Dirent, oldParent *Dirent, oldName string
 		return syscall.ENOENT
 	}
 
-	// Check constraints on the object being renamed.
+	// Do we have general permission to remove from oldParent and
+	// create/replace in newParent?
+	if err := oldParent.Inode.CheckPermission(ctx, PermMask{Write: true, Execute: true}); err != nil {
+		return err
+	}
+	if err := newParent.Inode.CheckPermission(ctx, PermMask{Write: true, Execute: true}); err != nil {
+		return err
+	}
+
+	// renamed is the dirent that will be renamed to something else.
 	renamed, err := oldParent.walk(ctx, root, oldName, false /* may unlock */)
 	if err != nil {
 		return err
 	}
 	defer renamed.DecRef()
 
-	// Make sure we have write permissions on old and new parent.
+	// Check that the renamed dirent is deletable.
 	if err := mayDelete(ctx, oldParent, renamed); err != nil {
 		return err
 	}
-	if newParent != oldParent {
-		if err := newParent.Inode.CheckPermission(ctx, PermMask{Write: true, Execute: true}); err != nil {
-			return err
-		}
+
+	// Check that the renamed dirent is not a mount point.
+	if renamed.isMountPointLocked() {
+		return syscall.EBUSY
 	}
 
 	// Source should not be an ancestor of the target.
-	if renamed == newParent {
+	if newParent.descendantOf(renamed) {
 		return syscall.EINVAL
-	}
-
-	// Is the thing we're trying to rename busy?
-	if renamed.Busy() {
-		return syscall.EBUSY
 	}
 
 	// Per rename(2): "... EACCES: ... or oldpath is a directory and does not
@@ -1514,19 +1555,40 @@ func Rename(ctx context.Context, root *Dirent, oldParent *Dirent, oldName string
 		}
 	}
 
-	// Check constraints on the object being replaced, if any.
+	// replaced is the dirent that is being overwritten by rename.
 	replaced, err := newParent.walk(ctx, root, newName, false /* may unlock */)
-	if err == nil {
-		defer replaced.DecRef()
+	if err != nil {
+		if err != syserror.ENOENT {
+			return err
+		}
+
+		// newName doesn't exist; simply create it below.
+	} else {
+		// Check constraints on the dirent being replaced.
+
+		// NOTE: We don't want to keep replaced alive
+		// across the Rename, so must call DecRef manually (no defer).
+
+		// Check that we can delete replaced.
+		if err := mayDelete(ctx, newParent, replaced); err != nil {
+			replaced.DecRef()
+			return err
+		}
 
 		// Target should not be an ancestor of source.
-		if replaced == oldParent {
-			// Why is this not EINVAL? See fs/namei.c.
+		if oldParent.descendantOf(replaced) {
+			replaced.DecRef()
+
+			// Note that Linux returns EINVAL if the source is an
+			// ancestor of target, but ENOTEMPTY if the target is
+			// an ancestor of source (unless RENAME_EXCHANGE flag
+			// is present).  See fs/namei.c:renameat2.
 			return syscall.ENOTEMPTY
 		}
 
-		// Is the thing we're trying to replace busy?
-		if replaced.Busy() {
+		// Check that replaced is not a mount point.
+		if replaced.isMountPointLocked() {
+			replaced.DecRef()
 			return syscall.EBUSY
 		}
 
@@ -1534,9 +1596,11 @@ func Rename(ctx context.Context, root *Dirent, oldParent *Dirent, oldName string
 		oldIsDir := IsDir(renamed.Inode.StableAttr)
 		newIsDir := IsDir(replaced.Inode.StableAttr)
 		if !newIsDir && oldIsDir {
+			replaced.DecRef()
 			return syscall.ENOTDIR
 		}
 		if !oldIsDir && newIsDir {
+			replaced.DecRef()
 			return syscall.EISDIR
 		}
 
@@ -1548,7 +1612,12 @@ func Rename(ctx context.Context, root *Dirent, oldParent *Dirent, oldName string
 		// reasons, so we flush all references on the replaced node and
 		// its children.
 		replaced.Inode.Watches.Unpin(replaced)
+		replaced.mu.Lock()
 		replaced.flush()
+		replaced.mu.Unlock()
+
+		// Done with replaced.
+		replaced.DecRef()
 	}
 
 	if err := renamed.Inode.Rename(ctx, oldParent, renamed, newParent, newName); err != nil {
@@ -1599,7 +1668,9 @@ func Rename(ctx context.Context, root *Dirent, oldParent *Dirent, oldName string
 	renamed.dropExtendedReference()
 
 	// Same as replaced.flush above.
+	renamed.mu.Lock()
 	renamed.flush()
+	renamed.mu.Unlock()
 
 	return nil
 }

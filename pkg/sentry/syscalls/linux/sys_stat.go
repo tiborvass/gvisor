@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +15,6 @@
 package linux
 
 import (
-	"syscall"
-
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
@@ -198,7 +196,7 @@ func statfsImpl(t *kernel.Task, d *fs.Dirent, addr usermem.Addr) error {
 		Files:           info.TotalFiles,
 		FilesFree:       info.FreeFiles,
 		// Same as Linux for simple_statfs, see fs/libfs.c.
-		NameLength:   syscall.PathMax,
+		NameLength:   linux.NAME_MAX,
 		FragmentSize: d.Inode.StableAttr.BlockSize,
 		// Leave other fields 0 like simple_statfs does.
 	}

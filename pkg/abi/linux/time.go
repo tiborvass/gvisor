@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -222,3 +222,7 @@ type Tms struct {
 	CUTime ClockT
 	CSTime ClockT
 }
+
+// TimerID represents type timer_t, which identifies a POSIX per-process
+// interval timer.
+type TimerID int32

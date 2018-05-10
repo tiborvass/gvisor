@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@ import (
 )
 
 // IO contains I/O-related statistics.
+//
+// +stateify savable
 type IO struct {
 	// CharsRead is the number of bytes read by read syscalls.
 	CharsRead uint64

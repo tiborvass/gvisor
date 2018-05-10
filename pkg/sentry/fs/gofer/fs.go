@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -56,21 +56,6 @@ const (
 	privateUnixSocketKey = "privateunixsocket"
 )
 
-// cachePolicy is a 9p cache policy.
-type cachePolicy string
-
-const (
-	// Use virtual file system cache.
-	cacheAll cachePolicy = "fscache"
-
-	// TODO: fully support cache=none.
-	cacheNone cachePolicy = "none"
-
-	// defaultCache is cacheAll. Note this diverges from the 9p Linux
-	// client whose default is "none".  See TODO above.
-	defaultCache = cacheAll
-)
-
 // defaultAname is the default attach name.
 const defaultAname = "/"
 
@@ -90,15 +75,19 @@ var (
 	// ErrNoTransport is returned when there is no 'trans' option.
 	ErrNoTransport = errors.New("missing required option: 'trans='")
 
-	// ErrNoReadFD is returned when there is no 'rfdno' option.
-	ErrNoReadFD = errors.New("missing required option: 'rfdno='")
+	// ErrFileNoReadFD is returned when there is no 'rfdno' option.
+	ErrFileNoReadFD = errors.New("missing required option: 'rfdno='")
 
-	// ErrNoWriteFD is returned when there is no 'wfdno' option.
-	ErrNoWriteFD = errors.New("missing required option: 'wfdno='")
+	// ErrFileNoWriteFD is returned when there is no 'wfdno' option.
+	ErrFileNoWriteFD = errors.New("missing required option: 'wfdno='")
 )
 
 // filesystem is a 9p client.
+//
+// +stateify savable
 type filesystem struct{}
+
+var _ fs.Filesystem = (*filesystem)(nil)
 
 func init() {
 	fs.RegisterFilesystem(&filesystem{})
@@ -116,6 +105,11 @@ func (*filesystem) Name() string {
 // AllowUserMount prohibits users from using mount(2) with this file system.
 func (*filesystem) AllowUserMount() bool {
 	return false
+}
+
+// AllowUserList allows this filesystem to be listed in /proc/filesystems.
+func (*filesystem) AllowUserList() bool {
+	return true
 }
 
 // Flags returns that there is nothing special about this file system.
@@ -168,14 +162,14 @@ func options(data string) (opts, error) {
 	// Check for the required 'rfdno=' option.
 	srfd, ok := options[readFDKey]
 	if !ok {
-		return o, ErrNoReadFD
+		return o, ErrFileNoReadFD
 	}
 	delete(options, readFDKey)
 
 	// Check for the required 'wfdno=' option.
 	swfd, ok := options[writeFDKey]
 	if !ok {
-		return o, ErrNoWriteFD
+		return o, ErrFileNoWriteFD
 	}
 	delete(options, writeFDKey)
 
@@ -206,11 +200,12 @@ func options(data string) (opts, error) {
 
 	// Parse the cache policy. Reject unsupported policies.
 	o.policy = cacheAll
-	if cp, ok := options[cacheKey]; ok {
-		if cachePolicy(cp) != cacheAll && cachePolicy(cp) != cacheNone {
-			return o, fmt.Errorf("unsupported cache mode: 'cache=%s'", cp)
+	if policy, ok := options[cacheKey]; ok {
+		cp, err := parseCachePolicy(policy)
+		if err != nil {
+			return o, err
 		}
-		o.policy = cachePolicy(cp)
+		o.policy = cp
 		delete(options, cacheKey)
 	}
 

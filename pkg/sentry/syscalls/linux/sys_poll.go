@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -82,7 +82,7 @@ func doPoll(t *kernel.Task, pfdAddr usermem.Addr, nfds uint, timeout time.Durati
 }
 
 func doSelect(t *kernel.Task, nfds int, readFDs, writeFDs, exceptFDs usermem.Addr, timeout time.Duration) (uintptr, error) {
-	if nfds < 0 || uint64(nfds) > t.ThreadGroup().Limits().GetCapped(limits.NumberOfFiles, fileCap) {
+	if nfds < 0 || nfds > fileCap {
 		return 0, syserror.EINVAL
 	}
 
@@ -90,6 +90,7 @@ func doSelect(t *kernel.Task, nfds int, readFDs, writeFDs, exceptFDs usermem.Add
 	//
 	// N.B. This only works on little-endian architectures.
 	byteCount := (nfds + 7) / 8
+
 	bitsInLastPartialByte := uint(nfds % 8)
 	r := make([]byte, byteCount)
 	w := make([]byte, byteCount)
@@ -274,6 +275,8 @@ func copyOutTimevalRemaining(t *kernel.Task, startNs ktime.Time, timeout time.Du
 
 // pollRestartBlock encapsulates the state required to restart poll(2) via
 // restart_syscall(2).
+//
+// +stateify savable
 type pollRestartBlock struct {
 	pfdAddr usermem.Addr
 	nfds    uint

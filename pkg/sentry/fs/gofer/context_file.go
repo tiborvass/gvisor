@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -56,13 +56,6 @@ func (c *contextFile) setAttr(ctx context.Context, valid p9.SetAttrMask, attr p9
 	defer ctx.UninterruptibleSleepFinish(false)
 
 	return c.file.SetAttr(valid, attr)
-}
-
-func (c *contextFile) remove(ctx context.Context) error {
-	ctx.UninterruptibleSleepStart(false)
-	defer ctx.UninterruptibleSleepFinish(false)
-
-	return c.file.Remove()
 }
 
 func (c *contextFile) rename(ctx context.Context, directory contextFile, name string) error {

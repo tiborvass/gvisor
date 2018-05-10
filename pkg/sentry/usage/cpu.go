@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ import (
 
 // CPUStats contains the subset of struct rusage fields that relate to CPU
 // scheduling.
+//
+// +stateify savable
 type CPUStats struct {
 	// UserTime is the amount of time spent executing application code.
 	UserTime time.Duration

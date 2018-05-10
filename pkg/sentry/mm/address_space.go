@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -114,12 +114,12 @@ func (mm *MemoryManager) Activate() error {
 	}
 }
 
-// Deactivate releases a release to the MemoryManager.
-func (mm *MemoryManager) Deactivate() error {
+// Deactivate releases a reference to the MemoryManager.
+func (mm *MemoryManager) Deactivate() {
 	// Fast path: this is not the last goroutine to deactivate the
 	// MemoryManager.
 	if atomicbitops.DecUnlessOneInt32(&mm.active) {
-		return nil
+		return
 	}
 
 	mm.activeMu.Lock()
@@ -128,33 +128,28 @@ func (mm *MemoryManager) Deactivate() error {
 	// Still active?
 	if atomic.AddInt32(&mm.active, -1) > 0 {
 		mm.activeMu.Unlock()
-		return nil
+		return
 	}
 
 	// Can we hold on to the address space?
 	if !mm.p.CooperativelySchedulesAddressSpace() {
 		mm.activeMu.Unlock()
-		return nil
+		return
 	}
 
 	// Release the address space.
-	if err := mm.as.Release(); err != nil {
-		atomic.StoreInt32(&mm.active, 1)
-		mm.activeMu.Unlock()
-		return err
-	}
+	mm.as.Release()
 
 	// Lost it.
 	mm.as = nil
 	mm.activeMu.Unlock()
-	return nil
 }
 
 // mapASLocked maps addresses in ar into mm.as. If precommit is true, mappings
 // for all addresses in ar should be precommitted.
 //
 // Preconditions: mm.activeMu must be locked. mm.as != nil. ar.Length() != 0.
-// ar must be page-aligned. pseg.Range().Contains(ar.Start).
+// ar must be page-aligned. pseg == mm.pmas.LowerBoundSegment(ar.Start).
 func (mm *MemoryManager) mapASLocked(pseg pmaIterator, ar usermem.AddrRange, precommit bool) error {
 	// By default, map entire pmas at a time, under the assumption that there
 	// is no cost to mapping more of a pma than necessary.
@@ -178,7 +173,9 @@ func (mm *MemoryManager) mapASLocked(pseg pmaIterator, ar usermem.AddrRange, pre
 		}
 	}
 
-	for {
+	// Since this checks ar.End and not mapAR.End, we will never map a pma that
+	// is not required.
+	for pseg.Ok() && pseg.Start() < ar.End {
 		pma := pseg.ValuePtr()
 		pmaAR := pseg.Range()
 		pmaMapAR := pmaAR.Intersect(mapAR)
@@ -189,13 +186,9 @@ func (mm *MemoryManager) mapASLocked(pseg pmaIterator, ar usermem.AddrRange, pre
 		if err := pma.file.MapInto(mm.as, pmaMapAR.Start, pseg.fileRangeOf(pmaMapAR), perms, precommit); err != nil {
 			return err
 		}
-		// Since this checks ar.End and not mapAR.End, we will never map a pma
-		// that is not required.
-		if ar.End <= pmaAR.End {
-			return nil
-		}
 		pseg = pseg.NextSegment()
 	}
+	return nil
 }
 
 // unmapASLocked removes all AddressSpace mappings for addresses in ar.

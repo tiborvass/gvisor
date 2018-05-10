@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,24 +15,39 @@
 package kernel
 
 import (
+	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/semaphore"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/shm"
 )
 
 // IPCNamespace represents an IPC namespace.
+//
+// +stateify savable
 type IPCNamespace struct {
+	// User namespace which owns this IPC namespace. Immutable.
+	userNS *auth.UserNamespace
+
 	semaphores *semaphore.Registry
+	shms       *shm.Registry
 }
 
 // NewIPCNamespace creates a new IPC namespace.
-func NewIPCNamespace() *IPCNamespace {
+func NewIPCNamespace(userNS *auth.UserNamespace) *IPCNamespace {
 	return &IPCNamespace{
-		semaphores: semaphore.NewRegistry(),
+		userNS:     userNS,
+		semaphores: semaphore.NewRegistry(userNS),
+		shms:       shm.NewRegistry(userNS),
 	}
 }
 
 // SemaphoreRegistry returns the semanphore set registry for this namespace.
 func (i *IPCNamespace) SemaphoreRegistry() *semaphore.Registry {
 	return i.semaphores
+}
+
+// ShmRegistry returns the shm segment registry for this namespace.
+func (i *IPCNamespace) ShmRegistry() *shm.Registry {
+	return i.shms
 }
 
 // IPCNamespace returns the task's IPC namespace.

@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -56,6 +56,7 @@ func (s *State) afterLoad() {
 	copy(s.x86FPState, old)
 }
 
+// +stateify savable
 type syscallPtraceRegs struct {
 	R15      uint64
 	R14      uint64

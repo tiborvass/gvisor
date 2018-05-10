@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,5 +37,5 @@ func (t *Timekeeper) beforeSave() {
 
 // afterLoad is invoked by stateify.
 func (t *Timekeeper) afterLoad() {
-	t.restored = true
+	t.restored = make(chan struct{})
 }

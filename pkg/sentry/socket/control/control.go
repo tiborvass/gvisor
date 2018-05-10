@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,16 +24,16 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/kdefs"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
-	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 )
 
 const maxInt = int(^uint(0) >> 1)
 
 // SCMCredentials represents a SCM_CREDENTIALS socket control message.
 type SCMCredentials interface {
-	unix.CredentialsControlMessage
+	transport.CredentialsControlMessage
 
 	// Credentials returns properly namespaced values for the sender's pid, uid
 	// and gid.
@@ -42,7 +42,7 @@ type SCMCredentials interface {
 
 // SCMRights represents a SCM_RIGHTS socket control message.
 type SCMRights interface {
-	unix.RightsControlMessage
+	transport.RightsControlMessage
 
 	// Files returns up to max RightsFiles.
 	Files(ctx context.Context, max int) RightsFiles
@@ -51,6 +51,8 @@ type SCMRights interface {
 // RightsFiles represents a SCM_RIGHTS socket control message. A reference is
 // maintained for each fs.File and is release either when an FD is created or
 // when the Release method is called.
+//
+// +stateify savable
 type RightsFiles []*fs.File
 
 // NewSCMRights creates a new SCM_RIGHTS socket control message representation
@@ -79,8 +81,8 @@ func (fs *RightsFiles) Files(ctx context.Context, max int) RightsFiles {
 	return rf
 }
 
-// Clone implements unix.RightsControlMessage.Clone.
-func (fs *RightsFiles) Clone() unix.RightsControlMessage {
+// Clone implements transport.RightsControlMessage.Clone.
+func (fs *RightsFiles) Clone() transport.RightsControlMessage {
 	nfs := append(RightsFiles(nil), *fs...)
 	for _, nf := range nfs {
 		nf.IncRef()
@@ -88,7 +90,7 @@ func (fs *RightsFiles) Clone() unix.RightsControlMessage {
 	return &nfs
 }
 
-// Release implements unix.RightsControlMessage.Release.
+// Release implements transport.RightsControlMessage.Release.
 func (fs *RightsFiles) Release() {
 	for _, f := range *fs {
 		f.DecRef()
@@ -128,6 +130,8 @@ func PackRights(t *kernel.Task, rights SCMRights, cloexec bool, buf []byte) []by
 }
 
 // scmCredentials represents an SCM_CREDENTIALS socket control message.
+//
+// +stateify savable
 type scmCredentials struct {
 	t    *kernel.Task
 	kuid auth.KUID
@@ -152,8 +156,8 @@ func NewSCMCredentials(t *kernel.Task, cred linux.ControlMessageCredentials) (SC
 	return &scmCredentials{t, kuid, kgid}, nil
 }
 
-// Equals implements unix.CredentialsControlMessage.Equals.
-func (c *scmCredentials) Equals(oc unix.CredentialsControlMessage) bool {
+// Equals implements transport.CredentialsControlMessage.Equals.
+func (c *scmCredentials) Equals(oc transport.CredentialsControlMessage) bool {
 	if oc, _ := oc.(*scmCredentials); oc != nil && *c == *oc {
 		return true
 	}
@@ -297,7 +301,7 @@ func PackTimestamp(t *kernel.Task, timestamp int64, buf []byte) []byte {
 }
 
 // Parse parses a raw socket control message into portable objects.
-func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (unix.ControlMessages, error) {
+func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (transport.ControlMessages, error) {
 	var (
 		fds linux.ControlMessageRights
 
@@ -307,20 +311,20 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (unix.Contr
 
 	for i := 0; i < len(buf); {
 		if i+linux.SizeOfControlMessageHeader > len(buf) {
-			return unix.ControlMessages{}, syserror.EINVAL
+			return transport.ControlMessages{}, syserror.EINVAL
 		}
 
 		var h linux.ControlMessageHeader
 		binary.Unmarshal(buf[i:i+linux.SizeOfControlMessageHeader], usermem.ByteOrder, &h)
 
 		if h.Length < uint64(linux.SizeOfControlMessageHeader) {
-			return unix.ControlMessages{}, syserror.EINVAL
+			return transport.ControlMessages{}, syserror.EINVAL
 		}
 		if h.Length > uint64(len(buf)-i) {
-			return unix.ControlMessages{}, syserror.EINVAL
+			return transport.ControlMessages{}, syserror.EINVAL
 		}
 		if h.Level != linux.SOL_SOCKET {
-			return unix.ControlMessages{}, syserror.EINVAL
+			return transport.ControlMessages{}, syserror.EINVAL
 		}
 
 		i += linux.SizeOfControlMessageHeader
@@ -336,7 +340,7 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (unix.Contr
 			numRights := rightsSize / linux.SizeOfControlMessageRight
 
 			if len(fds)+numRights > linux.SCM_MAX_FD {
-				return unix.ControlMessages{}, syserror.EINVAL
+				return transport.ControlMessages{}, syserror.EINVAL
 			}
 
 			for j := i; j < i+rightsSize; j += linux.SizeOfControlMessageRight {
@@ -347,7 +351,7 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (unix.Contr
 
 		case linux.SCM_CREDENTIALS:
 			if length < linux.SizeOfControlMessageCredentials {
-				return unix.ControlMessages{}, syserror.EINVAL
+				return transport.ControlMessages{}, syserror.EINVAL
 			}
 
 			binary.Unmarshal(buf[i:i+linux.SizeOfControlMessageCredentials], usermem.ByteOrder, &creds)
@@ -356,7 +360,7 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (unix.Contr
 
 		default:
 			// Unknown message type.
-			return unix.ControlMessages{}, syserror.EINVAL
+			return transport.ControlMessages{}, syserror.EINVAL
 		}
 	}
 
@@ -364,7 +368,7 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (unix.Contr
 	if haveCreds {
 		var err error
 		if credentials, err = NewSCMCredentials(t, creds); err != nil {
-			return unix.ControlMessages{}, err
+			return transport.ControlMessages{}, err
 		}
 	} else {
 		credentials = makeCreds(t, socketOrEndpoint)
@@ -374,22 +378,22 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (unix.Contr
 	if len(fds) > 0 {
 		var err error
 		if rights, err = NewSCMRights(t, fds); err != nil {
-			return unix.ControlMessages{}, err
+			return transport.ControlMessages{}, err
 		}
 	}
 
 	if credentials == nil && rights == nil {
-		return unix.ControlMessages{}, nil
+		return transport.ControlMessages{}, nil
 	}
 
-	return unix.ControlMessages{Credentials: credentials, Rights: rights}, nil
+	return transport.ControlMessages{Credentials: credentials, Rights: rights}, nil
 }
 
 func makeCreds(t *kernel.Task, socketOrEndpoint interface{}) SCMCredentials {
 	if t == nil || socketOrEndpoint == nil {
 		return nil
 	}
-	if cr, ok := socketOrEndpoint.(unix.Credentialer); ok && (cr.Passcred() || cr.ConnectedPasscred()) {
+	if cr, ok := socketOrEndpoint.(transport.Credentialer); ok && (cr.Passcred() || cr.ConnectedPasscred()) {
 		tcred := t.Credentials()
 		return &scmCredentials{t, tcred.EffectiveKUID, tcred.EffectiveKGID}
 	}
@@ -397,8 +401,8 @@ func makeCreds(t *kernel.Task, socketOrEndpoint interface{}) SCMCredentials {
 }
 
 // New creates default control messages if needed.
-func New(t *kernel.Task, socketOrEndpoint interface{}, rights SCMRights) unix.ControlMessages {
-	return unix.ControlMessages{
+func New(t *kernel.Task, socketOrEndpoint interface{}, rights SCMRights) transport.ControlMessages {
+	return transport.ControlMessages{
 		Credentials: makeCreds(t, socketOrEndpoint),
 		Rights:      rights,
 	}

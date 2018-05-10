@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,14 +16,12 @@ package tmpfs
 
 import (
 	"fmt"
-	"regexp"
 	"strconv"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/platform"
 )
 
 const (
@@ -39,15 +37,19 @@ const (
 	// TODO: support a tmpfs size limit.
 	// size = "size"
 
-	// default permissions are read/write/execute.
+	// Permissions that exceed modeMask will be rejected.
+	modeMask = 01777
+
+	// Default permissions are read/write/execute.
 	defaultMode = 0777
 )
 
-// modeRegexp is the expected format of the mode option.
-var modeRegexp = regexp.MustCompile("0[0-7][0-7][0-7]")
-
 // Filesystem is a tmpfs.
+//
+// +stateify savable
 type Filesystem struct{}
+
+var _ fs.Filesystem = (*Filesystem)(nil)
 
 func init() {
 	fs.RegisterFilesystem(&Filesystem{})
@@ -64,6 +66,11 @@ func (*Filesystem) Name() string {
 
 // AllowUserMount allows users to mount(2) this file system.
 func (*Filesystem) AllowUserMount() bool {
+	return true
+}
+
+// AllowUserList allows this filesystem to be listed in /proc/filesystems.
+func (*Filesystem) AllowUserList() bool {
 	return true
 }
 
@@ -84,14 +91,12 @@ func (f *Filesystem) Mount(ctx context.Context, device string, flags fs.MountSou
 	// Parse the root directory permissions.
 	perms := fs.FilePermsFromMode(defaultMode)
 	if m, ok := options[modeKey]; ok {
-		if !modeRegexp.MatchString(m) {
-			return nil, fmt.Errorf("unsupported mode value: 'mode=%s'", m)
-		}
-		// It's basically impossible that we error out at this point,
-		// maybe we should panic.
 		i, err := strconv.ParseUint(m, 8, 32)
 		if err != nil {
 			return nil, fmt.Errorf("mode value not parsable 'mode=%s': %v", m, err)
+		}
+		if i&^modeMask != 0 {
+			return nil, fmt.Errorf("invalid mode %q: must be less than %o", m, modeMask)
 		}
 		perms = fs.FilePermsFromMode(linux.FileMode(i))
 		delete(options, modeKey)
@@ -127,5 +132,5 @@ func (f *Filesystem) Mount(ctx context.Context, device string, flags fs.MountSou
 	msrc := fs.NewCachingMountSource(f, flags)
 
 	// Construct the tmpfs root.
-	return NewDir(ctx, nil, owner, perms, msrc, platform.FromContext(ctx)), nil
+	return NewDir(ctx, nil, owner, perms, msrc), nil
 }

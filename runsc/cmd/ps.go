@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import (
 	"github.com/google/subcommands"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/control"
 	"gvisor.googlesource.com/gvisor/runsc/boot"
-	"gvisor.googlesource.com/gvisor/runsc/sandbox"
+	"gvisor.googlesource.com/gvisor/runsc/container"
 )
 
 // PS implements subcommands.Command for the "ps" command.
@@ -60,13 +60,13 @@ func (ps *PS) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{})
 	id := f.Arg(0)
 	conf := args[0].(*boot.Config)
 
-	s, err := sandbox.Load(conf.RootDir, id)
+	c, err := container.Load(conf.RootDir, id)
 	if err != nil {
-		Fatalf("error loading sandox: %v", err)
+		Fatalf("loading sandbox: %v", err)
 	}
-	pList, err := s.Processes()
+	pList, err := c.Processes()
 	if err != nil {
-		Fatalf("error getting processes for sandbox: %v", err)
+		Fatalf("getting processes for container: %v", err)
 	}
 
 	switch ps.format {
@@ -75,11 +75,11 @@ func (ps *PS) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{})
 	case "json":
 		o, err := control.PrintPIDsJSON(pList)
 		if err != nil {
-			Fatalf("error generating JSON: %v", err)
+			Fatalf("generating JSON: %v", err)
 		}
 		fmt.Println(o)
 	default:
-		Fatalf("Unsupported format: %s", ps.format)
+		Fatalf("unsupported format: %s", ps.format)
 	}
 
 	return subcommands.ExitSuccess

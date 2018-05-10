@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ var FromLinuxResource = map[int]LimitType{
 	linux.RLIMIT_RSS:        Rss,
 	linux.RLIMIT_NPROC:      ProcessCount,
 	linux.RLIMIT_NOFILE:     NumberOfFiles,
-	linux.RLIMIT_MEMLOCK:    MemoryPagesLocked,
+	linux.RLIMIT_MEMLOCK:    MemoryLocked,
 	linux.RLIMIT_AS:         AS,
 	linux.RLIMIT_LOCKS:      Locks,
 	linux.RLIMIT_SIGPENDING: SignalsPending,

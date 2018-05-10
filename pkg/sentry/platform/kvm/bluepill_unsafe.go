@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,6 +37,13 @@ func bytePtr(addr uintptr) *byte {
 	return (*byte)(unsafe.Pointer(addr))
 }
 
+// uintptrValue returns a uintptr for the given address.
+//
+//go:nosplit
+func uintptrValue(addr *byte) uintptr {
+	return (uintptr)(unsafe.Pointer(addr))
+}
+
 // bluepillHandler is called from the signal stub.
 //
 // The world may be stopped while this is executing, and it executes on the
@@ -51,20 +58,19 @@ func bluepillHandler(context unsafe.Pointer) {
 	// Increment the number of switches.
 	atomic.AddUint32(&c.switches, 1)
 
-	// Store vCPUGuest.
-	//
-	// This is fine even if we're not in guest mode yet.  In this signal
-	// handler, we'll already have all the relevant signals blocked, so an
-	// interrupt is only deliverable when we actually execute the KVM_RUN.
-	//
-	// The state will be returned to vCPUReady by Phase2.
-	if state := atomic.SwapUintptr(&c.state, vCPUGuest); state != vCPUReady {
-		throw("vCPU not in ready state")
+	// Mark this as guest mode.
+	switch atomic.SwapUint32(&c.state, vCPUGuest|vCPUUser) {
+	case vCPUUser: // Expected case.
+	case vCPUUser | vCPUWaiter:
+		c.notify()
+	default:
+		throw("invalid state")
 	}
 
 	for {
-		_, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, uintptr(c.fd), _KVM_RUN, 0)
-		if errno == syscall.EINTR {
+		switch _, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, uintptr(c.fd), _KVM_RUN, 0); errno {
+		case 0: // Expected case.
+		case syscall.EINTR:
 			// First, we process whatever pending signal
 			// interrupted KVM. Since we're in a signal handler
 			// currently, all signals are masked and the signal
@@ -95,30 +101,52 @@ func bluepillHandler(context unsafe.Pointer) {
 				// Force injection below; the vCPU is ready.
 				c.runData.exitReason = _KVM_EXIT_IRQ_WINDOW_OPEN
 			}
-		} else if errno != 0 {
+		case syscall.EFAULT:
+			// If a fault is not serviceable due to the host
+			// backing pages having page permissions, instead of an
+			// MMIO exit we receive EFAULT from the run ioctl. We
+			// always inject an NMI here since we may be in kernel
+			// mode and have interrupts disabled.
+			if _, _, errno := syscall.RawSyscall(
+				syscall.SYS_IOCTL,
+				uintptr(c.fd),
+				_KVM_NMI, 0); errno != 0 {
+				throw("NMI injection failed")
+			}
+			continue // Rerun vCPU.
+		default:
 			throw("run failed")
 		}
 
 		switch c.runData.exitReason {
 		case _KVM_EXIT_EXCEPTION:
-			throw("exception")
+			c.die(bluepillArchContext(context), "exception")
+			return
 		case _KVM_EXIT_IO:
-			throw("I/O")
+			c.die(bluepillArchContext(context), "I/O")
+			return
 		case _KVM_EXIT_INTERNAL_ERROR:
-			throw("internal error")
+			// An internal error is typically thrown when emulation
+			// fails. This can occur via the MMIO path below (and
+			// it might fail because we have multiple regions that
+			// are not mapped). We would actually prefer that no
+			// emulation occur, and don't mind at all if it fails.
 		case _KVM_EXIT_HYPERCALL:
-			throw("hypercall")
+			c.die(bluepillArchContext(context), "hypercall")
+			return
 		case _KVM_EXIT_DEBUG:
-			throw("debug")
+			c.die(bluepillArchContext(context), "debug")
+			return
 		case _KVM_EXIT_HLT:
 			// Copy out registers.
 			bluepillArchExit(c, bluepillArchContext(context))
 
-			// Notify any waiters.
-			switch state := atomic.SwapUintptr(&c.state, vCPUReady); state {
-			case vCPUGuest:
-			case vCPUWaiter:
-				c.notify() // Safe from handler.
+			// Return to the vCPUReady state; notify any waiters.
+			user := atomic.LoadUint32(&c.state) & vCPUUser
+			switch atomic.SwapUint32(&c.state, user) {
+			case user | vCPUGuest: // Expected case.
+			case user | vCPUGuest | vCPUWaiter:
+				c.notify()
 			default:
 				throw("invalid state")
 			}
@@ -128,9 +156,11 @@ func bluepillHandler(context unsafe.Pointer) {
 			atomic.AddUint32(&c.faults, 1)
 
 			// For MMIO, the physical address is the first data item.
-			virtual, ok := handleBluepillFault(c.machine, uintptr(c.runData.data[0]))
+			physical := uintptr(c.runData.data[0])
+			virtual, ok := handleBluepillFault(c.machine, physical)
 			if !ok {
-				throw("physical address not valid")
+				c.die(bluepillArchContext(context), "invalid physical address")
+				return
 			}
 
 			// We now need to fill in the data appropriately. KVM
@@ -141,7 +171,7 @@ func bluepillHandler(context unsafe.Pointer) {
 			// not create invalid page table mappings.
 			data := (*[8]byte)(unsafe.Pointer(&c.runData.data[1]))
 			length := (uintptr)((uint32)(c.runData.data[2]))
-			write := (uint8)((c.runData.data[2] >> 32 & 0xff)) != 0
+			write := (uint8)(((c.runData.data[2] >> 32) & 0xff)) != 0
 			for i := uintptr(0); i < length; i++ {
 				b := bytePtr(uintptr(virtual) + i)
 				if write {
@@ -165,11 +195,14 @@ func bluepillHandler(context unsafe.Pointer) {
 			// Clear previous injection request.
 			c.runData.requestInterruptWindow = 0
 		case _KVM_EXIT_SHUTDOWN:
-			throw("shutdown")
+			c.die(bluepillArchContext(context), "shutdown")
+			return
 		case _KVM_EXIT_FAIL_ENTRY:
-			throw("entry failed")
+			c.die(bluepillArchContext(context), "entry failed")
+			return
 		default:
-			throw("unknown failure")
+			c.die(bluepillArchContext(context), "unknown")
+			return
 		}
 	}
 }

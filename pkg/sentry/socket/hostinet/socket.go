@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import (
 	"syscall"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
+	"gvisor.googlesource.com/gvisor/pkg/fdnotifier"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/fsutil"
@@ -27,12 +28,11 @@ import (
 	ktime "gvisor.googlesource.com/gvisor/pkg/sentry/kernel/time"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/safemem"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/socket"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserr"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
-	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 	"gvisor.googlesource.com/gvisor/pkg/waiter"
-	"gvisor.googlesource.com/gvisor/pkg/waiter/fdnotifier"
 )
 
 const (
@@ -46,12 +46,12 @@ const (
 // socketOperations implements fs.FileOperations and socket.Socket for a socket
 // implemented using a host socket.
 type socketOperations struct {
-	socket.ReceiveTimeout
-	fsutil.PipeSeek      `state:"nosave"`
-	fsutil.NotDirReaddir `state:"nosave"`
-	fsutil.NoFsync       `state:"nosave"`
-	fsutil.NoopFlush     `state:"nosave"`
-	fsutil.NoMMap        `state:"nosave"`
+	fsutil.FilePipeSeek      `state:"nosave"`
+	fsutil.FileNotDirReaddir `state:"nosave"`
+	fsutil.FileNoFsync       `state:"nosave"`
+	fsutil.FileNoopFlush     `state:"nosave"`
+	fsutil.FileNoMMap        `state:"nosave"`
+	socket.SendReceiveTimeout
 
 	fd    int // must be O_NONBLOCK
 	queue waiter.Queue
@@ -65,6 +65,7 @@ func newSocketFile(ctx context.Context, fd int, nonblock bool) (*fs.File, *syser
 		return nil, syserr.FromError(err)
 	}
 	dirent := socket.NewDirent(ctx, socketDevice)
+	defer dirent.DecRef()
 	return fs.NewFile(ctx, dirent, fs.FileFlags{NonBlocking: nonblock, Read: true, Write: true}, s), nil
 }
 
@@ -192,7 +193,7 @@ func (s *socketOperations) Accept(t *kernel.Task, peerRequested bool, flags int,
 
 	// Conservatively ignore all flags specified by the application and add
 	// SOCK_NONBLOCK since socketOperations requires it.
-	fd, syscallErr := accept4(s.fd, peerAddrPtr, peerAddrlenPtr, syscall.SOCK_NONBLOCK)
+	fd, syscallErr := accept4(s.fd, peerAddrPtr, peerAddrlenPtr, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
 	if blocking {
 		var ch chan struct{}
 		for syscallErr == syserror.ErrWouldBlock {
@@ -206,7 +207,7 @@ func (s *socketOperations) Accept(t *kernel.Task, peerRequested bool, flags int,
 				s.EventRegister(&e, waiter.EventIn)
 				defer s.EventUnregister(&e)
 			}
-			fd, syscallErr = accept4(s.fd, peerAddrPtr, peerAddrlenPtr, syscall.SOCK_NONBLOCK)
+			fd, syscallErr = accept4(s.fd, peerAddrPtr, peerAddrlenPtr, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
 		}
 	}
 
@@ -417,7 +418,7 @@ func (s *socketOperations) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags
 }
 
 // SendMsg implements socket.Socket.SendMsg.
-func (s *socketOperations) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, controlMessages socket.ControlMessages) (int, *syserr.Error) {
+func (s *socketOperations) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, haveDeadline bool, deadline ktime.Time, controlMessages socket.ControlMessages) (int, *syserr.Error) {
 	// Whitelist flags.
 	if flags&^(syscall.MSG_DONTWAIT|syscall.MSG_EOR|syscall.MSG_FASTOPEN|syscall.MSG_MORE|syscall.MSG_NOSIGNAL) != 0 {
 		return 0, syserr.ErrInvalidArgument
@@ -467,7 +468,10 @@ func (s *socketOperations) SendMsg(t *kernel.Task, src usermem.IOSequence, to []
 				panic(fmt.Sprintf("CopyInTo: got (%d, %v), wanted (0, %v)", n, err, err))
 			}
 			if ch != nil {
-				if err = t.Block(ch); err != nil {
+				if err = t.BlockWithDeadline(ch, haveDeadline, deadline); err != nil {
+					if err == syserror.ETIMEDOUT {
+						err = syserror.ErrWouldBlock
+					}
 					break
 				}
 			} else {
@@ -510,7 +514,7 @@ type socketProvider struct {
 }
 
 // Socket implements socket.Provider.Socket.
-func (p *socketProvider) Socket(t *kernel.Task, stypeflags unix.SockType, protocol int) (*fs.File, *syserr.Error) {
+func (p *socketProvider) Socket(t *kernel.Task, stypeflags transport.SockType, protocol int) (*fs.File, *syserr.Error) {
 	// Check that we are using the host network stack.
 	stack := t.NetworkContext()
 	if stack == nil {
@@ -544,7 +548,7 @@ func (p *socketProvider) Socket(t *kernel.Task, stypeflags unix.SockType, protoc
 	// Conservatively ignore all flags specified by the application and add
 	// SOCK_NONBLOCK since socketOperations requires it. Pass a protocol of 0
 	// to simplify the syscall filters, since 0 and IPPROTO_* are equivalent.
-	fd, err := syscall.Socket(p.family, stype|syscall.SOCK_NONBLOCK, 0)
+	fd, err := syscall.Socket(p.family, stype|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, syserr.FromError(err)
 	}
@@ -552,7 +556,7 @@ func (p *socketProvider) Socket(t *kernel.Task, stypeflags unix.SockType, protoc
 }
 
 // Pair implements socket.Provider.Pair.
-func (p *socketProvider) Pair(t *kernel.Task, stype unix.SockType, protocol int) (*fs.File, *fs.File, *syserr.Error) {
+func (p *socketProvider) Pair(t *kernel.Task, stype transport.SockType, protocol int) (*fs.File, *fs.File, *syserr.Error) {
 	// Not supported by AF_INET/AF_INET6.
 	return nil, nil, nil
 }

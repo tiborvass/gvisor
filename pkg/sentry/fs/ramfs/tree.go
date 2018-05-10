@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -60,8 +60,7 @@ func makeSubdir(ctx context.Context, msrc *fs.MountSource, root *Dir, subdir str
 
 // emptyDir returns an empty *ramfs.Dir that is traversable but not writable.
 func emptyDir(ctx context.Context, msrc *fs.MountSource) *fs.Inode {
-	dir := &Dir{}
-	dir.InitDir(ctx, make(map[string]*fs.Inode), fs.RootOwner, fs.FilePermsFromMode(0555))
+	dir := NewDir(ctx, make(map[string]*fs.Inode), fs.RootOwner, fs.FilePermsFromMode(0555))
 	return fs.NewInode(dir, msrc, fs.StableAttr{
 		DeviceID:  anon.PseudoDevice.DeviceID(),
 		InodeID:   anon.PseudoDevice.NextIno(),

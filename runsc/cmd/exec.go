@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,17 +15,18 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"context"
 	"flag"
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -34,7 +35,8 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.googlesource.com/gvisor/pkg/urpc"
 	"gvisor.googlesource.com/gvisor/runsc/boot"
-	"gvisor.googlesource.com/gvisor/runsc/sandbox"
+	"gvisor.googlesource.com/gvisor/runsc/console"
+	"gvisor.googlesource.com/gvisor/runsc/container"
 	"gvisor.googlesource.com/gvisor/runsc/specutils"
 )
 
@@ -43,12 +45,19 @@ type Exec struct {
 	cwd string
 	env stringSlice
 	// user contains the UID and GID with which to run the new process.
-	user        user
-	extraKGIDs  stringSlice
-	caps        stringSlice
-	detach      bool
-	processPath string
-	pidFile     string
+	user            user
+	extraKGIDs      stringSlice
+	caps            stringSlice
+	detach          bool
+	clearStatus     bool
+	processPath     string
+	pidFile         string
+	internalPidFile string
+
+	// consoleSocket is the path to an AF_UNIX socket which will receive a
+	// file descriptor referencing the master end of the console's
+	// pseudoterminal.
+	consoleSocket string
 }
 
 // Name implements subcommands.Command.Name.
@@ -89,32 +98,43 @@ func (ex *Exec) SetFlags(f *flag.FlagSet) {
 	f.Var(&ex.caps, "cap", "add a capability to the bounding set for the process")
 	f.BoolVar(&ex.detach, "detach", false, "detach from the container's process")
 	f.StringVar(&ex.processPath, "process", "", "path to the process.json")
-	f.StringVar(&ex.pidFile, "pid-file", "", "filename that the sandbox pid will be written to")
+	f.StringVar(&ex.pidFile, "pid-file", "", "filename that the container pid will be written to")
+	f.StringVar(&ex.internalPidFile, "internal-pid-file", "", "filename that the container-internal pid will be written to")
+	f.StringVar(&ex.consoleSocket, "console-socket", "", "path to an AF_UNIX socket which will receive a file descriptor referencing the master end of the console's pseudoterminal")
+
+	// clear-status is expected to only be set when we fork due to --detach being set.
+	f.BoolVar(&ex.clearStatus, "clear-status", true, "clear the status of the exec'd process upon completion")
 }
 
 // Execute implements subcommands.Command.Execute. It starts a process in an
-// already created sandbox.
+// already created container.
 func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
 	e, id, err := ex.parseArgs(f)
 	if err != nil {
-		Fatalf("error parsing process spec: %v", err)
+		Fatalf("parsing process spec: %v", err)
 	}
 	conf := args[0].(*boot.Config)
 	waitStatus := args[1].(*syscall.WaitStatus)
 
-	s, err := sandbox.Load(conf.RootDir, id)
+	c, err := container.Load(conf.RootDir, id)
 	if err != nil {
-		Fatalf("error loading sandox: %v", err)
+		Fatalf("loading sandbox: %v", err)
 	}
 
+	// Replace empty settings with defaults from container.
 	if e.WorkingDirectory == "" {
-		e.WorkingDirectory = s.Spec.Process.Cwd
+		e.WorkingDirectory = c.Spec.Process.Cwd
 	}
-
 	if e.Envv == nil {
-		e.Envv, err = resolveEnvs(s.Spec.Process.Env, ex.env)
+		e.Envv, err = resolveEnvs(c.Spec.Process.Env, ex.env)
 		if err != nil {
-			Fatalf("error getting environment variables: %v", err)
+			Fatalf("getting environment variables: %v", err)
+		}
+	}
+	if e.Capabilities == nil {
+		e.Capabilities, err = specutils.Capabilities(c.Spec.Process.Capabilities)
+		if err != nil {
+			Fatalf("creating capabilities: %v", err)
 		}
 	}
 
@@ -126,45 +146,105 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 		return ex.execAndWait(waitStatus)
 	}
 
-	if ex.pidFile != "" {
-		if err := ioutil.WriteFile(ex.pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
-			Fatalf("error writing pid file: %v", err)
+	// Start the new process and get it pid.
+	pid, err := c.Execute(e)
+	if err != nil {
+		Fatalf("getting processes for container: %v", err)
+	}
+
+	if e.StdioIsPty {
+		// Forward signals sent to this process to the foreground
+		// process in the sandbox.
+		stopForwarding := c.ForwardSignals(pid, true /* fgProcess */)
+		defer stopForwarding()
+	}
+
+	// Write the sandbox-internal pid if required.
+	if ex.internalPidFile != "" {
+		pidStr := []byte(strconv.Itoa(int(pid)))
+		if err := ioutil.WriteFile(ex.internalPidFile, pidStr, 0644); err != nil {
+			Fatalf("writing internal pid file %q: %v", ex.internalPidFile, err)
 		}
 	}
 
-	// Get the executable path, which is a bit tricky because we have to
-	// inspect the environment PATH which is relative to the root path.
-	// If the user is overriding environment variables, PATH may have been
-	// overwritten.
-	rootPath := s.Spec.Root.Path
-	e.Filename, err = specutils.GetExecutablePath(e.Argv[0], rootPath, e.Envv)
-	if err != nil {
-		Fatalf("error getting executable path: %v", err)
+	// Generate the pid file after the internal pid file is generated, so that users
+	// can safely assume that the internal pid file is ready after `runsc exec -d`
+	// returns.
+	if ex.pidFile != "" {
+		if err := ioutil.WriteFile(ex.pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
+			Fatalf("writing pid file: %v", err)
+		}
 	}
 
-	ws, err := s.Execute(e)
+	// Wait for the process to exit.
+	ws, err := c.WaitPID(pid, ex.clearStatus)
 	if err != nil {
-		Fatalf("error getting processes for sandbox: %v", err)
+		Fatalf("waiting on pid %d: %v", pid, err)
 	}
 	*waitStatus = ws
 	return subcommands.ExitSuccess
 }
 
 func (ex *Exec) execAndWait(waitStatus *syscall.WaitStatus) subcommands.ExitStatus {
-	binPath, err := specutils.BinPath()
-	if err != nil {
-		Fatalf("error getting bin path: %v", err)
-	}
+	binPath := specutils.ExePath
 	var args []string
+
+	// The command needs to write a pid file so that execAndWait can tell
+	// when it has started. If no pid-file was provided, we should use a
+	// filename in a temp directory.
+	pidFile := ex.pidFile
+	if pidFile == "" {
+		tmpDir, err := ioutil.TempDir("", "exec-pid-")
+		if err != nil {
+			Fatalf("creating TempDir: %v", err)
+		}
+		defer os.RemoveAll(tmpDir)
+		pidFile = filepath.Join(tmpDir, "pid")
+		args = append(args, "--pid-file="+pidFile)
+	}
+
+	// Add the rest of the args, excluding the "detach" flag.
 	for _, a := range os.Args[1:] {
-		if !strings.Contains(a, "detach") {
+		if strings.Contains(a, "detach") {
+			// Replace with the "clear-status" flag, which tells
+			// the new process it's a detached child and shouldn't
+			// clear the exit status of the sentry process.
+			args = append(args, "--clear-status=false")
+		} else {
 			args = append(args, a)
 		}
 	}
+
 	cmd := exec.Command(binPath, args...)
+	cmd.Args[0] = "runsc-exec"
+
+	// Exec stdio defaults to current process stdio.
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+
+	// If the console control socket file is provided, then create a new
+	// pty master/slave pair and set the TTY on the sandbox process.
+	if ex.consoleSocket != "" {
+		// Create a new TTY pair and send the master on the provided
+		// socket.
+		tty, err := console.NewWithSocket(ex.consoleSocket)
+		if err != nil {
+			Fatalf("setting up console with socket %q: %v", ex.consoleSocket, err)
+		}
+		defer tty.Close()
+
+		// Set stdio to the new TTY slave.
+		cmd.Stdin = tty
+		cmd.Stdout = tty
+		cmd.Stderr = tty
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Setsid:  true,
+			Setctty: true,
+			Ctty:    int(tty.Fd()),
+		}
+	}
+
 	if err := cmd.Start(); err != nil {
 		Fatalf("failure to start child exec process, err: %v", err)
 	}
@@ -175,10 +255,14 @@ func (ex *Exec) execAndWait(waitStatus *syscall.WaitStatus) subcommands.ExitStat
 	// '--process' file is deleted as soon as this process returns and the child
 	// may fail to read it.
 	ready := func() (bool, error) {
-		_, err := os.Stat(ex.pidFile)
+		pidb, err := ioutil.ReadFile(pidFile)
 		if err == nil {
-			// File appeared, we're done!
-			return true, nil
+			// File appeared, check whether pid is fully written.
+			pid, err := strconv.Atoi(string(pidb))
+			if err != nil {
+				return false, nil
+			}
+			return pid == cmd.Process.Pid, nil
 		}
 		if pe, ok := err.(*os.PathError); !ok || pe.Err != syscall.ENOENT {
 			return false, err
@@ -196,7 +280,7 @@ func (ex *Exec) execAndWait(waitStatus *syscall.WaitStatus) subcommands.ExitStat
 
 // parseArgs parses exec information from the command line or a JSON file
 // depending on whether the --process flag was used. Returns an ExecArgs and
-// the ID of the sandbox to be used.
+// the ID of the container to be used.
 func (ex *Exec) parseArgs(f *flag.FlagSet) (*control.ExecArgs, string, error) {
 	if ex.processPath == "" {
 		// Requires at least a container ID and command.
@@ -221,24 +305,29 @@ func (ex *Exec) argsFromCLI(argv []string) (*control.ExecArgs, error) {
 	for _, s := range ex.extraKGIDs {
 		kgid, err := strconv.Atoi(s)
 		if err != nil {
-			Fatalf("error parsing GID: %s, %v", s, err)
+			Fatalf("parsing GID: %s, %v", s, err)
 		}
 		extraKGIDs = append(extraKGIDs, auth.KGID(kgid))
 	}
 
-	caps, err := capabilities(ex.caps)
-	if err != nil {
-		return nil, fmt.Errorf("capabilities error: %v", err)
+	var caps *auth.TaskCapabilities
+	if len(ex.caps) > 0 {
+		var err error
+		caps, err = capabilities(ex.caps)
+		if err != nil {
+			return nil, fmt.Errorf("capabilities error: %v", err)
+		}
 	}
 
 	return &control.ExecArgs{
 		Argv:             argv,
 		WorkingDirectory: ex.cwd,
-		FilePayload:      urpc.FilePayload{Files: []*os.File{os.Stdin, os.Stdout, os.Stderr}},
 		KUID:             ex.user.kuid,
 		KGID:             ex.user.kgid,
 		ExtraKGIDs:       extraKGIDs,
 		Capabilities:     caps,
+		StdioIsPty:       ex.consoleSocket != "",
+		FilePayload:      urpc.FilePayload{[]*os.File{os.Stdin, os.Stdout, os.Stderr}},
 	}, nil
 }
 
@@ -259,9 +348,13 @@ func (ex *Exec) argsFromProcessFile() (*control.ExecArgs, error) {
 // to ExecArgs.
 func argsFromProcess(p *specs.Process) (*control.ExecArgs, error) {
 	// Create capabilities.
-	caps, err := specutils.Capabilities(p.Capabilities)
-	if err != nil {
-		return nil, fmt.Errorf("error creating capabilities: %v", err)
+	var caps *auth.TaskCapabilities
+	if p.Capabilities != nil {
+		var err error
+		caps, err = specutils.Capabilities(p.Capabilities)
+		if err != nil {
+			return nil, fmt.Errorf("error creating capabilities: %v", err)
+		}
 	}
 
 	// Convert the spec's additional GIDs to KGIDs.
@@ -274,11 +367,12 @@ func argsFromProcess(p *specs.Process) (*control.ExecArgs, error) {
 		Argv:             p.Args,
 		Envv:             p.Env,
 		WorkingDirectory: p.Cwd,
-		FilePayload:      urpc.FilePayload{Files: []*os.File{os.Stdin, os.Stdout, os.Stderr}},
 		KUID:             auth.KUID(p.User.UID),
 		KGID:             auth.KGID(p.User.GID),
 		ExtraKGIDs:       extraKGIDs,
 		Capabilities:     caps,
+		StdioIsPty:       p.Terminal,
+		FilePayload:      urpc.FilePayload{Files: []*os.File{os.Stdin, os.Stdout, os.Stderr}},
 	}, nil
 }
 

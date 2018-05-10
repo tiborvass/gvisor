@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package kvm
 
 import (
 	"fmt"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -54,7 +55,7 @@ func (m *machine) setMemoryRegion(slot int, physical, length, virtual uintptr) s
 // This may be called from within the signal context and throws on error.
 //
 //go:nosplit
-func (c *vCPU) loadSegments() {
+func (c *vCPU) loadSegments(tid uint64) {
 	if _, _, errno := syscall.RawSyscall(
 		syscall.SYS_ARCH_PRCTL,
 		linux.ARCH_GET_FS,
@@ -69,30 +70,7 @@ func (c *vCPU) loadSegments() {
 		0); errno != 0 {
 		throw("getting GS segment")
 	}
-}
-
-// setUserRegisters sets user registers in the vCPU.
-func (c *vCPU) setUserRegisters(uregs *userRegs) error {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
-		uintptr(c.fd),
-		_KVM_SET_REGS,
-		uintptr(unsafe.Pointer(uregs))); errno != 0 {
-		return fmt.Errorf("error setting user registers: %v", errno)
-	}
-	return nil
-}
-
-// setSystemRegisters sets system registers.
-func (c *vCPU) setSystemRegisters(sregs *systemRegs) error {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
-		uintptr(c.fd),
-		_KVM_SET_SREGS,
-		uintptr(unsafe.Pointer(sregs))); errno != 0 {
-		return fmt.Errorf("error setting system registers: %v", errno)
-	}
-	return nil
+	atomic.StoreUint64(&c.tid, tid)
 }
 
 // setCPUID sets the CPUID to be used by the guest.

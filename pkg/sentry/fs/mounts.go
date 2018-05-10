@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,9 +16,13 @@ package fs
 
 import (
 	"fmt"
+	"path"
+	"strings"
 	"sync"
 	"syscall"
 
+	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
+	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/pkg/refs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
@@ -32,6 +36,8 @@ import (
 const DefaultTraversalLimit = 10
 
 // MountNamespace defines a collection of mounts.
+//
+// +stateify savable
 type MountNamespace struct {
 	refs.AtomicRefCount
 
@@ -344,12 +350,12 @@ func (mns *MountNamespace) Unmount(ctx context.Context, node *Dirent, detachOnly
 //
 // Precondition: root must be non-nil.
 // Precondition: the path must be non-empty.
-func (mns *MountNamespace) FindLink(ctx context.Context, root, wd *Dirent, path string, maxTraversals uint) (*Dirent, error) {
+func (mns *MountNamespace) FindLink(ctx context.Context, root, wd *Dirent, path string, remainingTraversals *uint) (*Dirent, error) {
 	if root == nil {
-		panic("MountNamespace.FindInode: root must not be nil")
+		panic("MountNamespace.FindLink: root must not be nil")
 	}
 	if len(path) == 0 {
-		panic("MountNamespace.FindInode: path is empty")
+		panic("MountNamespace.FindLink: path is empty")
 	}
 
 	// Split the path.
@@ -413,7 +419,7 @@ func (mns *MountNamespace) FindLink(ctx context.Context, root, wd *Dirent, path 
 			//
 			// See resolve for reference semantics; on err next
 			// will have one dropped.
-			current, err = mns.resolve(ctx, root, next, maxTraversals)
+			current, err = mns.resolve(ctx, root, next, remainingTraversals)
 			if err != nil {
 				return nil, err
 			}
@@ -433,15 +439,15 @@ func (mns *MountNamespace) FindLink(ctx context.Context, root, wd *Dirent, path 
 // FindInode is identical to FindLink except the return value is resolved.
 //
 //go:nosplit
-func (mns *MountNamespace) FindInode(ctx context.Context, root, wd *Dirent, path string, maxTraversals uint) (*Dirent, error) {
-	d, err := mns.FindLink(ctx, root, wd, path, maxTraversals)
+func (mns *MountNamespace) FindInode(ctx context.Context, root, wd *Dirent, path string, remainingTraversals *uint) (*Dirent, error) {
+	d, err := mns.FindLink(ctx, root, wd, path, remainingTraversals)
 	if err != nil {
 		return nil, err
 	}
 
 	// See resolve for reference semantics; on err d will have the
 	// reference dropped.
-	return mns.resolve(ctx, root, d, maxTraversals)
+	return mns.resolve(ctx, root, d, remainingTraversals)
 }
 
 // resolve resolves the given link.
@@ -452,14 +458,14 @@ func (mns *MountNamespace) FindInode(ctx context.Context, root, wd *Dirent, path
 // If not successful, a reference is _also_ dropped on the node and an error
 // returned. This is for convenience in using resolve directly as a return
 // value.
-func (mns *MountNamespace) resolve(ctx context.Context, root, node *Dirent, maxTraversals uint) (*Dirent, error) {
+func (mns *MountNamespace) resolve(ctx context.Context, root, node *Dirent, remainingTraversals *uint) (*Dirent, error) {
 	// Resolve the path.
 	target, err := node.Inode.Getlink(ctx)
 
 	switch err {
 	case nil:
 		// Make sure we didn't exhaust the traversal budget.
-		if maxTraversals == 0 {
+		if *remainingTraversals == 0 {
 			target.DecRef()
 			return nil, syscall.ELOOP
 		}
@@ -475,7 +481,7 @@ func (mns *MountNamespace) resolve(ctx context.Context, root, node *Dirent, maxT
 		defer node.DecRef() // See above.
 
 		// First, check if we should traverse.
-		if maxTraversals == 0 {
+		if *remainingTraversals == 0 {
 			return nil, syscall.ELOOP
 		}
 
@@ -486,7 +492,8 @@ func (mns *MountNamespace) resolve(ctx context.Context, root, node *Dirent, maxT
 		}
 
 		// Find the node; we resolve relative to the current symlink's parent.
-		d, err := mns.FindInode(ctx, root, node.parent, targetPath, maxTraversals-1)
+		*remainingTraversals--
+		d, err := mns.FindInode(ctx, root, node.parent, targetPath, remainingTraversals)
 		if err != nil {
 			return nil, err
 		}
@@ -506,4 +513,67 @@ func (mns *MountNamespace) SyncAll(ctx context.Context) {
 	mns.mu.Lock()
 	defer mns.mu.Unlock()
 	mns.root.SyncAll(ctx)
+}
+
+// ResolveExecutablePath resolves the given executable name given a set of
+// paths that might contain it.
+func (mns *MountNamespace) ResolveExecutablePath(ctx context.Context, wd, name string, paths []string) (string, error) {
+	// Absolute paths can be used directly.
+	if path.IsAbs(name) {
+		return name, nil
+	}
+
+	// Paths with '/' in them should be joined to the working directory, or
+	// to the root if working directory is not set.
+	if strings.IndexByte(name, '/') > 0 {
+		if wd == "" {
+			wd = "/"
+		}
+		if !path.IsAbs(wd) {
+			return "", fmt.Errorf("working directory %q must be absolute", wd)
+		}
+		return path.Join(wd, name), nil
+	}
+
+	// Otherwise, We must lookup the name in the paths, starting from the
+	// calling context's root directory.
+	root := RootFromContext(ctx)
+	if root == nil {
+		// Caller has no root. Don't bother traversing anything.
+		return "", syserror.ENOENT
+	}
+	defer root.DecRef()
+	for _, p := range paths {
+		binPath := path.Join(p, name)
+		traversals := uint(linux.MaxSymlinkTraversals)
+		d, err := mns.FindInode(ctx, root, nil, binPath, &traversals)
+		if err == syserror.ENOENT || err == syserror.EACCES {
+			// Didn't find it here.
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		defer d.DecRef()
+
+		// Check whether we can read and execute the found file.
+		if err := d.Inode.CheckPermission(ctx, PermMask{Read: true, Execute: true}); err != nil {
+			log.Infof("Found executable at %q, but user cannot execute it: %v", binPath, err)
+			continue
+		}
+		return path.Join("/", p, name), nil
+	}
+	return "", syserror.ENOENT
+}
+
+// GetPath returns the PATH as a slice of strings given the environemnt
+// variables.
+func GetPath(env []string) []string {
+	const prefix = "PATH="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return strings.Split(strings.TrimPrefix(e, prefix), ":")
+		}
+	}
+	return nil
 }
