@@ -1,27 +1,28 @@
-// Copyright 2017 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package tcp
 
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"gvisor.googlesource.com/gvisor/pkg/tcpip"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/header"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip/stack"
 )
-
-// ErrSaveRejection indicates a failed save due to unsupported tcp endpoint
-// state.
-type ErrSaveRejection struct {
-	Err error
-}
-
-// Error returns a sensible description of the save rejection error.
-func (e ErrSaveRejection) Error() string {
-	return "save rejected due to unsupported endpoint state: " + e.Err.Error()
-}
 
 func (e *endpoint) drainSegmentLocked() {
 	// Drain only up to once.
@@ -33,7 +34,7 @@ func (e *endpoint) drainSegmentLocked() {
 	e.undrain = make(chan struct{})
 	e.mu.Unlock()
 
-	e.notificationWaker.Assert()
+	e.notifyProtocolGoroutine(notifyDrain)
 	<-e.drainDone
 
 	e.mu.Lock()
@@ -48,26 +49,115 @@ func (e *endpoint) beforeSave() {
 	defer e.mu.Unlock()
 
 	switch e.state {
-	case stateInitial:
-	case stateBound:
-	case stateListen:
-		if !e.segmentQueue.empty() {
-			e.drainSegmentLocked()
+	case stateInitial, stateBound:
+	case stateConnected:
+		if e.route.Capabilities()&stack.CapabilitySaveRestore == 0 {
+			if e.route.Capabilities()&stack.CapabilityDisconnectOk == 0 {
+				panic(tcpip.ErrSaveRejection{fmt.Errorf("endpoint cannot be saved in connected state: local %v:%d, remote %v:%d", e.id.LocalAddress, e.id.LocalPort, e.id.RemoteAddress, e.id.RemotePort)})
+			}
+			e.resetConnectionLocked(tcpip.ErrConnectionAborted)
+			e.mu.Unlock()
+			e.Close()
+			e.mu.Lock()
 		}
-	case stateConnecting:
-		e.drainSegmentLocked()
-		if e.state != stateConnected {
+		if !e.workerRunning {
+			// The endpoint must be in acceptedChan or has been just
+			// disconnected and closed.
 			break
 		}
 		fallthrough
-	case stateConnected:
-		// FIXME
-		panic(ErrSaveRejection{fmt.Errorf("endpoint cannot be saved in connected state: local %v:%v, remote %v:%v", e.id.LocalAddress, e.id.LocalPort, e.id.RemoteAddress, e.id.RemotePort)})
-	case stateClosed:
-	case stateError:
+	case stateListen, stateConnecting:
+		e.drainSegmentLocked()
+		if e.state != stateClosed && e.state != stateError {
+			if !e.workerRunning {
+				panic("endpoint has no worker running in listen, connecting, or connected state")
+			}
+			break
+		}
+		fallthrough
+	case stateError, stateClosed:
+		for e.state == stateError && e.workerRunning {
+			e.mu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+			e.mu.Lock()
+		}
+		if e.workerRunning {
+			panic("endpoint still has worker running in closed or error state")
+		}
 	default:
 		panic(fmt.Sprintf("endpoint in unknown state %v", e.state))
 	}
+
+	if e.waiterQueue != nil && !e.waiterQueue.IsEmpty() {
+		panic("endpoint still has waiters upon save")
+	}
+
+	if e.state != stateClosed && !((e.state == stateBound || e.state == stateListen) == e.isPortReserved) {
+		panic("endpoints which are not in the closed state must have a reserved port IFF they are in bound or listen state")
+	}
+}
+
+// saveAcceptedChan is invoked by stateify.
+func (e *endpoint) saveAcceptedChan() []*endpoint {
+	if e.acceptedChan == nil {
+		return nil
+	}
+	acceptedEndpoints := make([]*endpoint, len(e.acceptedChan), cap(e.acceptedChan))
+	for i := 0; i < len(acceptedEndpoints); i++ {
+		select {
+		case ep := <-e.acceptedChan:
+			acceptedEndpoints[i] = ep
+		default:
+			panic("endpoint acceptedChan buffer got consumed by background context")
+		}
+	}
+	for i := 0; i < len(acceptedEndpoints); i++ {
+		select {
+		case e.acceptedChan <- acceptedEndpoints[i]:
+		default:
+			panic("endpoint acceptedChan buffer got populated by background context")
+		}
+	}
+	return acceptedEndpoints
+}
+
+// loadAcceptedChan is invoked by stateify.
+func (e *endpoint) loadAcceptedChan(acceptedEndpoints []*endpoint) {
+	if cap(acceptedEndpoints) > 0 {
+		e.acceptedChan = make(chan *endpoint, cap(acceptedEndpoints))
+		for _, ep := range acceptedEndpoints {
+			e.acceptedChan <- ep
+		}
+	}
+}
+
+// saveState is invoked by stateify.
+func (e *endpoint) saveState() endpointState {
+	return e.state
+}
+
+// Endpoint loading must be done in the following ordering by their state, to
+// avoid dangling connecting w/o listening peer, and to avoid conflicts in port
+// reservation.
+var connectedLoading sync.WaitGroup
+var listenLoading sync.WaitGroup
+var connectingLoading sync.WaitGroup
+
+// Bound endpoint loading happens last.
+
+// loadState is invoked by stateify.
+func (e *endpoint) loadState(state endpointState) {
+	// This is to ensure that the loading wait groups include all applicable
+	// endpoints before any asynchronous calls to the Wait() methods.
+	switch state {
+	case stateConnected:
+		connectedLoading.Add(1)
+	case stateListen:
+		listenLoading.Add(1)
+	case stateConnecting:
+		connectingLoading.Add(1)
+	}
+	e.state = state
 }
 
 // afterLoad is invoked by stateify.
@@ -78,7 +168,7 @@ func (e *endpoint) afterLoad() {
 
 	state := e.state
 	switch state {
-	case stateInitial, stateBound, stateListen, stateConnecting:
+	case stateInitial, stateBound, stateListen, stateConnecting, stateConnected:
 		var ss SendBufferSizeOption
 		if err := e.stack.TransportProtocolOption(ProtocolNumber, &ss); err == nil {
 			if e.sndBufSize < ss.Min || e.sndBufSize > ss.Max {
@@ -90,63 +180,83 @@ func (e *endpoint) afterLoad() {
 		}
 	}
 
-	switch state {
-	case stateBound, stateListen, stateConnecting:
+	bind := func() {
 		e.state = stateInitial
-		if err := e.Bind(tcpip.FullAddress{Addr: e.id.LocalAddress, Port: e.id.LocalPort}, nil); err != nil {
+		if len(e.bindAddress) == 0 {
+			e.bindAddress = e.id.LocalAddress
+		}
+		if err := e.Bind(tcpip.FullAddress{Addr: e.bindAddress, Port: e.id.LocalPort}, nil); err != nil {
 			panic("endpoint binding failed: " + err.String())
 		}
 	}
 
 	switch state {
-	case stateListen:
-		backlog := cap(e.acceptedChan)
-		e.acceptedChan = nil
-		if err := e.Listen(backlog); err != nil {
-			panic("endpoint listening failed: " + err.String())
+	case stateConnected:
+		bind()
+		if len(e.connectingAddress) == 0 {
+			// This endpoint is accepted by netstack but not yet by
+			// the app. If the endpoint is IPv6 but the remote
+			// address is IPv4, we need to connect as IPv6 so that
+			// dual-stack mode can be properly activated.
+			if e.netProto == header.IPv6ProtocolNumber && len(e.id.RemoteAddress) != header.IPv6AddressSize {
+				e.connectingAddress = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff" + e.id.RemoteAddress
+			} else {
+				e.connectingAddress = e.id.RemoteAddress
+			}
 		}
-	}
-
-	switch state {
-	case stateConnecting:
-		if err := e.Connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.id.RemotePort}); err != tcpip.ErrConnectStarted {
+		if err := e.connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.id.RemotePort}, false, e.workerRunning); err != tcpip.ErrConnectStarted {
 			panic("endpoint connecting failed: " + err.String())
 		}
+		connectedLoading.Done()
+	case stateListen:
+		tcpip.AsyncLoading.Add(1)
+		go func() {
+			connectedLoading.Wait()
+			bind()
+			backlog := cap(e.acceptedChan)
+			if err := e.Listen(backlog); err != nil {
+				panic("endpoint listening failed: " + err.String())
+			}
+			listenLoading.Done()
+			tcpip.AsyncLoading.Done()
+		}()
+	case stateConnecting:
+		tcpip.AsyncLoading.Add(1)
+		go func() {
+			connectedLoading.Wait()
+			listenLoading.Wait()
+			bind()
+			if err := e.Connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.id.RemotePort}); err != tcpip.ErrConnectStarted {
+				panic("endpoint connecting failed: " + err.String())
+			}
+			connectingLoading.Done()
+			tcpip.AsyncLoading.Done()
+		}()
+	case stateBound:
+		tcpip.AsyncLoading.Add(1)
+		go func() {
+			connectedLoading.Wait()
+			listenLoading.Wait()
+			connectingLoading.Wait()
+			bind()
+			tcpip.AsyncLoading.Done()
+		}()
+	case stateClosed:
+		if e.isPortReserved {
+			tcpip.AsyncLoading.Add(1)
+			go func() {
+				connectedLoading.Wait()
+				listenLoading.Wait()
+				connectingLoading.Wait()
+				bind()
+				e.state = stateClosed
+				tcpip.AsyncLoading.Done()
+			}()
+		}
+		fallthrough
+	case stateError:
+		tcpip.DeleteDanglingEndpoint(e)
 	}
-}
-
-// saveAcceptedChan is invoked by stateify.
-func (e *endpoint) saveAcceptedChan() endpointChan {
-	if e.acceptedChan == nil {
-		return endpointChan{}
-	}
-	close(e.acceptedChan)
-	buffer := make([]*endpoint, 0, len(e.acceptedChan))
-	for ep := range e.acceptedChan {
-		buffer = append(buffer, ep)
-	}
-	if len(buffer) != cap(buffer) {
-		panic("endpoint.acceptedChan buffer got consumed by background context")
-	}
-	c := cap(e.acceptedChan)
-	e.acceptedChan = nil
-	return endpointChan{buffer: buffer, cap: c}
-}
-
-// loadAcceptedChan is invoked by stateify.
-func (e *endpoint) loadAcceptedChan(c endpointChan) {
-	if c.cap == 0 {
-		return
-	}
-	e.acceptedChan = make(chan *endpoint, c.cap)
-	for _, ep := range c.buffer {
-		e.acceptedChan <- ep
-	}
-}
-
-type endpointChan struct {
-	buffer []*endpoint
-	cap    int
 }
 
 // saveLastError is invoked by stateify.
@@ -224,6 +334,8 @@ func loadError(s string) *tcpip.Error {
 			tcpip.ErrNoLinkAddress,
 			tcpip.ErrBadAddress,
 			tcpip.ErrNetworkUnreachable,
+			tcpip.ErrMessageTooLong,
+			tcpip.ErrNoBufferSpace,
 		}
 
 		messageToError = make(map[string]*tcpip.Error)

@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,11 +17,14 @@ package proc
 import (
 	"fmt"
 
+	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/proc/seqfile"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 )
 
 // versionData backs /proc/version.
+//
+// +stateify savable
 type versionData struct {
 	// k is the owning Kernel.
 	k *kernel.Kernel
@@ -33,7 +36,7 @@ func (*versionData) NeedsUpdate(generation int64) bool {
 }
 
 // ReadSeqFileData implements seqfile.SeqSource.ReadSeqFileData.
-func (v *versionData) ReadSeqFileData(h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
+func (v *versionData) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
 	if h != nil {
 		return nil, 0
 	}

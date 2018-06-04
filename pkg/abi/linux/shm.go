@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +13,8 @@
 // limitations under the License.
 
 package linux
+
+import "math"
 
 // shmat(2) flags. Source: include/uapi/linux/shm.h
 const (
@@ -36,6 +38,15 @@ const (
 	SHM_UNLOCK = 12
 	SHM_STAT   = 13
 	SHM_INFO   = 14
+)
+
+// SHM defaults as specified by linux. Source: include/uapi/linux/shm.h
+const (
+	SHMMIN = 1
+	SHMMNI = 4096
+	SHMMAX = math.MaxUint64 - 1<<24
+	SHMALL = math.MaxUint64 - 1<<24
+	SHMSEG = 4096
 )
 
 // ShmidDS is equivalent to struct shmid64_ds. Source:

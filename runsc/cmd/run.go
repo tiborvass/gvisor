@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,9 @@
 package cmd
 
 import (
+	"context"
 	"syscall"
 
-	"context"
 	"flag"
 	"github.com/google/subcommands"
 	"gvisor.googlesource.com/gvisor/runsc/boot"
@@ -69,12 +69,13 @@ func (r *Run) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) s
 	}
 	spec, err := specutils.ReadSpec(bundleDir)
 	if err != nil {
-		Fatalf("error reading spec: %v", err)
+		Fatalf("reading spec: %v", err)
 	}
+	specutils.LogSpec(spec)
 
-	ws, err := container.Run(id, spec, conf, bundleDir, r.consoleSocket, r.pidFile)
+	ws, err := container.Run(id, spec, conf, bundleDir, r.consoleSocket, r.pidFile, r.userLog)
 	if err != nil {
-		Fatalf("error running container: %v", err)
+		Fatalf("running container: %v", err)
 	}
 
 	*waitStatus = ws

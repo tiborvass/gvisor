@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import (
 	"syscall"
 
 	"gvisor.googlesource.com/gvisor/pkg/atomicbitops"
+	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform/procid"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform/ring0"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform/ring0/pagetables"
@@ -40,23 +41,27 @@ type machine struct {
 	nextSlot uint32
 
 	// kernel is the set of global structures.
-	kernel *ring0.Kernel
+	kernel ring0.Kernel
 
 	// mappingCache is used for mapPhysical.
 	mappingCache sync.Map
 
 	// mu protects vCPUs.
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	// available is notified when vCPUs are available.
 	available sync.Cond
 
 	// vCPUs are the machine vCPUs.
 	//
-	// This is eventually keyed by system TID, but is initially indexed by
-	// the negative vCPU id. This is merely an optimization, so while
-	// collisions here are not possible, it wouldn't matter anyways.
+	// These are populated dynamically.
 	vCPUs map[uint64]*vCPU
+
+	// vCPUsByID are the machine vCPUs, can be indexed by the vCPU's ID.
+	vCPUsByID map[int]*vCPU
+
+	// maxVCPUs is the maximum number of vCPUs supported by the machine.
+	maxVCPUs int
 }
 
 const (
@@ -112,74 +117,74 @@ type vCPU struct {
 	// active is the current addressSpace: this is set and read atomically,
 	// it is used to elide unnecessary interrupts due to invalidations.
 	active atomicAddressSpace
+
+	// vCPUArchState is the architecture-specific state.
+	vCPUArchState
+
+	// dieMessage is thrown from die.
+	dieMessage string
+}
+
+// newVCPU creates a returns a new vCPU.
+//
+// Precondtion: mu must be held.
+func (m *machine) newVCPU() *vCPU {
+	id := len(m.vCPUs)
+
+	// Create the vCPU.
+	fd, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, uintptr(m.fd), _KVM_CREATE_VCPU, uintptr(id))
+	if errno != 0 {
+		panic(fmt.Sprintf("error creating new vCPU: %v", errno))
+	}
+
+	c := &vCPU{
+		id:      id,
+		fd:      int(fd),
+		machine: m,
+	}
+	c.CPU.Init(&m.kernel, c)
+	m.vCPUsByID[c.id] = c
+
+	// Ensure the signal mask is correct.
+	if err := c.setSignalMask(); err != nil {
+		panic(fmt.Sprintf("error setting signal mask: %v", err))
+	}
+
+	// Map the run data.
+	runData, err := mapRunData(int(fd))
+	if err != nil {
+		panic(fmt.Sprintf("error mapping run data: %v", err))
+	}
+	c.runData = runData
+
+	// Initialize architecture state.
+	if err := c.initArchState(); err != nil {
+		panic(fmt.Sprintf("error initialization vCPU state: %v", err))
+	}
+
+	return c // Done.
 }
 
 // newMachine returns a new VM context.
-func newMachine(vm int, vCPUs int) (*machine, error) {
+func newMachine(vm int) (*machine, error) {
 	// Create the machine.
 	m := &machine{
-		fd:    vm,
-		vCPUs: make(map[uint64]*vCPU),
+		fd:        vm,
+		vCPUs:     make(map[uint64]*vCPU),
+		vCPUsByID: make(map[int]*vCPU),
 	}
 	m.available.L = &m.mu
-	if vCPUs > _KVM_NR_VCPUS {
-		// Hard cap at KVM's limit.
-		vCPUs = _KVM_NR_VCPUS
-	}
-	if n := 2 * runtime.NumCPU(); vCPUs > n {
-		// Cap at twice the number of physical cores. Otherwise we're
-		// just wasting memory and thrashing. (There may be scheduling
-		// issues when you've got > n active threads.)
-		vCPUs = n
-	}
-	m.kernel = ring0.New(ring0.KernelOpts{
-		PageTables: pagetables.New(m, pagetablesOpts),
+	m.kernel.Init(ring0.KernelOpts{
+		PageTables: pagetables.New(newAllocator()),
 	})
 
-	// Initialize architecture state.
-	if err := m.initArchState(vCPUs); err != nil {
-		m.Destroy()
-		return nil, err
+	maxVCPUs, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
+	if errno != 0 {
+		m.maxVCPUs = _KVM_NR_VCPUS
+	} else {
+		m.maxVCPUs = int(maxVCPUs)
 	}
-
-	// Create all the vCPUs.
-	for id := 0; id < vCPUs; id++ {
-		// Create the vCPU.
-		fd, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, uintptr(vm), _KVM_CREATE_VCPU, uintptr(id))
-		if errno != 0 {
-			m.Destroy()
-			return nil, fmt.Errorf("error creating VCPU: %v", errno)
-		}
-		c := &vCPU{
-			id:      id,
-			fd:      int(fd),
-			machine: m,
-		}
-		c.CPU.Init(m.kernel)
-		c.CPU.KernelSyscall = bluepillSyscall
-		c.CPU.KernelException = bluepillException
-		m.vCPUs[uint64(-id)] = c // See above.
-
-		// Ensure the signal mask is correct.
-		if err := c.setSignalMask(); err != nil {
-			m.Destroy()
-			return nil, err
-		}
-
-		// Initialize architecture state.
-		if err := c.initArchState(); err != nil {
-			m.Destroy()
-			return nil, err
-		}
-
-		// Map the run data.
-		runData, err := mapRunData(int(fd))
-		if err != nil {
-			m.Destroy()
-			return nil, err
-		}
-		c.runData = runData
-	}
+	log.Debugf("The maximum number of vCPUs is %d.", m.maxVCPUs)
 
 	// Apply the physical mappings. Note that these mappings may point to
 	// guest physical addresses that are not actually available. These
@@ -211,7 +216,7 @@ func newMachine(vm int, vCPUs int) (*machine, error) {
 			return // skip region.
 		}
 		for virtual := vr.virtual; virtual < vr.virtual+vr.length; {
-			physical, length, ok := TranslateToPhysical(virtual)
+			physical, length, ok := translateToPhysical(virtual)
 			if !ok {
 				// This must be an invalid region that was
 				// knocked out by creation of the physical map.
@@ -228,6 +233,12 @@ func newMachine(vm int, vCPUs int) (*machine, error) {
 		}
 	})
 
+	// Initialize architecture state.
+	if err := m.initArchState(); err != nil {
+		m.Destroy()
+		return nil, err
+	}
+
 	// Ensure the machine is cleaned up properly.
 	runtime.SetFinalizer(m, (*machine).Destroy)
 	return m, nil
@@ -239,7 +250,7 @@ func newMachine(vm int, vCPUs int) (*machine, error) {
 // This panics on error.
 func (m *machine) mapPhysical(physical, length uintptr) {
 	for end := physical + length; physical < end; {
-		_, physicalStart, length, ok := calculateBluepillFault(m, physical)
+		_, physicalStart, length, ok := calculateBluepillFault(physical)
 		if !ok {
 			// Should never happen.
 			panic("mapPhysical on unknown physical address")
@@ -285,11 +296,6 @@ func (m *machine) Destroy() {
 		}
 	}
 
-	// Release host mappings.
-	if m.kernel.PageTables != nil {
-		m.kernel.PageTables.Release()
-	}
-
 	// vCPUs are gone: teardown machine state.
 	if err := syscall.Close(m.fd); err != nil {
 		panic(fmt.Sprintf("error closing VM fd: %v", err))
@@ -300,14 +306,19 @@ func (m *machine) Destroy() {
 func (m *machine) Get() *vCPU {
 	runtime.LockOSThread()
 	tid := procid.Current()
-	m.mu.Lock()
+	m.mu.RLock()
 
 	// Check for an exact match.
 	if c := m.vCPUs[tid]; c != nil {
 		c.lock()
-		m.mu.Unlock()
+		m.mu.RUnlock()
 		return c
 	}
+
+	// The happy path failed. We now proceed to acquire an exclusive lock
+	// (because the vCPU map may change), and scan all available vCPUs.
+	m.mu.RUnlock()
+	m.mu.Lock()
 
 	for {
 		// Scan for an available vCPU.
@@ -316,14 +327,19 @@ func (m *machine) Get() *vCPU {
 				delete(m.vCPUs, origTID)
 				m.vCPUs[tid] = c
 				m.mu.Unlock()
-
-				// We need to reload thread-local segments as
-				// we have origTID != tid and the vCPU state
-				// may be stale.
-				c.loadSegments()
-				atomic.StoreUint64(&c.tid, tid)
+				c.loadSegments(tid)
 				return c
 			}
+		}
+
+		// Create a new vCPU (maybe).
+		if len(m.vCPUs) < m.maxVCPUs {
+			c := m.newVCPU()
+			c.lock()
+			m.vCPUs[tid] = c
+			m.mu.Unlock()
+			c.loadSegments(tid)
+			return c
 		}
 
 		// Scan for something not in user mode.
@@ -348,10 +364,7 @@ func (m *machine) Get() *vCPU {
 			delete(m.vCPUs, origTID)
 			m.vCPUs[tid] = c
 			m.mu.Unlock()
-
-			// See above.
-			c.loadSegments()
-			atomic.StoreUint64(&c.tid, tid)
+			c.loadSegments(tid)
 			return c
 		}
 
@@ -368,6 +381,13 @@ func (m *machine) Put(c *vCPU) {
 	c.unlock()
 	runtime.UnlockOSThread()
 	m.available.Signal()
+}
+
+// newDirtySet returns a new dirty set.
+func (m *machine) newDirtySet() *dirtySet {
+	return &dirtySet{
+		vCPUs: make([]uint64, (m.maxVCPUs+63)/64, (m.maxVCPUs+63)/64),
+	}
 }
 
 // lock marks the vCPU as in user mode.
@@ -399,7 +419,7 @@ func (c *vCPU) unlock() {
 	case vCPUUser | vCPUGuest | vCPUWaiter:
 		// Force a transition: this must trigger a notification when we
 		// return from guest mode.
-		redpill()
+		c.notify()
 	case vCPUUser | vCPUWaiter:
 		// Waiting for the lock to be released; the responsibility is
 		// on us to notify the waiter and clear the associated bit.

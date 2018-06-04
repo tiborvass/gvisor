@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,6 +23,13 @@ package linux
 // Bits 31:20 - minor bits 19:8
 func MakeDeviceID(major uint16, minor uint32) uint32 {
 	return (minor & 0xff) | ((uint32(major) & 0xfff) << 8) | ((minor >> 8) << 20)
+}
+
+// DecodeDeviceID decodes a device ID into major and minor device numbers.
+func DecodeDeviceID(rdev uint32) (uint16, uint32) {
+	major := uint16((rdev >> 8) & 0xfff)
+	minor := (rdev & 0xff) | ((rdev >> 20) << 8)
+	return major, minor
 }
 
 // Character device IDs.

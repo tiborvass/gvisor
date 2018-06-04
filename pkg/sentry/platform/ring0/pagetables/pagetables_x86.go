@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,66 +22,28 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 )
 
-// Opts are pagetable options.
-type Opts struct {
-	EnablePCID bool
-}
-
-// archPageTables has x86-specific features.
+// archPageTables is architecture-specific data.
 type archPageTables struct {
-	// pcids is the PCID database.
-	pcids *PCIDs
-
-	// pcid is the globally unique identifier, or zero if none were
-	// available or pcids is nil.
+	// pcid is the value assigned by PCIDs.Assign.
+	//
+	// Note that zero is a valid PCID.
 	pcid uint16
-}
-
-// init initializes arch-specific features.
-func (a *archPageTables) init(opts Opts) {
-	if opts.EnablePCID {
-		a.pcids = NewPCIDs()
-		a.pcid = a.pcids.allocate()
-	}
-}
-
-// initFrom initializes arch-specific features from an existing entry.'
-func (a *archPageTables) initFrom(other *archPageTables) {
-	a.pcids = other.pcids // Refer to the same PCID database.
-	if a.pcids != nil {
-		a.pcid = a.pcids.allocate()
-	}
-}
-
-// release is called from Release.
-func (a *archPageTables) release() {
-	// Return the PCID.
-	if a.pcids != nil {
-		a.pcids.free(a.pcid)
-	}
 }
 
 // CR3 returns the CR3 value for these tables.
 //
-// This may be called in interrupt contexts.
+// This may be called in interrupt contexts. A PCID of zero always implies a
+// flush and should be passed when PCIDs are not enabled. See pcids_x86.go for
+// more information.
 //
 //go:nosplit
-func (p *PageTables) CR3() uint64 {
+func (p *PageTables) CR3(noFlush bool, pcid uint16) uint64 {
 	// Bit 63 is set to avoid flushing the PCID (per SDM 4.10.4.1).
 	const noFlushBit uint64 = 0x8000000000000000
-	if p.pcid != 0 {
-		return noFlushBit | uint64(p.root.physical) | uint64(p.pcid)
+	if noFlush && pcid != 0 {
+		return noFlushBit | uint64(p.rootPhysical) | uint64(pcid)
 	}
-	return uint64(p.root.physical)
-}
-
-// FlushCR3 returns the CR3 value that flushes the TLB.
-//
-// This may be called in interrupt contexts.
-//
-//go:nosplit
-func (p *PageTables) FlushCR3() uint64 {
-	return uint64(p.root.physical) | uint64(p.pcid)
+	return uint64(p.rootPhysical) | uint64(pcid)
 }
 
 // Bits in page table entries.
@@ -200,8 +162,13 @@ func (p *PTE) Set(addr uintptr, opts MapOpts) {
 // be cleared. This is used explicitly for breaking super pages.
 //
 //go:nosplit
-func (p *PTE) setPageTable(addr uintptr) {
-	v := (addr &^ optionMask) | present | user | writable | accessed | dirty
+func (p *PTE) setPageTable(pt *PageTables, ptes *PTEs) {
+	addr := pt.Allocator.PhysicalFor(ptes)
+	if addr&^optionMask != addr {
+		// This should never happen.
+		panic("unaligned physical address!")
+	}
+	v := addr | present | user | writable | accessed | dirty
 	atomic.StoreUintptr((*uintptr)(p), v)
 }
 

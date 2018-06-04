@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -52,6 +52,8 @@ type vdsoParams struct {
 // Everything in the struct is 8 bytes for easy alignment.
 //
 // It must be kept in sync with params in vdso/vdso_time.cc.
+//
+// +stateify savable
 type VDSOParamPage struct {
 	// The parameter page is fr, allocated from platform.Memory().
 	platform platform.Platform

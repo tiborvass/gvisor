@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -91,6 +91,8 @@ func (n InodeType) String() string {
 
 // StableAttr contains Inode attributes that will be stable throughout the
 // lifetime of the Inode.
+//
+// +stateify savable
 type StableAttr struct {
 	// Type is the InodeType of a InodeOperations.
 	Type InodeType
@@ -150,6 +152,8 @@ func IsCharDevice(s StableAttr) bool {
 
 // UnstableAttr contains Inode attributes that may change over the lifetime
 // of the Inode.
+//
+// +stateify savable
 type UnstableAttr struct {
 	// Size is the file size in bytes.
 	Size int64
@@ -176,6 +180,53 @@ type UnstableAttr struct {
 	Links uint64
 }
 
+// SetOwner sets the owner and group if they are valid.
+//
+// This method is NOT thread-safe. Callers must prevent concurrent calls.
+func (ua *UnstableAttr) SetOwner(ctx context.Context, owner FileOwner) {
+	if owner.UID.Ok() {
+		ua.Owner.UID = owner.UID
+	}
+	if owner.GID.Ok() {
+		ua.Owner.GID = owner.GID
+	}
+	ua.StatusChangeTime = ktime.NowFromContext(ctx)
+}
+
+// SetPermissions sets the permissions.
+//
+// This method is NOT thread-safe. Callers must prevent concurrent calls.
+func (ua *UnstableAttr) SetPermissions(ctx context.Context, p FilePermissions) {
+	ua.Perms = p
+	ua.StatusChangeTime = ktime.NowFromContext(ctx)
+}
+
+// SetTimestamps sets the timestamps according to the TimeSpec.
+//
+// This method is NOT thread-safe. Callers must prevent concurrent calls.
+func (ua *UnstableAttr) SetTimestamps(ctx context.Context, ts TimeSpec) {
+	if ts.ATimeOmit && ts.MTimeOmit {
+		return
+	}
+
+	now := ktime.NowFromContext(ctx)
+	if !ts.ATimeOmit {
+		if ts.ATimeSetSystemTime {
+			ua.AccessTime = now
+		} else {
+			ua.AccessTime = ts.ATime
+		}
+	}
+	if !ts.MTimeOmit {
+		if ts.MTimeSetSystemTime {
+			ua.ModificationTime = now
+		} else {
+			ua.ModificationTime = ts.MTime
+		}
+	}
+	ua.StatusChangeTime = now
+}
+
 // WithCurrentTime returns u with AccessTime == ModificationTime == current time.
 func WithCurrentTime(ctx context.Context, u UnstableAttr) UnstableAttr {
 	t := ktime.NowFromContext(ctx)
@@ -186,6 +237,8 @@ func WithCurrentTime(ctx context.Context, u UnstableAttr) UnstableAttr {
 }
 
 // AttrMask contains fields to mask StableAttr and UnstableAttr.
+//
+// +stateify savable
 type AttrMask struct {
 	Type             bool
 	DeviceID         bool
@@ -207,26 +260,9 @@ func (a AttrMask) Empty() bool {
 	return a == AttrMask{}
 }
 
-// Union returns an AttrMask containing the inclusive disjunction of fields in a and b.
-func (a AttrMask) Union(b AttrMask) AttrMask {
-	return AttrMask{
-		Type:             a.Type || b.Type,
-		DeviceID:         a.DeviceID || b.DeviceID,
-		InodeID:          a.InodeID || b.InodeID,
-		BlockSize:        a.BlockSize || b.BlockSize,
-		Size:             a.Size || b.Size,
-		Usage:            a.Usage || b.Usage,
-		Perms:            a.Perms || b.Perms,
-		UID:              a.UID || b.UID,
-		GID:              a.GID || b.GID,
-		AccessTime:       a.AccessTime || b.AccessTime,
-		ModificationTime: a.ModificationTime || b.ModificationTime,
-		StatusChangeTime: a.StatusChangeTime || b.StatusChangeTime,
-		Links:            a.Links || b.Links,
-	}
-}
-
 // PermMask are file access permissions.
+//
+// +stateify savable
 type PermMask struct {
 	// Read indicates reading is permitted.
 	Read bool
@@ -280,6 +316,8 @@ func (p PermMask) SupersetOf(other PermMask) bool {
 
 // FilePermissions represents the permissions of a file, with
 // Read/Write/Execute bits for user, group, and other.
+//
+// +stateify savable
 type FilePermissions struct {
 	User  PermMask
 	Group PermMask
@@ -370,6 +408,8 @@ func (f FilePermissions) AnyRead() bool {
 }
 
 // FileOwner represents ownership of a file.
+//
+// +stateify savable
 type FileOwner struct {
 	UID auth.KUID
 	GID auth.KGID

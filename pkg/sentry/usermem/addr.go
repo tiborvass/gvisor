@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@ import (
 )
 
 // Addr represents a generic virtual address.
+//
+// +stateify savable
 type Addr uintptr
 
 // AddLength adds the given length to start and returns the result. ok is true

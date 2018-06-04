@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,20 +18,6 @@ package ring0
 
 import (
 	"encoding/binary"
-)
-
-const (
-	// KernelFlagsSet should always be set in the kernel.
-	KernelFlagsSet = _RFLAGS_RESERVED
-
-	// UserFlagsSet are always set in userspace.
-	UserFlagsSet = _RFLAGS_RESERVED | _RFLAGS_IF
-
-	// KernelFlagsClear should always be clear in the kernel.
-	KernelFlagsClear = _RFLAGS_IF | _RFLAGS_NT | _RFLAGS_IOPL
-
-	// UserFlagsClear are always cleared in userspace.
-	UserFlagsClear = _RFLAGS_NT | _RFLAGS_IOPL
 )
 
 // init initializes architecture-specific state.
@@ -85,6 +71,9 @@ func (c *CPU) init() {
 	c.registers.Ss = uint64(Kdata)
 	c.registers.Fs = uint64(Kdata)
 	c.registers.Gs = uint64(Kdata)
+
+	// Set mandatory flags.
+	c.registers.Eflags = KernelFlagsSet
 }
 
 // StackTop returns the kernel's stack address.
@@ -119,7 +108,7 @@ func (c *CPU) TSS() (uint64, uint16, *SegmentDescriptor) {
 //
 //go:nosplit
 func (c *CPU) CR0() uint64 {
-	return _CR0_PE | _CR0_PG | _CR0_ET
+	return _CR0_PE | _CR0_PG | _CR0_AM | _CR0_ET
 }
 
 // CR4 returns the CPU's CR4 value.
@@ -173,30 +162,19 @@ func IsCanonical(addr uint64) bool {
 // code that uses IP-relative addressing inside of absolute addresses. That's
 // the case for amd64, but may not be the case for other architectures.
 //
+// Precondition: the Rip, Rsp, Fs and Gs registers must be canonical.
+//
 //go:nosplit
 func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
-	// Check for canonical addresses.
-	regs := switchOpts.Registers
-	if !IsCanonical(regs.Rip) || !IsCanonical(regs.Rsp) || !IsCanonical(regs.Fs_base) || !IsCanonical(regs.Gs_base) {
-		return GeneralProtectionFault
-	}
-
-	var (
-		userCR3   uint64
-		kernelCR3 uint64
-	)
+	userCR3 := switchOpts.PageTables.CR3(!switchOpts.Flush, switchOpts.UserPCID)
+	kernelCR3 := c.kernel.PageTables.CR3(true, switchOpts.KernelPCID)
 
 	// Sanitize registers.
-	if switchOpts.Flush {
-		userCR3 = switchOpts.PageTables.FlushCR3()
-	} else {
-		userCR3 = switchOpts.PageTables.CR3()
-	}
+	regs := switchOpts.Registers
 	regs.Eflags &= ^uint64(UserFlagsClear)
 	regs.Eflags |= UserFlagsSet
 	regs.Cs = uint64(Ucode64) // Required for iret.
 	regs.Ss = uint64(Udata)   // Ditto.
-	kernelCR3 = c.kernel.PageTables.CR3()
 
 	// Perform the switch.
 	swapgs()                                         // GS will be swapped on return.
@@ -226,7 +204,7 @@ func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
 func start(c *CPU) {
 	// Save per-cpu & FS segment.
 	WriteGS(kernelAddr(c))
-	WriteFS(uintptr(c.Registers().Fs_base))
+	WriteFS(uintptr(c.registers.Fs_base))
 
 	// Initialize floating point.
 	//
@@ -249,13 +227,34 @@ func start(c *CPU) {
 
 	// Set the syscall target.
 	wrmsr(_MSR_LSTAR, kernelFunc(sysenter))
-	wrmsr(_MSR_SYSCALL_MASK, _RFLAGS_STEP|_RFLAGS_IF|_RFLAGS_DF|_RFLAGS_IOPL|_RFLAGS_AC|_RFLAGS_NT)
+	wrmsr(_MSR_SYSCALL_MASK, KernelFlagsClear|_RFLAGS_DF)
 
 	// NOTE: This depends on having the 64-bit segments immediately
 	// following the 32-bit user segments. This is simply the way the
 	// sysret instruction is designed to work (it assumes they follow).
 	wrmsr(_MSR_STAR, uintptr(uint64(Kcode)<<32|uint64(Ucode32)<<48))
 	wrmsr(_MSR_CSTAR, kernelFunc(sysenter))
+}
+
+// SetCPUIDFaulting sets CPUID faulting per the boolean value.
+//
+// True is returned if faulting could be set.
+//
+//go:nosplit
+func SetCPUIDFaulting(on bool) bool {
+	// Per the SDM (Vol 3, Table 2-43), PLATFORM_INFO bit 31 denotes support
+	// for CPUID faulting, and we enable and disable via the MISC_FEATURES MSR.
+	if rdmsr(_MSR_PLATFORM_INFO)&_PLATFORM_INFO_CPUID_FAULT != 0 {
+		features := rdmsr(_MSR_MISC_FEATURES)
+		if on {
+			features |= _MISC_FEATURE_CPUID_TRAP
+		} else {
+			features &^= _MISC_FEATURE_CPUID_TRAP
+		}
+		wrmsr(_MSR_MISC_FEATURES, features)
+		return true // Setting successful.
+	}
+	return false
 }
 
 // ReadCR2 reads the current CR2 value.

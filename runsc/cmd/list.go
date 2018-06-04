@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,13 +15,13 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"text/tabwriter"
 	"time"
 
-	"context"
 	"flag"
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -81,7 +81,7 @@ func (l *List) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 	for _, id := range ids {
 		c, err := container.Load(conf.RootDir, id)
 		if err != nil {
-			Fatalf("error loading container %q: %v", id, err)
+			Fatalf("loading container %q: %v", id, err)
 		}
 		containers = append(containers, c)
 	}
@@ -94,7 +94,7 @@ func (l *List) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 		for _, c := range containers {
 			fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\n",
 				c.ID,
-				c.Pid(),
+				c.SandboxPid(),
 				c.Status,
 				c.BundleDir,
 				c.CreatedAt.Format(time.RFC3339Nano),
@@ -108,7 +108,7 @@ func (l *List) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 			states = append(states, c.State())
 		}
 		if err := json.NewEncoder(os.Stdout).Encode(states); err != nil {
-			Fatalf("error marshaling container state: %v", err)
+			Fatalf("marshaling container state: %v", err)
 		}
 	default:
 		Fatalf("unknown list format %q", l.format)

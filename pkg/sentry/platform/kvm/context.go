@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,6 +28,9 @@ import (
 type context struct {
 	// machine is the parent machine, and is immutable.
 	machine *machine
+
+	// info is the arch.SignalInfo cached for this context.
+	info arch.SignalInfo
 
 	// interrupt is the interrupt context.
 	interrupt interrupt.Forwarder
@@ -65,7 +68,7 @@ func (c *context) Switch(as platform.AddressSpace, ac arch.Context, _ int32) (*a
 	}
 
 	// Take the blue pill.
-	si, at, err := cpu.SwitchToUser(switchOpts)
+	at, err := cpu.SwitchToUser(switchOpts, &c.info)
 
 	// Clear the address space.
 	cpu.active.set(nil)
@@ -75,7 +78,7 @@ func (c *context) Switch(as platform.AddressSpace, ac arch.Context, _ int32) (*a
 
 	// All done.
 	c.interrupt.Disable()
-	return si, at, err
+	return &c.info, at, err
 }
 
 // Interrupt interrupts the running context.

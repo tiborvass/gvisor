@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -69,6 +69,8 @@ type ioCallback struct {
 }
 
 // ioEvent describes an I/O result.
+//
+// +stateify savable
 type ioEvent struct {
 	Data    uint64
 	Obj     uint64
@@ -132,7 +134,7 @@ func IoGetevents(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.S
 	timespecAddr := args[4].Pointer()
 
 	// Sanity check arguments.
-	if minEvents > events {
+	if minEvents < 0 || minEvents > events {
 		return 0, nil, syserror.EINVAL
 	}
 
@@ -300,7 +302,7 @@ func submitCallback(t *kernel.Task, id uint64, cb *ioCallback, cbAddr usermem.Ad
 	// Was there an eventFD? Extract it.
 	var eventFile *fs.File
 	if cb.Flags&_IOCB_FLAG_RESFD != 0 {
-		eventFile := t.FDMap().GetFile(kdefs.FD(cb.ResFD))
+		eventFile = t.FDMap().GetFile(kdefs.FD(cb.ResFD))
 		if eventFile == nil {
 			// Bad FD.
 			return syserror.EBADF
@@ -317,6 +319,14 @@ func submitCallback(t *kernel.Task, id uint64, cb *ioCallback, cbAddr usermem.Ad
 	ioseq, err := memoryFor(t, cb)
 	if err != nil {
 		return err
+	}
+
+	// Check offset for reads/writes.
+	switch cb.OpCode {
+	case _IOCB_CMD_PREAD, _IOCB_CMD_PREADV, _IOCB_CMD_PWRITE, _IOCB_CMD_PWRITEV:
+		if cb.Offset < 0 {
+			return syserror.EINVAL
+		}
 	}
 
 	// Prepare the request.
@@ -350,6 +360,10 @@ func IoSubmit(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 	id := args[0].Uint64()
 	nrEvents := args[1].Int()
 	addr := args[2].Pointer()
+
+	if nrEvents < 0 {
+		return 0, nil, syserror.EINVAL
+	}
 
 	for i := int32(0); i < nrEvents; i++ {
 		// Copy in the address.

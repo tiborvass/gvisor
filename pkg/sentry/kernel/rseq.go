@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,6 +23,8 @@ import (
 // Restartable sequences, as described in https://lwn.net/Articles/650333/.
 
 // RSEQCriticalRegion describes a restartable sequence critical region.
+//
+// +stateify savable
 type RSEQCriticalRegion struct {
 	// When a task in this thread group has its CPU preempted (as defined by
 	// platform.ErrContextCPUPreempted) or has a signal delivered to an

@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,12 +17,56 @@ package kvm
 import (
 	"reflect"
 	"sync"
+	"sync/atomic"
 
+	"gvisor.googlesource.com/gvisor/pkg/atomicbitops"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform/filemem"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform/ring0/pagetables"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 )
+
+// dirtySet tracks vCPUs for invalidation.
+type dirtySet struct {
+	vCPUs []uint64
+}
+
+// forEach iterates over all CPUs in the dirty set.
+func (ds *dirtySet) forEach(m *machine, fn func(c *vCPU)) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for index := range ds.vCPUs {
+		mask := atomic.SwapUint64(&ds.vCPUs[index], 0)
+		if mask != 0 {
+			for bit := 0; bit < 64; bit++ {
+				if mask&(1<<uint64(bit)) == 0 {
+					continue
+				}
+				id := 64*index + bit
+				fn(m.vCPUsByID[id])
+			}
+		}
+	}
+}
+
+// mark marks the given vCPU as dirty and returns whether it was previously
+// clean. Being previously clean implies that a flush is needed on entry.
+func (ds *dirtySet) mark(c *vCPU) bool {
+	index := uint64(c.id) / 64
+	bit := uint64(1) << uint(c.id%64)
+
+	oldValue := atomic.LoadUint64(&ds.vCPUs[index])
+	if oldValue&bit != 0 {
+		return false // Not clean.
+	}
+
+	// Set the bit unilaterally, and ensure that a flush takes place. Note
+	// that it's possible for races to occur here, but since the flush is
+	// taking place long after these lines there's no race in practice.
+	atomicbitops.OrUint64(&ds.vCPUs[index], bit)
+	return true // Previously clean.
+}
 
 // addressSpace is a wrapper for PageTables.
 type addressSpace struct {
@@ -43,11 +87,7 @@ type addressSpace struct {
 	pageTables *pagetables.PageTables
 
 	// dirtySet is the set of dirty vCPUs.
-	//
-	// These are actually vCPU pointers that are stored iff the vCPU is
-	// dirty. If the vCPU is not dirty and requires invalidation, then a
-	// nil value is stored here instead.
-	dirtySet dirtySet
+	dirtySet *dirtySet
 
 	// files contains files mapped in the host address space.
 	//
@@ -57,11 +97,11 @@ type addressSpace struct {
 
 // invalidate is the implementation for Invalidate.
 func (as *addressSpace) invalidate() {
-	for i := 0; i < as.dirtySet.size(); i++ {
-		if c := as.dirtySet.swap(i, nil); c != nil && c.active.get() == as {
-			c.BounceToKernel() // Force a kernel transition.
+	as.dirtySet.forEach(as.machine, func(c *vCPU) {
+		if c.active.get() == as { // If this happens to be active,
+			c.BounceToKernel() // ... force a kernel transition.
 		}
-	}
+	})
 }
 
 // Invalidate interrupts all dirty contexts.
@@ -75,16 +115,12 @@ func (as *addressSpace) Invalidate() {
 //
 // The return value indicates whether a flush is required.
 func (as *addressSpace) Touch(c *vCPU) bool {
-	if old := as.dirtySet.swap(c.id, c); old == nil {
-		return true // Flush is required.
-	}
-	// Already dirty: no flush required.
-	return false
+	return as.dirtySet.mark(c)
 }
 
 func (as *addressSpace) mapHost(addr usermem.Addr, m hostMapEntry, at usermem.AccessType) (inv bool) {
 	for m.length > 0 {
-		physical, length, ok := TranslateToPhysical(m.addr)
+		physical, length, ok := translateToPhysical(m.addr)
 		if !ok {
 			panic("unable to translate segment")
 		}
@@ -102,11 +138,18 @@ func (as *addressSpace) mapHost(addr usermem.Addr, m hostMapEntry, at usermem.Ac
 		// important; if the pagetable mappings were installed before
 		// ensuring the physical pages were available, then some other
 		// thread could theoretically access them.
-		prev := as.pageTables.Map(addr, length, pagetables.MapOpts{
-			AccessType: at,
-			User:       true,
-		}, physical)
-		inv = inv || prev
+		//
+		// Due to the way KVM's shadow paging implementation works,
+		// modifications to the page tables while in host mode may not
+		// be trapped, leading to the shadow pages being out of sync.
+		// Therefore, we need to ensure that we are in guest mode for
+		// page table modifications. See the call to bluepill, below.
+		as.machine.retryInGuest(func() {
+			inv = as.pageTables.Map(addr, length, pagetables.MapOpts{
+				AccessType: at,
+				User:       true,
+			}, physical) || inv
+		})
 		m.addr += length
 		m.length -= length
 		addr += usermem.Addr(length)
@@ -214,17 +257,30 @@ func (as *addressSpace) Unmap(addr usermem.Addr, length uint64) {
 	as.mu.Lock()
 	defer as.mu.Unlock()
 
-	if prev := as.pageTables.Unmap(addr, uintptr(length)); prev {
+	// See above re: retryInGuest.
+	var prev bool
+	as.machine.retryInGuest(func() {
+		prev = as.pageTables.Unmap(addr, uintptr(length)) || prev
+	})
+	if prev {
 		as.invalidate()
 		as.files.DeleteMapping(usermem.AddrRange{
 			Start: addr,
 			End:   addr + usermem.Addr(length),
 		})
+
+		// Recycle any freed intermediate pages.
+		as.pageTables.Allocator.Recycle()
 	}
 }
 
 // Release releases the page tables.
 func (as *addressSpace) Release() {
 	as.Unmap(0, ^uint64(0))
-	as.pageTables.Release()
+
+	// Free all pages from the allocator.
+	as.pageTables.Allocator.(allocator).base.Drain()
+
+	// Drop all cached machine references.
+	as.machine.dropPageTables(as.pageTables)
 }

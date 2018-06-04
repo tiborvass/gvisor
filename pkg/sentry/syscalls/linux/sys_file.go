@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/lock"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/fasync"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/kdefs"
 	ktime "gvisor.googlesource.com/gvisor/pkg/sentry/kernel/time"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/limits"
@@ -91,10 +92,11 @@ func fileOpOn(t *kernel.Task, dirFD kdefs.FD, path string, resolve bool, fn func
 	root := t.FSContext().RootDirectory()
 
 	// Lookup the node.
+	remainingTraversals := uint(linux.MaxSymlinkTraversals)
 	if resolve {
-		d, err = t.MountNamespace().FindInode(t, root, rel, path, linux.MaxSymlinkTraversals)
+		d, err = t.MountNamespace().FindInode(t, root, rel, path, &remainingTraversals)
 	} else {
-		d, err = t.MountNamespace().FindLink(t, root, rel, path, linux.MaxSymlinkTraversals)
+		d, err = t.MountNamespace().FindLink(t, root, rel, path, &remainingTraversals)
 	}
 	root.DecRef()
 	if wd != nil {
@@ -114,7 +116,7 @@ func fileOpOn(t *kernel.Task, dirFD kdefs.FD, path string, resolve bool, fn func
 
 // copyInPath copies a path in.
 func copyInPath(t *kernel.Task, addr usermem.Addr, allowEmpty bool) (path string, dirPath bool, err error) {
-	path, err = t.CopyInString(addr, syscall.PathMax)
+	path, err = t.CopyInString(addr, linux.PATH_MAX)
 	if err != nil {
 		return "", false, err
 	}
@@ -135,7 +137,8 @@ func openAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, flags uint) (fd u
 		return 0, err
 	}
 
-	err = fileOpOn(t, dirFD, path, true /* resolve */, func(root *fs.Dirent, d *fs.Dirent) error {
+	resolve := flags&linux.O_NOFOLLOW == 0
+	err = fileOpOn(t, dirFD, path, resolve, func(root *fs.Dirent, d *fs.Dirent) error {
 		// First check a few things about the filesystem before trying to get the file
 		// reference.
 		//
@@ -146,22 +149,32 @@ func openAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, flags uint) (fd u
 			return err
 		}
 
+		if fs.IsSymlink(d.Inode.StableAttr) && !resolve {
+			return syserror.ELOOP
+		}
+
 		fileFlags := linuxToFlags(flags)
-		isDir := fs.IsDir(d.Inode.StableAttr)
-
-		// If O_DIRECTORY is set, but the file is not a directory, then fail.
-		if fileFlags.Directory && !isDir {
-			return syserror.ENOTDIR
-		}
-
-		// If it's a directory, then make sure.
-		if dirPath && !isDir {
-			return syserror.ENOTDIR
-		}
-
-		// Don't allow directories to be opened writable.
-		if isDir && fileFlags.Write {
-			return syserror.EISDIR
+		// Linux always adds the O_LARGEFILE flag when running in 64-bit mode.
+		fileFlags.LargeFile = true
+		if fs.IsDir(d.Inode.StableAttr) {
+			// Don't allow directories to be opened writable.
+			if fileFlags.Write {
+				return syserror.EISDIR
+			}
+		} else {
+			// If O_DIRECTORY is set, but the file is not a directory, then fail.
+			if fileFlags.Directory {
+				return syserror.ENOTDIR
+			}
+			// If it's a directory, then make sure.
+			if dirPath {
+				return syserror.ENOTDIR
+			}
+			if flags&linux.O_TRUNC != 0 {
+				if err := d.Inode.Truncate(t, d, 0); err != nil {
+					return err
+				}
+			}
 		}
 
 		file, err := d.Inode.GetFile(t, d, fileFlags)
@@ -171,7 +184,7 @@ func openAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, flags uint) (fd u
 		defer file.DecRef()
 
 		// Success.
-		fdFlags := kernel.FDFlags{CloseOnExec: flags&syscall.O_CLOEXEC != 0}
+		fdFlags := kernel.FDFlags{CloseOnExec: flags&linux.O_CLOEXEC != 0}
 		newFD, err := t.FDMap().NewFDFrom(0, file, fdFlags, t.ThreadGroup().Limits())
 		if err != nil {
 			return err
@@ -295,8 +308,13 @@ func createAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, flags uint, mod
 			return syserror.ENOTDIR
 		}
 
+		fileFlags := linuxToFlags(flags)
+		// Linux always adds the O_LARGEFILE flag when running in 64-bit mode.
+		fileFlags.LargeFile = true
+
 		// Does this file exist already?
-		targetDirent, err := t.MountNamespace().FindInode(t, root, d, name, linux.MaxSymlinkTraversals)
+		remainingTraversals := uint(linux.MaxSymlinkTraversals)
+		targetDirent, err := t.MountNamespace().FindInode(t, root, d, name, &remainingTraversals)
 		var newFile *fs.File
 		switch err {
 		case nil:
@@ -304,7 +322,7 @@ func createAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, flags uint, mod
 			defer targetDirent.DecRef()
 
 			// Check if we wanted to create.
-			if flags&syscall.O_EXCL != 0 {
+			if flags&linux.O_EXCL != 0 {
 				return syserror.EEXIST
 			}
 
@@ -316,14 +334,14 @@ func createAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, flags uint, mod
 			}
 
 			// Should we truncate the file?
-			if flags&syscall.O_TRUNC != 0 {
+			if flags&linux.O_TRUNC != 0 {
 				if err := targetDirent.Inode.Truncate(t, targetDirent, 0); err != nil {
 					return err
 				}
 			}
 
 			// Create a new fs.File.
-			newFile, err = targetDirent.Inode.GetFile(t, targetDirent, linuxToFlags(flags))
+			newFile, err = targetDirent.Inode.GetFile(t, targetDirent, fileFlags)
 			if err != nil {
 				return syserror.ConvertIntr(err, kernel.ERESTARTSYS)
 			}
@@ -339,7 +357,7 @@ func createAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, flags uint, mod
 
 			// Attempt a creation.
 			perms := fs.FilePermsFromMode(mode &^ linux.FileMode(t.FSContext().Umask()))
-			newFile, err = d.Create(t, root, name, linuxToFlags(flags), perms)
+			newFile, err = d.Create(t, root, name, fileFlags, perms)
 			if err != nil {
 				// No luck, bail.
 				return err
@@ -349,7 +367,7 @@ func createAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, flags uint, mod
 		}
 
 		// Success.
-		fdFlags := kernel.FDFlags{CloseOnExec: flags&syscall.O_CLOEXEC != 0}
+		fdFlags := kernel.FDFlags{CloseOnExec: flags&linux.O_CLOEXEC != 0}
 		newFD, err := t.FDMap().NewFDFrom(0, newFile, fdFlags, t.ThreadGroup().Limits())
 		if err != nil {
 			return err
@@ -373,7 +391,7 @@ func createAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, flags uint, mod
 func Open(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	addr := args[0].Pointer()
 	flags := uint(args[1].Uint())
-	if flags&syscall.O_CREAT != 0 {
+	if flags&linux.O_CREAT != 0 {
 		mode := linux.FileMode(args[2].ModeT())
 		n, err := createAt(t, linux.AT_FDCWD, addr, flags, mode)
 		return n, nil, err
@@ -387,7 +405,7 @@ func Openat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	dirFD := kdefs.FD(args[0].Int())
 	addr := args[1].Pointer()
 	flags := uint(args[2].Uint())
-	if flags&syscall.O_CREAT != 0 {
+	if flags&linux.O_CREAT != 0 {
 		mode := linux.FileMode(args[3].ModeT())
 		n, err := createAt(t, dirFD, addr, flags, mode)
 		return n, nil, err
@@ -400,7 +418,7 @@ func Openat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 func Creat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	addr := args[0].Pointer()
 	mode := linux.FileMode(args[1].ModeT())
-	n, err := createAt(t, linux.AT_FDCWD, addr, syscall.O_WRONLY|syscall.O_TRUNC, mode)
+	n, err := createAt(t, linux.AT_FDCWD, addr, linux.O_WRONLY|linux.O_TRUNC, mode)
 	return n, nil, err
 }
 
@@ -410,14 +428,14 @@ func Creat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 // accessContext should only be used for access(2).
 type accessContext struct {
 	context.Context
-	creds auth.Credentials
+	creds *auth.Credentials
 }
 
 // Value implements context.Context.
 func (ac accessContext) Value(key interface{}) interface{} {
 	switch key {
 	case auth.CtxCredentials:
-		return &ac.creds
+		return ac.creds
 	default:
 		return ac.Context.Value(key)
 	}
@@ -446,7 +464,7 @@ func accessAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, resolve bool, m
 		// uid/gid. We do this by temporarily clearing all FS-related
 		// capabilities and switching the fsuid/fsgid around to the
 		// real ones." -fs/open.c:faccessat
-		creds := t.Credentials()
+		creds := t.Credentials().Fork()
 		creds.EffectiveKUID = creds.RealKUID
 		creds.EffectiveKGID = creds.RealKGID
 		if creds.EffectiveKUID.In(creds.UserNamespace) == auth.RootUID {
@@ -523,6 +541,33 @@ func Ioctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		}
 		file.SetFlags(flags.Settable())
 		return 0, nil, nil
+
+	case linux.FIOASYNC:
+		var set int32
+		if _, err := t.CopyIn(args[2].Pointer(), &set); err != nil {
+			return 0, nil, err
+		}
+		flags := file.Flags()
+		if set != 0 {
+			flags.Async = true
+		} else {
+			flags.Async = false
+		}
+		file.SetFlags(flags.Settable())
+		return 0, nil, nil
+
+	case linux.FIOSETOWN, linux.SIOCSPGRP:
+		var set int32
+		if _, err := t.CopyIn(args[2].Pointer(), &set); err != nil {
+			return 0, nil, err
+		}
+		fSetOwn(t, file, set)
+		return 0, nil, nil
+
+	case linux.FIOGETOWN, linux.SIOCGPGRP:
+		who := fGetOwn(t, file)
+		_, err := t.CopyOut(args[2].Pointer(), &who)
+		return 0, nil, err
 
 	default:
 		ret, err := file.FileOperations.Ioctl(t, t.MemoryManager(), args)
@@ -713,12 +758,45 @@ func Dup3(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 	}
 	defer oldFile.DecRef()
 
-	err := t.FDMap().NewFDAt(newfd, oldFile, kernel.FDFlags{CloseOnExec: flags&syscall.O_CLOEXEC != 0}, t.ThreadGroup().Limits())
+	err := t.FDMap().NewFDAt(newfd, oldFile, kernel.FDFlags{CloseOnExec: flags&linux.O_CLOEXEC != 0}, t.ThreadGroup().Limits())
 	if err != nil {
 		return 0, nil, err
 	}
 
 	return uintptr(newfd), nil, nil
+}
+
+func fGetOwn(t *kernel.Task, file *fs.File) int32 {
+	ma := file.Async(nil)
+	if ma == nil {
+		return 0
+	}
+	a := ma.(*fasync.FileAsync)
+	ot, otg, opg := a.Owner()
+	switch {
+	case ot != nil:
+		return int32(t.PIDNamespace().IDOfTask(ot))
+	case otg != nil:
+		return int32(t.PIDNamespace().IDOfThreadGroup(otg))
+	case opg != nil:
+		return int32(-t.PIDNamespace().IDOfProcessGroup(opg))
+	default:
+		return 0
+	}
+}
+
+// fSetOwn sets the file's owner with the semantics of F_SETOWN in Linux.
+//
+// If who is positive, it represents a PID. If negative, it represents a PGID.
+// If the PID or PGID is invalid, the owner is silently unset.
+func fSetOwn(t *kernel.Task, file *fs.File, who int32) {
+	a := file.Async(fasync.New).(*fasync.FileAsync)
+	if who < 0 {
+		pg := t.PIDNamespace().ProcessGroupWithID(kernel.ProcessGroupID(-who))
+		a.SetOwnerProcessGroup(t, pg)
+	}
+	tg := t.PIDNamespace().ThreadGroupWithID(kernel.ThreadID(who))
+	a.SetOwnerThreadGroup(t, tg)
 }
 
 // Fcntl implements linux syscall fcntl(2).
@@ -733,27 +811,27 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	defer file.DecRef()
 
 	switch cmd {
-	case syscall.F_DUPFD, syscall.F_DUPFD_CLOEXEC:
+	case linux.F_DUPFD, linux.F_DUPFD_CLOEXEC:
 		from := kdefs.FD(args[2].Int())
-		fdFlags := kernel.FDFlags{CloseOnExec: cmd == syscall.F_DUPFD_CLOEXEC}
+		fdFlags := kernel.FDFlags{CloseOnExec: cmd == linux.F_DUPFD_CLOEXEC}
 		fd, err := t.FDMap().NewFDFrom(from, file, fdFlags, t.ThreadGroup().Limits())
 		if err != nil {
 			return 0, nil, err
 		}
 		return uintptr(fd), nil, nil
-	case syscall.F_GETFD:
-		return uintptr(fdFlagsToLinux(flags)), nil, nil
-	case syscall.F_SETFD:
+	case linux.F_GETFD:
+		return uintptr(flags.ToLinuxFDFlags()), nil, nil
+	case linux.F_SETFD:
 		flags := args[2].Uint()
 		t.FDMap().SetFlags(fd, kernel.FDFlags{
-			CloseOnExec: flags&syscall.FD_CLOEXEC != 0,
+			CloseOnExec: flags&linux.FD_CLOEXEC != 0,
 		})
-	case syscall.F_GETFL:
-		return uintptr(flagsToLinux(file.Flags())), nil, nil
-	case syscall.F_SETFL:
+	case linux.F_GETFL:
+		return uintptr(file.Flags().ToLinux()), nil, nil
+	case linux.F_SETFL:
 		flags := uint(args[2].Uint())
-		file.SetFlags(linuxToSettableFlags(flags))
-	case syscall.F_SETLK, syscall.F_SETLKW:
+		file.SetFlags(linuxToFlags(flags).Settable())
+	case linux.F_SETLK, linux.F_SETLKW:
 		// In Linux the file system can choose to provide lock operations for an inode.
 		// Normally pipe and socket types lack lock operations. We diverge and use a heavy
 		// hammer by only allowing locks on files and directories.
@@ -850,6 +928,11 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		default:
 			return 0, nil, syserror.EINVAL
 		}
+	case linux.F_GETOWN:
+		return uintptr(fGetOwn(t, file)), nil, nil
+	case linux.F_SETOWN:
+		fSetOwn(t, file, args[2].Int())
+		return 0, nil, nil
 	default:
 		// Everything else is not yet supported.
 		return 0, nil, syserror.EINVAL
@@ -916,7 +999,8 @@ func mkdirAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, mode linux.FileM
 		}
 
 		// Does this directory exist already?
-		f, err := t.MountNamespace().FindInode(t, root, d, name, linux.MaxSymlinkTraversals)
+		remainingTraversals := uint(linux.MaxSymlinkTraversals)
+		f, err := t.MountNamespace().FindInode(t, root, d, name, &remainingTraversals)
 		switch err {
 		case nil:
 			// The directory existed.
@@ -961,16 +1045,23 @@ func rmdirAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr) error {
 		return err
 	}
 
-	// Special case: rmdir rejects anything with '.' as last component.
-	// This would be handled by the busy check for the current working
-	// directory, but this is how it's done.
-	if (len(path) == 1 && path == ".") || (len(path) > 1 && path[len(path)-2:] == "/.") {
-		return syserror.EINVAL
+	// Special case: removing the root always returns EBUSY.
+	if path == "/" {
+		return syserror.EBUSY
 	}
 
 	return fileOpAt(t, dirFD, path, func(root *fs.Dirent, d *fs.Dirent, name string) error {
 		if !fs.IsDir(d.Inode.StableAttr) {
 			return syserror.ENOTDIR
+		}
+
+		// Linux returns different ernos when the path ends in single
+		// dot vs. double dots.
+		switch name {
+		case ".":
+			return syserror.EINVAL
+		case "..":
+			return syserror.ENOTEMPTY
 		}
 
 		if err := fs.MayDelete(t, root, d, name); err != nil {
@@ -999,7 +1090,7 @@ func symlinkAt(t *kernel.Task, dirFD kdefs.FD, newAddr usermem.Addr, oldAddr use
 
 	// The oldPath is copied in verbatim. This is because the symlink
 	// will include all details, including trailing slashes.
-	oldPath, err := t.CopyInString(oldAddr, syscall.PathMax)
+	oldPath, err := t.CopyInString(oldAddr, linux.PATH_MAX)
 	if err != nil {
 		return err
 	}
@@ -1041,15 +1132,29 @@ func Symlinkat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 //
 // This corresponds to Linux's fs/namei.c:may_linkat.
 func mayLinkAt(t *kernel.Task, target *fs.Inode) error {
-	// Technically Linux is more restrictive in 3.11.10 (requires CAP_FOWNER in
-	// root user namespace); this is from the later f2ca379642d7 "namei: permit
-	// linking with CAP_FOWNER in userns".
-	if !target.CheckOwnership(t) {
-		return syserror.EPERM
+	// Linux will impose the following restrictions on hard links only if
+	// sysctl_protected_hardlinks is enabled. The kernel disables this
+	// setting by default for backward compatibility (see commit
+	// 561ec64ae67e), but also recommends that distributions enable it (and
+	// Debian does:
+	// https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=889098).
+	//
+	// gVisor currently behaves as though sysctl_protected_hardlinks is
+	// always enabled, and thus imposes the following restrictions on hard
+	// links.
+
+	if target.CheckOwnership(t) {
+		// fs/namei.c:may_linkat: "Source inode owner (or CAP_FOWNER)
+		// can hardlink all they like."
+		return nil
 	}
 
-	// Check that the target is not a directory and that permissions are okay.
-	if fs.IsDir(target.StableAttr) || target.CheckPermission(t, fs.PermMask{Read: true, Write: true}) != nil {
+	// If we are not the owner, then the file must be regular and have
+	// Read+Write permissions.
+	if !fs.IsRegular(target.StableAttr) {
+		return syserror.EPERM
+	}
+	if target.CheckPermission(t, fs.PermMask{Read: true, Write: true}) != nil {
 		return syserror.EPERM
 	}
 
@@ -1146,6 +1251,12 @@ func Linkat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	// AT_SYMLINK_FOLLOW can be specified in flags to cause oldpath to be
 	// dereferenced if it is a symbolic link.
 	flags := args[4].Int()
+
+	// Sanity check flags.
+	if flags&^(linux.AT_SYMLINK_FOLLOW|linux.AT_EMPTY_PATH) != 0 {
+		return 0, nil, syserror.EINVAL
+	}
+
 	resolve := flags&linux.AT_SYMLINK_FOLLOW == linux.AT_SYMLINK_FOLLOW
 	allowEmpty := flags&linux.AT_EMPTY_PATH == linux.AT_EMPTY_PATH
 
@@ -1731,27 +1842,25 @@ func renameAt(t *kernel.Task, oldDirFD kdefs.FD, oldAddr usermem.Addr, newDirFD 
 			return syserror.ENOTDIR
 		}
 
-		// Root cannot be renamed to anything.
-		//
-		// TODO: This catches the case when the rename
-		// argument is exactly "/", but we should return EBUSY when
-		// renaming any mount point, or when the argument is not
-		// exactly "/" but still resolves to the root, like "/.." or
-		// "/bin/..".
-		if oldParent == root && oldName == "." {
-			return syscall.EBUSY
+		// Rename rejects paths that end in ".", "..", or empty (i.e.
+		// the root) with EBUSY.
+		switch oldName {
+		case "", ".", "..":
+			return syserror.EBUSY
 		}
+
 		return fileOpAt(t, newDirFD, newPath, func(root *fs.Dirent, newParent *fs.Dirent, newName string) error {
 			if !fs.IsDir(newParent.Inode.StableAttr) {
 				return syserror.ENOTDIR
 			}
 
-			// Nothing can be renamed to root.
-			//
-			// TODO: Same as above.
-			if newParent == root && newName == "." {
-				return syscall.EBUSY
+			// Rename rejects paths that end in ".", "..", or empty
+			// (i.e.  the root) with EBUSY.
+			switch newName {
+			case "", ".", "..":
+				return syserror.EBUSY
 			}
+
 			return fs.Rename(t, root, oldParent, oldName, newParent, newName)
 		})
 	})

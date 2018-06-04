@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,7 +35,6 @@ package shm
 
 import (
 	"fmt"
-	"math"
 	"sync"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
@@ -52,81 +51,87 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 )
 
-// Various limits for shared memory segments.
-const (
-	// shmsTotalMaxPages is the system-wide limit on all shared memory segments, measured
-	// in number of pages.
-	shmsTotalMaxPages = math.MaxInt64 // SHMALL
+// Key represents a shm segment key. Analogous to a file name.
+type Key int32
 
-	// shmMaxSize is the maximum size of a single segment, in bytes.
-	shmMaxSize = math.MaxInt64 // SHMMAX
-
-	// shmMinSize is the minimum specifiable size of a segment, effectively
-	// yielding a size rounded up to the next page size. Measured in bytes.
-	shmMinSize = 1 // SHMMIN
-
-	// shmsTotalMax is the maximum number of segments on the system.
-	shmsTotalMax = 4096 // SHMMNI
-)
+// ID represents the opaque handle for a shm segment. Analogous to an fd.
+type ID int32
 
 // Registry tracks all shared memory segments in an IPC namespace. The registry
 // provides the mechanisms for creating and finding segments, and reporting
 // global shm parameters.
+//
+// +stateify savable
 type Registry struct {
 	// userNS owns the IPC namespace this registry belong to. Immutable.
 	userNS *auth.UserNamespace
 
+	// mu protects all fields below.
 	mu sync.Mutex `state:"nosave"`
 
-	// shms maps segment ids to segments. Protected by mu.
-	shms map[int32]*Shm
+	// shms maps segment ids to segments.
+	shms map[ID]*Shm
+
+	// keysToShms maps segment keys to segments.
+	keysToShms map[Key]*Shm
 
 	// Sum of the sizes of all existing segments rounded up to page size, in
-	// units of page size. Protected by mu.
+	// units of page size.
 	totalPages uint64
 
-	// lastIDUsed is protected by mu.
-	lastIDUsed int32
+	// ID assigned to the last created segment. Used to quickly find the next
+	// unused ID.
+	lastIDUsed ID
 }
 
 // NewRegistry creates a new shm registry.
 func NewRegistry(userNS *auth.UserNamespace) *Registry {
 	return &Registry{
-		userNS: userNS,
-		shms:   make(map[int32]*Shm),
+		userNS:     userNS,
+		shms:       make(map[ID]*Shm),
+		keysToShms: make(map[Key]*Shm),
 	}
 }
 
 // FindByID looks up a segment given an ID.
-func (r *Registry) FindByID(id int32) *Shm {
+func (r *Registry) FindByID(id ID) *Shm {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.shms[id]
 }
 
-// Precondition: Caller must hold r.mu.
-func (r *Registry) findByKey(key int32) *Shm {
-	for _, v := range r.shms {
-		if v.key == key {
-			return v
-		}
+// dissociateKey removes the association between a segment and its key,
+// preventing it from being discovered in the registry. This doesn't necessarily
+// mean the segment is about to be destroyed. This is analogous to unlinking a
+// file; the segment can still be used by a process already referencing it, but
+// cannot be discovered by a new process.
+func (r *Registry) dissociateKey(s *Shm) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.key != linux.IPC_PRIVATE {
+		delete(r.keysToShms, s.key)
+		s.key = linux.IPC_PRIVATE
 	}
-	return nil
 }
 
 // FindOrCreate looks up or creates a segment in the registry. It's functionally
 // analogous to open(2).
-func (r *Registry) FindOrCreate(ctx context.Context, pid, key int32, size uint64, mode linux.FileMode, private, create, exclusive bool) (*Shm, error) {
-	if create && (size < shmMinSize || size > shmMaxSize) {
+func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key Key, size uint64, mode linux.FileMode, private, create, exclusive bool) (*Shm, error) {
+	if (create || private) && (size < linux.SHMMIN || size > linux.SHMMAX) {
 		// "A new segment was to be created and size is less than SHMMIN or
 		// greater than SHMMAX." - man shmget(2)
+		//
+		// Note that 'private' always implies the creation of a new segment
+		// whether IPC_CREAT is specified or not.
 		return nil, syserror.EINVAL
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if len(r.shms) >= shmsTotalMax {
+	if len(r.shms) >= linux.SHMMNI {
 		// "All possible shared memory IDs have been taken (SHMMNI) ..."
 		//   - man shmget(2)
 		return nil, syserror.ENOSPC
@@ -134,7 +139,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid, key int32, size uint64
 
 	if !private {
 		// Look up an existing segment.
-		if shm := r.findByKey(key); shm != nil {
+		if shm := r.keysToShms[key]; shm != nil {
 			shm.mu.Lock()
 			defer shm.mu.Unlock()
 
@@ -177,7 +182,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid, key int32, size uint64
 		return nil, syserror.EINVAL
 	}
 
-	if numPages := sizeAligned / usermem.PageSize; r.totalPages+numPages > shmsTotalMaxPages {
+	if numPages := sizeAligned / usermem.PageSize; r.totalPages+numPages > linux.SHMALL {
 		// "... allocating a segment of the requested size would cause the
 		// system to exceed the system-wide limit on shared memory (SHMALL)."
 		//   - man shmget(2)
@@ -191,7 +196,9 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid, key int32, size uint64
 }
 
 // newShm creates a new segment in the registry.
-func (r *Registry) newShm(ctx context.Context, pid, key int32, creator fs.FileOwner, perms fs.FilePermissions, size uint64) (*Shm, error) {
+//
+// Precondition: Caller must hold r.mu.
+func (r *Registry) newShm(ctx context.Context, pid int32, key Key, creator fs.FileOwner, perms fs.FilePermissions, size uint64) (*Shm, error) {
 	p := platform.FromContext(ctx)
 	if p == nil {
 		panic(fmt.Sprintf("context.Context %T lacks non-nil value for key %T", ctx, platform.CtxPlatform))
@@ -226,8 +233,10 @@ func (r *Registry) newShm(ctx context.Context, pid, key int32, creator fs.FileOw
 		}
 		if r.shms[id] == nil {
 			r.lastIDUsed = id
-			r.shms[id] = shm
+
 			shm.ID = id
+			r.shms[id] = shm
+			r.keysToShms[key] = shm
 
 			r.totalPages += effectiveSize / usermem.PageSize
 
@@ -243,11 +252,11 @@ func (r *Registry) newShm(ctx context.Context, pid, key int32, creator fs.FileOw
 // system. See shmctl(IPC_INFO).
 func (r *Registry) IPCInfo() *linux.ShmParams {
 	return &linux.ShmParams{
-		ShmMax: shmMaxSize,
-		ShmMin: shmMinSize,
-		ShmMni: shmsTotalMax,
-		ShmSeg: shmsTotalMax, // Linux also sets this to SHMMNI.
-		ShmAll: shmsTotalMaxPages,
+		ShmMax: linux.SHMMAX,
+		ShmMin: linux.SHMMIN,
+		ShmMni: linux.SHMMNI,
+		ShmSeg: linux.SHMSEG,
+		ShmAll: linux.SHMALL,
 	}
 }
 
@@ -265,13 +274,20 @@ func (r *Registry) ShmInfo() *linux.ShmInfo {
 	}
 }
 
-// remove unregisters a segment from this registry, preventing it from being
-// discovered in the future. Caller is responsible for ensuring s is destroyed.
+// remove deletes a segment from this registry, deaccounting the memory used by
+// the segment.
 //
-// Precondition: To preserve lock ordering, caller must not hold s.mu.
+// Precondition: Must follow a call to r.dissociateKey(s).
 func (r *Registry) remove(s *Shm) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.key != linux.IPC_PRIVATE {
+		panic(fmt.Sprintf("Attempted to remove shm segment %+v from the registry whose key is still associated", s))
+	}
+
 	delete(r.shms, s.ID)
 	r.totalPages -= s.effectiveSize / usermem.PageSize
 }
@@ -288,6 +304,8 @@ func (r *Registry) remove(s *Shm) {
 // shmctl(SHM_RMID).
 //
 // Shm implements memmap.Mappable and memmap.MappingIdentity.
+//
+// +stateify savable
 type Shm struct {
 	// AtomicRefCount tracks the number of references to this segment from
 	// maps. A segment always holds a reference to itself, until it's marked for
@@ -300,7 +318,7 @@ type Shm struct {
 	registry *Registry
 
 	// ID is the kernel identifier for this segment. Immutable.
-	ID int32
+	ID ID
 
 	// creator is the user that created the segment. Immutable.
 	creator fs.FileOwner
@@ -319,11 +337,11 @@ type Shm struct {
 	// segment. Immutable.
 	fr platform.FileRange
 
-	// key is the public identifier for this segment.
-	key int32
-
 	// mu protects all fields below.
 	mu sync.Mutex `state:"nosave"`
+
+	// key is the public identifier for this segment.
+	key Key
 
 	// perms is the access permissions for the segment.
 	perms fs.FilePermissions
@@ -347,12 +365,14 @@ type Shm struct {
 	// pendingDestruction indicates the segment was marked as destroyed through
 	// shmctl(IPC_RMID). When marked as destroyed, the segment will not be found
 	// in the registry and can no longer be attached. When the last user
-	// detaches from the segment, it is destroyed. Protected by mu.
+	// detaches from the segment, it is destroyed.
 	pendingDestruction bool
 }
 
 // MappedName implements memmap.MappingIdentity.MappedName.
 func (s *Shm) MappedName(ctx context.Context) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return fmt.Sprintf("SYSV%08d", s.key)
 }
 
@@ -369,6 +389,8 @@ func (s *Shm) InodeID() uint64 {
 }
 
 // DecRef overrides refs.RefCount.DecRef with a destructor.
+//
+// Precondition: Caller must not hold s.mu.
 func (s *Shm) DecRef() {
 	s.DecRefWithDestructor(s.destroy)
 }
@@ -380,7 +402,7 @@ func (s *Shm) Msync(context.Context, memmap.MappableRange) error {
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
-func (s *Shm) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) error {
+func (s *Shm) AddMapping(ctx context.Context, _ memmap.MappingSpace, _ usermem.AddrRange, _ uint64, _ bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.attachTime = ktime.NowFromContext(ctx)
@@ -395,7 +417,7 @@ func (s *Shm) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem
 }
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
-func (s *Shm) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) {
+func (s *Shm) RemoveMapping(ctx context.Context, _ memmap.MappingSpace, _ usermem.AddrRange, _ uint64, _ bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// TODO: RemoveMapping may be called during task exit, when ctx
@@ -416,7 +438,7 @@ func (s *Shm) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar user
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
-func (s *Shm) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64) error {
+func (*Shm) CopyMapping(context.Context, memmap.MappingSpace, usermem.AddrRange, usermem.AddrRange, uint64, bool) error {
 	return nil
 }
 
@@ -577,19 +599,30 @@ func (s *Shm) Set(ctx context.Context, ds *linux.ShmidDS) error {
 }
 
 func (s *Shm) destroy() {
-	s.registry.remove(s)
 	s.p.Memory().DecRef(s.fr)
+	s.registry.remove(s)
 }
 
-// MarkDestroyed marks a shm for destruction. The shm is actually destroyed once
-// it has no references. See shmctl(IPC_RMID).
+// MarkDestroyed marks a segment for destruction. The segment is actually
+// destroyed once it has no references. MarkDestroyed may be called multiple
+// times, and is safe to call after a segment has already been destroyed. See
+// shmctl(IPC_RMID).
 func (s *Shm) MarkDestroyed() {
+	s.registry.dissociateKey(s)
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	// Prevent the segment from being found in the registry.
-	s.key = linux.IPC_PRIVATE
-	s.pendingDestruction = true
-	s.DecRef()
+	// Only drop the segment's self-reference once, when destruction is
+	// requested. Otherwise, repeated calls to shmctl(IPC_RMID) would force a
+	// segment to be destroyed prematurely, potentially with active maps to the
+	// segment's address range. Remaining references are dropped when the
+	// segment is detached or unmaped.
+	if !s.pendingDestruction {
+		s.pendingDestruction = true
+		s.mu.Unlock() // Must release s.mu before calling s.DecRef.
+		s.DecRef()
+		return
+	}
+	s.mu.Unlock()
 }
 
 // checkOwnership verifies whether a segment may be accessed by ctx as an

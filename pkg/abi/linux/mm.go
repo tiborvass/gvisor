@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -47,6 +47,18 @@ const (
 const (
 	MREMAP_MAYMOVE = 1 << 0
 	MREMAP_FIXED   = 1 << 1
+)
+
+// Flags for mlock2(2).
+const (
+	MLOCK_ONFAULT = 0x01
+)
+
+// Flags for mlockall(2).
+const (
+	MCL_CURRENT = 1
+	MCL_FUTURE  = 2
+	MCL_ONFAULT = 4
 )
 
 // Advice for madvise(2).

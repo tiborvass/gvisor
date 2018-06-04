@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,5 +34,7 @@ func instrumentationFilters() seccomp.SyscallRules {
 		syscall.SYS_NANOSLEEP:       {},
 		syscall.SYS_OPEN:            {},
 		syscall.SYS_SET_ROBUST_LIST: {},
+		// Used within glibc's malloc.
+		syscall.SYS_TIME: {},
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ package kvm
 
 import (
 	"fmt"
-	"runtime"
+	"os"
 	"sync"
 	"syscall"
 
@@ -45,39 +45,45 @@ var (
 	globalErr  error
 )
 
+// OpenDevice opens the KVM device at /dev/kvm and returns the File.
+func OpenDevice() (*os.File, error) {
+	f, err := os.OpenFile("/dev/kvm", syscall.O_RDWR, 0)
+	if err != nil {
+		return nil, fmt.Errorf("error opening /dev/kvm: %v", err)
+	}
+	return f, nil
+}
+
 // New returns a new KVM-based implementation of the platform interface.
-func New() (*KVM, error) {
+func New(deviceFile *os.File) (*KVM, error) {
 	// Allocate physical memory for the vCPUs.
 	fm, err := filemem.New("kvm-memory")
 	if err != nil {
 		return nil, err
 	}
 
-	// Try opening KVM.
-	fd, err := syscall.Open("/dev/kvm", syscall.O_RDWR, 0)
-	if err != nil {
-		return nil, fmt.Errorf("opening /dev/kvm: %v", err)
-	}
-	defer syscall.Close(fd)
+	fd := deviceFile.Fd()
 
 	// Ensure global initialization is done.
 	globalOnce.Do(func() {
 		physicalInit()
-		globalErr = updateSystemValues(fd)
+		globalErr = updateSystemValues(int(fd))
 		ring0.Init(cpuid.HostFeatureSet())
 	})
 	if globalErr != nil {
-		return nil, err
+		return nil, globalErr
 	}
 
 	// Create a new VM fd.
-	vm, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, uintptr(fd), _KVM_CREATE_VM, 0)
+	vm, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, fd, _KVM_CREATE_VM, 0)
 	if errno != 0 {
 		return nil, fmt.Errorf("creating VM: %v", errno)
 	}
+	// We are done with the device file.
+	deviceFile.Close()
 
 	// Create a VM context.
-	machine, err := newMachine(int(vm), runtime.NumCPU())
+	machine, err := newMachine(int(vm))
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +127,7 @@ func (*KVM) MaxUserAddress() usermem.Addr {
 // NewAddressSpace returns a new pagetable root.
 func (k *KVM) NewAddressSpace(_ interface{}) (platform.AddressSpace, <-chan struct{}, error) {
 	// Allocate page tables and install system mappings.
-	pageTables := k.machine.kernel.PageTables.New()
+	pageTables := pagetables.New(newAllocator())
 	applyPhysicalRegions(func(pr physicalRegion) bool {
 		// Map the kernel in the upper half.
 		pageTables.Map(
@@ -137,7 +143,7 @@ func (k *KVM) NewAddressSpace(_ interface{}) (platform.AddressSpace, <-chan stru
 		filemem:    k.FileMem,
 		machine:    k.machine,
 		pageTables: pageTables,
-		dirtySet:   makeDirtySet(len(k.machine.vCPUs)),
+		dirtySet:   k.machine.newDirtySet(),
 	}, nil, nil
 }
 

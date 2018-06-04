@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 
-	"context"
 	"flag"
 	"github.com/google/subcommands"
 	"gvisor.googlesource.com/gvisor/pkg/log"
@@ -59,14 +59,17 @@ func (*State) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) s
 
 	c, err := container.Load(conf.RootDir, id)
 	if err != nil {
-		Fatalf("error loading container: %v", err)
+		Fatalf("loading container: %v", err)
 	}
 	log.Debugf("Returning state for container %+v", c)
 
+	state := c.State()
+	log.Debugf("State: %+v", state)
+
 	// Write json-encoded state directly to stdout.
-	b, err := json.MarshalIndent(c.State(), "", "  ")
+	b, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		Fatalf("error marshaling container state: %v", err)
+		Fatalf("marshaling container state: %v", err)
 	}
 	os.Stdout.Write(b)
 	return subcommands.ExitSuccess

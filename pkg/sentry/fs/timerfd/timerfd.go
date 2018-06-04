@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,15 +30,17 @@ import (
 )
 
 // TimerOperations implements fs.FileOperations for timerfds.
+//
+// +stateify savable
 type TimerOperations struct {
-	fsutil.ZeroSeek      `state:"nosave"`
-	fsutil.NotDirReaddir `state:"nosave"`
-	fsutil.NoFsync       `state:"nosave"`
-	fsutil.NoopFlush     `state:"nosave"`
-	fsutil.NoMMap        `state:"nosave"`
-	fsutil.NoIoctl       `state:"nosave"`
+	fsutil.FileZeroSeek      `state:"nosave"`
+	fsutil.FileNotDirReaddir `state:"nosave"`
+	fsutil.FileNoFsync       `state:"nosave"`
+	fsutil.FileNoopFlush     `state:"nosave"`
+	fsutil.FileNoMMap        `state:"nosave"`
+	fsutil.FileNoIoctl       `state:"nosave"`
 
-	events waiter.Queue `state:"nosave"`
+	events waiter.Queue `state:"zerovalue"`
 	timer  *ktime.Timer
 
 	// val is the number of timer expirations since the last successful call to

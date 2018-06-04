@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,6 +46,8 @@ import (
 )
 
 // MemoryManager implements a virtual address space.
+//
+// +stateify savable
 type MemoryManager struct {
 	// p is the platform.
 	//
@@ -93,17 +95,29 @@ type MemoryManager struct {
 	// vmas is protected by mappingMu.
 	vmas vmaSet
 
-	// usageAS is vmas.Span(), cached to accelerate RLIMIT_AS checks.
-	//
-	// usageAS is protected by mappingMu.
-	usageAS uint64
-
 	// brk is the mm's brk, which is manipulated using the brk(2) system call.
 	// The brk is initially set up by the loader which maps an executable
 	// binary into the mm.
 	//
 	// brk is protected by mappingMu.
 	brk usermem.AddrRange
+
+	// usageAS is vmas.Span(), cached to accelerate RLIMIT_AS checks.
+	//
+	// usageAS is protected by mappingMu.
+	usageAS uint64
+
+	// lockedAS is the combined size in bytes of all vmas with vma.mlockMode !=
+	// memmap.MLockNone.
+	//
+	// lockedAS is protected by mappingMu.
+	lockedAS uint64
+
+	// New VMAs created by MMap use whichever of memmap.MMapOpts.MLockMode or
+	// defMLockMode is greater.
+	//
+	// defMLockMode is protected by mappingMu.
+	defMLockMode memmap.MLockMode
 
 	// activeMu is loosely analogous to Linux's struct
 	// mm_struct::page_table_lock.
@@ -207,6 +221,8 @@ type MemoryManager struct {
 }
 
 // vma represents a virtual memory area.
+//
+// +stateify savable
 type vma struct {
 	// mappable is the virtual memory object mapped by this vma. If mappable is
 	// nil, the vma represents a private anonymous mapping.
@@ -247,6 +263,8 @@ type vma struct {
 	// architectures that can have VM_GROWSUP mappings are ia64, parisc, and
 	// metag, none of which we currently support.
 	growsDown bool `state:"manual"`
+
+	mlockMode memmap.MLockMode
 
 	// If id is not nil, it controls the lifecycle of mappable and provides vma
 	// metadata shown in /proc/[pid]/maps, and the vma holds a reference.
@@ -346,6 +364,8 @@ func (v *vma) loadRealPerms(b int) {
 }
 
 // pma represents a platform mapping area.
+//
+// +stateify savable
 type pma struct {
 	// file is the file mapped by this pma. Only pmas for which file ==
 	// platform.Platform.Memory() may be saved. pmas hold a reference to the
@@ -380,6 +400,7 @@ type pma struct {
 	internalMappings safemem.BlockSeq `state:"nosave"`
 }
 
+// +stateify savable
 type privateRefs struct {
 	mu sync.Mutex `state:"nosave"`
 

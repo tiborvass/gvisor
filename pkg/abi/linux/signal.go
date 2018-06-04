@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -165,13 +165,68 @@ const (
 
 // Signal action flags for rt_sigaction(2), from uapi/asm-generic/signal.h
 const (
-	SA_NOCLDSTOP   = 0x00000001
-	SA_NOCLDWAIT   = 0x00000002
-	SA_SIGINFO     = 0x00000004
-	SA_ONSTACK     = 0x08000000
-	SA_RESTART     = 0x10000000
-	SA_NODEFER     = 0x40000000
-	SA_RESTARTHAND = 0x80000000
-	SA_NOMASK      = SA_NODEFER
-	SA_ONESHOT     = SA_RESTARTHAND
+	SA_NOCLDSTOP = 0x00000001
+	SA_NOCLDWAIT = 0x00000002
+	SA_SIGINFO   = 0x00000004
+	SA_RESTORER  = 0x04000000
+	SA_ONSTACK   = 0x08000000
+	SA_RESTART   = 0x10000000
+	SA_NODEFER   = 0x40000000
+	SA_RESETHAND = 0x80000000
+	SA_NOMASK    = SA_NODEFER
+	SA_ONESHOT   = SA_RESETHAND
+)
+
+// Signal info types.
+const (
+	SI_MASK  = 0xffff0000
+	SI_KILL  = 0 << 16
+	SI_TIMER = 1 << 16
+	SI_POLL  = 2 << 16
+	SI_FAULT = 3 << 16
+	SI_CHLD  = 4 << 16
+	SI_RT    = 5 << 16
+	SI_MESGQ = 6 << 16
+	SI_SYS   = 7 << 16
+)
+
+// SIGPOLL si_codes.
+const (
+	// POLL_IN indicates that data input available.
+	POLL_IN = SI_POLL | 1
+
+	// POLL_OUT indicates that output buffers available.
+	POLL_OUT = SI_POLL | 2
+
+	// POLL_MSG indicates that an input message available.
+	POLL_MSG = SI_POLL | 3
+
+	// POLL_ERR indicates that there was an i/o error.
+	POLL_ERR = SI_POLL | 4
+
+	// POLL_PRI indicates that a high priority input available.
+	POLL_PRI = SI_POLL | 5
+
+	// POLL_HUP indicates that a device disconnected.
+	POLL_HUP = SI_POLL | 6
+)
+
+// Sigevent represents struct sigevent.
+type Sigevent struct {
+	Value  uint64 // union sigval {int, void*}
+	Signo  int32
+	Notify int32
+
+	// struct sigevent here contains 48-byte union _sigev_un. However, only
+	// member _tid is significant to the kernel.
+	Tid         int32
+	UnRemainder [44]byte
+}
+
+// Possible values for Sigevent.Notify, aka struct sigevent::sigev_notify.
+const (
+	SIGEV_SIGNAL    = 0
+	SIGEV_NONE      = 1
+	SIGEV_THREAD    = 2
+	SIGEV_THREAD_ID = 4
 )

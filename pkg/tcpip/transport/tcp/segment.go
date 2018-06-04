@@ -1,6 +1,16 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package tcp
 
@@ -26,15 +36,17 @@ const (
 // segment represents a TCP segment. It holds the payload and parsed TCP segment
 // information, and can be added to intrusive lists.
 // segment is mostly immutable, the only field allowed to change is viewToDeliver.
+//
+// +stateify savable
 type segment struct {
 	segmentEntry
 	refCnt int32
-	id     stack.TransportEndpointID
-	route  stack.Route
-	data   buffer.VectorisedView
+	id     stack.TransportEndpointID `state:"manual"`
+	route  stack.Route               `state:"manual"`
+	data   buffer.VectorisedView     `state:".(buffer.VectorisedView)"`
 	// views is used as buffer for data when its length is large
 	// enough to store a VectorisedView.
-	views [8]buffer.View
+	views [8]buffer.View `state:"nosave"`
 	// viewToDeliver keeps track of the next View that should be
 	// delivered by the Read endpoint.
 	viewToDeliver  int
@@ -45,10 +57,10 @@ type segment struct {
 
 	// parsedOptions stores the parsed values from the options in the segment.
 	parsedOptions header.TCPOptions
-	options       []byte
+	options       []byte `state:".([]byte)"`
 }
 
-func newSegment(r *stack.Route, id stack.TransportEndpointID, vv *buffer.VectorisedView) *segment {
+func newSegment(r *stack.Route, id stack.TransportEndpointID, vv buffer.VectorisedView) *segment {
 	s := &segment{
 		refCnt: 1,
 		id:     id,

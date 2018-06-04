@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package kernel
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -25,6 +26,8 @@ import (
 )
 
 // Timekeeper manages all of the kernel clocks.
+//
+// +stateify savable
 type Timekeeper struct {
 	// clocks are the clock sources.
 	//
@@ -44,14 +47,14 @@ type Timekeeper struct {
 	// It is set only once, by SetClocks.
 	monotonicOffset int64 `state:"nosave"`
 
-	// restored indicates that this Timekeeper was restored from a state
-	// file.
-	restored bool `state:"nosave"`
+	// restored, if non-nil, indicates that this Timekeeper was restored
+	// from a state file. The clocks are not set until restored is closed.
+	restored chan struct{} `state:"nosave"`
 
 	// saveMonotonic is the (offset) value of the monotonic clock at the
 	// time of save.
 	//
-	// It is only valid if restored is true.
+	// It is only valid if restored is non-nil.
 	//
 	// It is only used in SetClocks after restore to compute the new
 	// monotonicOffset.
@@ -59,7 +62,7 @@ type Timekeeper struct {
 
 	// saveRealtime is the value of the realtime clock at the time of save.
 	//
-	// It is only valid if restored is true.
+	// It is only valid if restored is non-nil.
 	//
 	// It is only used in SetClocks after restore to compute the new
 	// monotonicOffset.
@@ -98,7 +101,7 @@ func NewTimekeeper(platform platform.Platform, paramPage platform.FileRange) (*T
 func (t *Timekeeper) SetClocks(c sentrytime.Clocks) {
 	// Update the params, marking them "not ready", as we may need to
 	// restart calibration on this new machine.
-	if t.restored {
+	if t.restored != nil {
 		if err := t.params.Write(func() vdsoParams {
 			return vdsoParams{}
 		}); err != nil {
@@ -135,7 +138,7 @@ func (t *Timekeeper) SetClocks(c sentrytime.Clocks) {
 		panic("Unable to get current realtime: " + err.Error())
 	}
 
-	if t.restored {
+	if t.restored != nil {
 		wantMonotonic = t.saveMonotonic
 		elapsed := nowRealtime - t.saveRealtime
 		if elapsed > 0 {
@@ -145,7 +148,7 @@ func (t *Timekeeper) SetClocks(c sentrytime.Clocks) {
 
 	t.monotonicOffset = wantMonotonic - nowMonotonic
 
-	if !t.restored {
+	if t.restored == nil {
 		// Hold on to the initial "boot" time.
 		t.bootTime = ktime.FromNanoseconds(nowRealtime)
 	}
@@ -153,6 +156,10 @@ func (t *Timekeeper) SetClocks(c sentrytime.Clocks) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.startUpdater()
+
+	if t.restored != nil {
+		close(t.restored)
+	}
 }
 
 // startUpdater starts an update goroutine that keeps the clocks updated.
@@ -255,7 +262,10 @@ func (t *Timekeeper) ResumeUpdates() {
 // GetTime returns the current time in nanoseconds.
 func (t *Timekeeper) GetTime(c sentrytime.ClockID) (int64, error) {
 	if t.clocks == nil {
-		panic("Timekeeper used before initialized with SetClocks")
+		if t.restored == nil {
+			panic("Timekeeper used before initialized with SetClocks")
+		}
+		<-t.restored
 	}
 	now, err := t.clocks.GetTime(c)
 	if err == nil && c == sentrytime.Monotonic {
@@ -267,4 +277,29 @@ func (t *Timekeeper) GetTime(c sentrytime.ClockID) (int64, error) {
 // BootTime returns the system boot real time.
 func (t *Timekeeper) BootTime() ktime.Time {
 	return t.bootTime
+}
+
+// timekeeperClock is a ktime.Clock that reads time from a
+// kernel.Timekeeper-managed clock.
+//
+// +stateify savable
+type timekeeperClock struct {
+	tk *Timekeeper
+	c  sentrytime.ClockID
+
+	// Implements ktime.Clock.WallTimeUntil.
+	ktime.WallRateClock `state:"nosave"`
+
+	// Implements waiter.Waitable. (We have no ability to detect
+	// discontinuities from external changes to CLOCK_REALTIME).
+	ktime.NoClockEvents `state:"nosave"`
+}
+
+// Now implements ktime.Clock.Now.
+func (tc *timekeeperClock) Now() ktime.Time {
+	now, err := tc.tk.GetTime(tc.c)
+	if err != nil {
+		panic(fmt.Sprintf("timekeeperClock(ClockID=%v)).Now: %v", tc.c, err))
+	}
+	return ktime.FromNanoseconds(now)
 }

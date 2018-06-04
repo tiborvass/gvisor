@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,11 +19,14 @@ import (
 	"fmt"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/proc/seqfile"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 )
 
 // statData backs /proc/stat.
+//
+// +stateify savable
 type statData struct {
 	// k is the owning Kernel.
 	k *kernel.Kernel
@@ -73,7 +76,7 @@ func (c cpuStats) String() string {
 }
 
 // ReadSeqFileData implements seqfile.SeqSource.ReadSeqFileData.
-func (s *statData) ReadSeqFileData(h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
+func (s *statData) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
 	if h != nil {
 		return nil, 0
 	}

@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package linux
 import (
 	"syscall"
 
+	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/kdefs"
@@ -26,7 +27,7 @@ import (
 
 // pipe2 implements the actual system call with flags.
 func pipe2(t *kernel.Task, addr usermem.Addr, flags uint) (uintptr, error) {
-	if flags&^(syscall.O_NONBLOCK|syscall.O_CLOEXEC) != 0 {
+	if flags&^(linux.O_NONBLOCK|linux.O_CLOEXEC) != 0 {
 		return 0, syscall.EINVAL
 	}
 	r, w := pipe.NewConnectedPipe(t, pipe.DefaultPipeSize, usermem.PageSize)
@@ -38,14 +39,14 @@ func pipe2(t *kernel.Task, addr usermem.Addr, flags uint) (uintptr, error) {
 	defer w.DecRef()
 
 	rfd, err := t.FDMap().NewFDFrom(0, r, kernel.FDFlags{
-		CloseOnExec: flags&syscall.O_CLOEXEC != 0},
+		CloseOnExec: flags&linux.O_CLOEXEC != 0},
 		t.ThreadGroup().Limits())
 	if err != nil {
 		return 0, err
 	}
 
 	wfd, err := t.FDMap().NewFDFrom(0, w, kernel.FDFlags{
-		CloseOnExec: flags&syscall.O_CLOEXEC != 0},
+		CloseOnExec: flags&linux.O_CLOEXEC != 0},
 		t.ThreadGroup().Limits())
 	if err != nil {
 		t.FDMap().Remove(rfd)

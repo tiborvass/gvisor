@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,6 +25,8 @@ import (
 // FSContext contains filesystem context.
 //
 // This includes umask and working directory.
+//
+// +stateify savable
 type FSContext struct {
 	refs.AtomicRefCount
 
@@ -66,6 +68,11 @@ func newFSContext(root, cwd *fs.Dirent, umask uint) *FSContext {
 // (that return nil).  This is because valid references may still be held via
 // proc files or other mechanisms.
 func (f *FSContext) destroy() {
+	// Hold f.mu so that we don't race with RootDirectory() and
+	// WorkingDirectory().
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	f.root.DecRef()
 	f.root = nil
 
@@ -94,9 +101,9 @@ func (f *FSContext) Fork() *FSContext {
 }
 
 // WorkingDirectory returns the current working directory.
-// You should call DecRef on the returned Dirent when finished.
 //
-// This will return nil if called after destroy().
+// This will return nil if called after destroy(), otherwise it will return a
+// Dirent with a reference taken.
 func (f *FSContext) WorkingDirectory() *fs.Dirent {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -114,11 +121,14 @@ func (f *FSContext) SetWorkingDirectory(d *fs.Dirent) {
 	if d == nil {
 		panic("FSContext.SetWorkingDirectory called with nil dirent")
 	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.cwd == nil {
 		panic(fmt.Sprintf("FSContext.SetWorkingDirectory(%v)) called after destroy", d))
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
+
 	old := f.cwd
 	f.cwd = d
 	d.IncRef()
@@ -126,13 +136,15 @@ func (f *FSContext) SetWorkingDirectory(d *fs.Dirent) {
 }
 
 // RootDirectory returns the current filesystem root.
-// You should call DecRef on the returned Dirent when finished.
 //
-// This will return nil if called after destroy().
+// This will return nil if called after destroy(), otherwise it will return a
+// Dirent with a reference taken.
 func (f *FSContext) RootDirectory() *fs.Dirent {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.root.IncRef()
+	if f.root != nil {
+		f.root.IncRef()
+	}
 	return f.root
 }
 
@@ -144,11 +156,14 @@ func (f *FSContext) SetRootDirectory(d *fs.Dirent) {
 	if d == nil {
 		panic("FSContext.SetRootDirectory called with nil dirent")
 	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.root == nil {
 		panic(fmt.Sprintf("FSContext.SetRootDirectory(%v)) called after destroy", d))
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
+
 	old := f.root
 	f.root = d
 	d.IncRef()

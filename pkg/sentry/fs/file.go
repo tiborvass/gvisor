@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package fs
 
 import (
 	"math"
+	"sync"
 	"sync/atomic"
 
 	"gvisor.googlesource.com/gvisor/pkg/amutex"
@@ -46,6 +47,8 @@ const FileMaxOffset = math.MaxInt64
 // and write(2).
 //
 // FIXME: Split synchronization from cancellation.
+//
+// +stateify savable
 type File struct {
 	refs.AtomicRefCount
 
@@ -72,9 +75,18 @@ type File struct {
 	// other files via the Dirent cache.
 	Dirent *Dirent
 
+	// flagsMu protects flags and async below.
+	flagsMu sync.Mutex `state:"nosave"`
+
 	// flags are the File's flags. Setting or getting flags is fully atomic
 	// and is not protected by mu (below).
-	flags atomic.Value `state:".(FileFlags)"`
+	flags FileFlags
+
+	// async handles O_ASYNC notifications.
+	async FileAsync
+
+	// saving indicates that this file is in the process of being saved.
+	saving bool `state:"nosave"`
 
 	// mu is dual-purpose: first, to make read(2) and write(2) thread-safe
 	// in conformity with POSIX, and second, to cancel operations before they
@@ -82,7 +94,7 @@ type File struct {
 	mu amutex.AbortableMutex `state:"nosave"`
 
 	// FileOperations implements file system specific behavior for this File.
-	FileOperations FileOperations
+	FileOperations FileOperations `state:"wait"`
 
 	// offset is the File's offset. Updating offset is protected by mu but
 	// can be read atomically via File.Offset() outside of mu.
@@ -99,8 +111,8 @@ func NewFile(ctx context.Context, dirent *Dirent, flags FileFlags, fops FileOper
 		UniqueID:       uniqueid.GlobalFromContext(ctx),
 		Dirent:         dirent,
 		FileOperations: fops,
+		flags:          flags,
 	}
-	f.flags.Store(flags)
 	f.mu.Init()
 	return f
 }
@@ -117,22 +129,45 @@ func (f *File) DecRef() {
 
 		// Release a reference on the Dirent.
 		f.Dirent.DecRef()
+
+		// Only unregister if we are currently registered. There is nothing
+		// to register if f.async is nil (this happens when async mode is
+		// enabled without setting an owner). Also, we unregister during
+		// save.
+		f.flagsMu.Lock()
+		if !f.saving && f.flags.Async && f.async != nil {
+			f.async.Unregister(f)
+		}
+		f.async = nil
+		f.flagsMu.Unlock()
 	})
 }
 
 // Flags atomically loads the File's flags.
 func (f *File) Flags() FileFlags {
-	return f.flags.Load().(FileFlags)
+	f.flagsMu.Lock()
+	flags := f.flags
+	f.flagsMu.Unlock()
+	return flags
 }
 
 // SetFlags atomically changes the File's flags to the values contained
 // in newFlags. See SettableFileFlags for values that can be set.
 func (f *File) SetFlags(newFlags SettableFileFlags) {
-	flags := f.flags.Load().(FileFlags)
-	flags.Direct = newFlags.Direct
-	flags.NonBlocking = newFlags.NonBlocking
-	flags.Append = newFlags.Append
-	f.flags.Store(flags)
+	f.flagsMu.Lock()
+	f.flags.Direct = newFlags.Direct
+	f.flags.NonBlocking = newFlags.NonBlocking
+	f.flags.Append = newFlags.Append
+	if f.async != nil {
+		if newFlags.Async && !f.flags.Async {
+			f.async.Register(f)
+		}
+		if !newFlags.Async && f.flags.Async {
+			f.async.Unregister(f)
+		}
+	}
+	f.flags.Async = newFlags.Async
+	f.flagsMu.Unlock()
 }
 
 // Offset atomically loads the File's offset.
@@ -359,6 +394,27 @@ func (f *File) InodeID() uint64 {
 // Msync implements memmap.MappingIdentity.Msync.
 func (f *File) Msync(ctx context.Context, mr memmap.MappableRange) error {
 	return f.Fsync(ctx, int64(mr.Start), int64(mr.End-1), SyncData)
+}
+
+// A FileAsync sends signals to its owner when w is ready for IO.
+type FileAsync interface {
+	Register(w waiter.Waitable)
+	Unregister(w waiter.Waitable)
+}
+
+// Async gets the stored FileAsync or creates a new one with the supplied
+// function. If the supplied function is nil, no FileAsync is created and the
+// current value is returned.
+func (f *File) Async(newAsync func() FileAsync) FileAsync {
+	f.flagsMu.Lock()
+	defer f.flagsMu.Unlock()
+	if f.async == nil && newAsync != nil {
+		f.async = newAsync()
+		if f.flags.Async {
+			f.async.Register(f)
+		}
+	}
+	return f.async
 }
 
 // FileReader implements io.Reader and io.ReaderAt.

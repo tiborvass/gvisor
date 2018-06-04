@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 package netlink
 
 import (
+	"math"
 	"sync"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
@@ -30,17 +31,27 @@ import (
 	ktime "gvisor.googlesource.com/gvisor/pkg/sentry/kernel/time"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/socket"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/netlink/port"
-	sunix "gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserr"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip"
-	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 	"gvisor.googlesource.com/gvisor/pkg/waiter"
 )
 
-// defaultSendBufferSize is the default size for the send buffer.
-const defaultSendBufferSize = 16 * 1024
+const sizeOfInt32 int = 4
+
+const (
+	// minBufferSize is the smallest size of a send buffer.
+	minSendBufferSize = 4 << 10 // 4096 bytes.
+
+	// defaultSendBufferSize is the default size for the send buffer.
+	defaultSendBufferSize = 16 * 1024
+
+	// maxBufferSize is the largest size a send buffer can grow to.
+	maxSendBufferSize = 4 << 20 // 4MB
+)
 
 // netlinkSocketDevice is the netlink socket virtual device.
 var netlinkSocketDevice = device.NewAnonDevice()
@@ -51,13 +62,15 @@ var netlinkSocketDevice = device.NewAnonDevice()
 // to/from the kernel.
 //
 // Socket implements socket.Socket.
+//
+// +stateify savable
 type Socket struct {
-	socket.ReceiveTimeout
-	fsutil.PipeSeek      `state:"nosave"`
-	fsutil.NotDirReaddir `state:"nosave"`
-	fsutil.NoFsync       `state:"nosave"`
-	fsutil.NoopFlush     `state:"nosave"`
-	fsutil.NoMMap        `state:"nosave"`
+	fsutil.FilePipeSeek      `state:"nosave"`
+	fsutil.FileNotDirReaddir `state:"nosave"`
+	fsutil.FileNoFsync       `state:"nosave"`
+	fsutil.FileNoopFlush     `state:"nosave"`
+	fsutil.FileNoMMap        `state:"nosave"`
+	socket.SendReceiveTimeout
 
 	// ports provides netlink port allocation.
 	ports *port.Manager
@@ -67,11 +80,11 @@ type Socket struct {
 
 	// ep is a datagram unix endpoint used to buffer messages sent from the
 	// kernel to userspace. RecvMsg reads messages from this endpoint.
-	ep unix.Endpoint
+	ep transport.Endpoint
 
 	// connection is the kernel's connection to ep, used to write messages
 	// sent to userspace.
-	connection unix.ConnectedEndpoint
+	connection transport.ConnectedEndpoint
 
 	// mu protects the fields below.
 	mu sync.Mutex `state:"nosave"`
@@ -84,7 +97,7 @@ type Socket struct {
 
 	// sendBufferSize is the send buffer "size". We don't actually have a
 	// fixed buffer but only consume this many bytes.
-	sendBufferSize uint64
+	sendBufferSize uint32
 }
 
 var _ socket.Socket = (*Socket)(nil)
@@ -92,20 +105,20 @@ var _ socket.Socket = (*Socket)(nil)
 // NewSocket creates a new Socket.
 func NewSocket(t *kernel.Task, protocol Protocol) (*Socket, *syserr.Error) {
 	// Datagram endpoint used to buffer kernel -> user messages.
-	ep := unix.NewConnectionless()
+	ep := transport.NewConnectionless()
 
 	// Bind the endpoint for good measure so we can connect to it. The
 	// bound address will never be exposed.
-	if terr := ep.Bind(tcpip.FullAddress{Addr: "dummy"}, nil); terr != nil {
+	if err := ep.Bind(tcpip.FullAddress{Addr: "dummy"}, nil); err != nil {
 		ep.Close()
-		return nil, syserr.TranslateNetstackError(terr)
+		return nil, err
 	}
 
 	// Create a connection from which the kernel can write messages.
-	connection, terr := ep.(unix.BoundEndpoint).UnidirectionalConnect()
-	if terr != nil {
+	connection, err := ep.(transport.BoundEndpoint).UnidirectionalConnect()
+	if err != nil {
 		ep.Close()
-		return nil, syserr.TranslateNetstackError(terr)
+		return nil, err
 	}
 
 	return &Socket{
@@ -271,13 +284,87 @@ func (s *Socket) Shutdown(t *kernel.Task, how int) *syserr.Error {
 
 // GetSockOpt implements socket.Socket.GetSockOpt.
 func (s *Socket) GetSockOpt(t *kernel.Task, level int, name int, outLen int) (interface{}, *syserr.Error) {
-	// TODO: no sockopts supported.
+	switch level {
+	case linux.SOL_SOCKET:
+		switch name {
+		case linux.SO_SNDBUF:
+			if outLen < sizeOfInt32 {
+				return nil, syserr.ErrInvalidArgument
+			}
+			return int32(s.sendBufferSize), nil
+
+		case linux.SO_RCVBUF:
+			if outLen < sizeOfInt32 {
+				return nil, syserr.ErrInvalidArgument
+			}
+			// We don't have limit on receiving size.
+			return int32(math.MaxInt32), nil
+
+		default:
+			socket.GetSockOptEmitUnimplementedEvent(t, name)
+		}
+	case linux.SOL_NETLINK:
+		switch name {
+		case linux.NETLINK_BROADCAST_ERROR,
+			linux.NETLINK_CAP_ACK,
+			linux.NETLINK_DUMP_STRICT_CHK,
+			linux.NETLINK_EXT_ACK,
+			linux.NETLINK_LIST_MEMBERSHIPS,
+			linux.NETLINK_NO_ENOBUFS,
+			linux.NETLINK_PKTINFO:
+
+			t.Kernel().EmitUnimplementedEvent(t)
+		}
+	}
+	// TODO: other sockopts are not supported.
 	return nil, syserr.ErrProtocolNotAvailable
 }
 
 // SetSockOpt implements socket.Socket.SetSockOpt.
 func (s *Socket) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *syserr.Error {
-	// TODO: no sockopts supported.
+	switch level {
+	case linux.SOL_SOCKET:
+		switch name {
+		case linux.SO_SNDBUF:
+			if len(opt) < sizeOfInt32 {
+				return syserr.ErrInvalidArgument
+			}
+			size := usermem.ByteOrder.Uint32(opt)
+			if size < minSendBufferSize {
+				size = minSendBufferSize
+			} else if size > maxSendBufferSize {
+				size = maxSendBufferSize
+			}
+			s.sendBufferSize = size
+			return nil
+		case linux.SO_RCVBUF:
+			if len(opt) < sizeOfInt32 {
+				return syserr.ErrInvalidArgument
+			}
+			// We don't have limit on receiving size. So just accept anything as
+			// valid for compatibility.
+			return nil
+		default:
+			socket.SetSockOptEmitUnimplementedEvent(t, name)
+		}
+
+	case linux.SOL_NETLINK:
+		switch name {
+		case linux.NETLINK_ADD_MEMBERSHIP,
+			linux.NETLINK_BROADCAST_ERROR,
+			linux.NETLINK_CAP_ACK,
+			linux.NETLINK_DROP_MEMBERSHIP,
+			linux.NETLINK_DUMP_STRICT_CHK,
+			linux.NETLINK_EXT_ACK,
+			linux.NETLINK_LISTEN_ALL_NSID,
+			linux.NETLINK_NO_ENOBUFS,
+			linux.NETLINK_PKTINFO:
+
+			t.Kernel().EmitUnimplementedEvent(t)
+		}
+
+	}
+	// TODO: other sockopts are not supported.
 	return syserr.ErrProtocolNotAvailable
 }
 
@@ -314,7 +401,7 @@ func (s *Socket) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, have
 
 	trunc := flags&linux.MSG_TRUNC != 0
 
-	r := sunix.EndpointReader{
+	r := unix.EndpointReader{
 		Endpoint: s.ep,
 		Peek:     flags&linux.MSG_PEEK != 0,
 	}
@@ -354,7 +441,7 @@ func (s *Socket) Read(ctx context.Context, _ *fs.File, dst usermem.IOSequence, _
 	if dst.NumBytes() == 0 {
 		return 0, nil
 	}
-	return dst.CopyOutFrom(ctx, &sunix.EndpointReader{
+	return dst.CopyOutFrom(ctx, &unix.EndpointReader{
 		Endpoint: s.ep,
 	})
 }
@@ -370,11 +457,11 @@ func (s *Socket) sendResponse(ctx context.Context, ms *MessageSet) *syserr.Error
 	if len(bufs) > 0 {
 		// RecvMsg never receives the address, so we don't need to send
 		// one.
-		_, notify, terr := s.connection.Send(bufs, unix.ControlMessages{}, tcpip.FullAddress{})
+		_, notify, err := s.connection.Send(bufs, transport.ControlMessages{}, tcpip.FullAddress{})
 		// If the buffer is full, we simply drop messages, just like
 		// Linux.
-		if terr != nil && terr != tcpip.ErrWouldBlock {
-			return syserr.TranslateNetstackError(terr)
+		if err != nil && err != syserr.ErrWouldBlock {
+			return err
 		}
 		if notify {
 			s.connection.SendNotify()
@@ -394,9 +481,9 @@ func (s *Socket) sendResponse(ctx context.Context, ms *MessageSet) *syserr.Error
 			PortID: uint32(ms.PortID),
 		})
 
-		_, notify, terr := s.connection.Send([][]byte{m.Finalize()}, unix.ControlMessages{}, tcpip.FullAddress{})
-		if terr != nil && terr != tcpip.ErrWouldBlock {
-			return syserr.TranslateNetstackError(terr)
+		_, notify, err := s.connection.Send([][]byte{m.Finalize()}, transport.ControlMessages{}, tcpip.FullAddress{})
+		if err != nil && err != syserr.ErrWouldBlock {
+			return err
 		}
 		if notify {
 			s.connection.SendNotify()
@@ -487,7 +574,7 @@ func (s *Socket) sendMsg(ctx context.Context, src usermem.IOSequence, to []byte,
 
 	// For simplicity, and consistency with Linux, we copy in the entire
 	// message up front.
-	if uint64(src.NumBytes()) > s.sendBufferSize {
+	if src.NumBytes() > int64(s.sendBufferSize) {
 		return 0, syserr.ErrMessageTooLong
 	}
 
@@ -506,7 +593,7 @@ func (s *Socket) sendMsg(ctx context.Context, src usermem.IOSequence, to []byte,
 }
 
 // SendMsg implements socket.Socket.SendMsg.
-func (s *Socket) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, controlMessages socket.ControlMessages) (int, *syserr.Error) {
+func (s *Socket) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, haveDeadline bool, deadline ktime.Time, controlMessages socket.ControlMessages) (int, *syserr.Error) {
 	return s.sendMsg(t, src, to, flags, controlMessages)
 }
 

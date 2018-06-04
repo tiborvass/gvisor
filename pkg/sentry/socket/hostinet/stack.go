@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -84,11 +84,13 @@ func (s *Stack) Configure() error {
 		log.Warningf("Failed to read TCP send buffer size, using default values")
 	}
 
-	s.tcpSACKEnabled = false
+	// SACK is important for performance and even compatibility, assume it's
+	// enabled if we can't find the actual value.
+	s.tcpSACKEnabled = true
 	if sack, err := ioutil.ReadFile("/proc/sys/net/ipv4/tcp_sack"); err == nil {
 		s.tcpSACKEnabled = strings.TrimSpace(string(sack)) != "0"
 	} else {
-		log.Warningf("Failed to read if TCP SACK if enabled, setting to false")
+		log.Warningf("Failed to read if TCP SACK if enabled, setting to true")
 	}
 
 	return nil

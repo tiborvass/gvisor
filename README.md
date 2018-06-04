@@ -1,10 +1,11 @@
 # gVisor
 
 gVisor is a user-space kernel, written in Go, that implements a substantial
-portion of the Linux system surface. It includes an [Open Container Initiative
-(OCI)][oci] runtime called `runsc` that provides an isolation boundary between
-the application and the host kernel. The `runsc` runtime integrates with Docker
-and Kubernetes, making it simple to run sandboxed containers.
+portion of the Linux system surface. It includes an
+[Open Container Initiative (OCI)][oci] runtime called `runsc` that provides an
+isolation boundary between the application and the host kernel. The `runsc`
+runtime integrates with Docker and Kubernetes, making it simple to run sandboxed
+containers.
 
 gVisor takes a distinct approach to container sandboxing and makes a different
 set of technical trade-offs compared to existing sandbox technologies, thus
@@ -51,11 +52,11 @@ require a larger resource footprint and slower start-up times.
 [AppArmor][apparmor], allows the specification of a fine-grained security policy
 for an application or container. These schemes typically rely on hooks
 implemented inside the host kernel to enforce the rules. If the surface can be
-made small enough (i.e. a sufficiently complete policy defined), then this is
-an excellent way to sandbox applications and maintain native performance.
-However, in practice it can be extremely difficult (if not impossible) to
-reliably define a policy for arbitrary, previously unknown applications,
-making this approach challenging to apply universally.
+made small enough (i.e. a sufficiently complete policy defined), then this is an
+excellent way to sandbox applications and maintain native performance. However,
+in practice it can be extremely difficult (if not impossible) to reliably define
+a policy for arbitrary, previously unknown applications, making this approach
+challenging to apply universally.
 
 ![Rule-based execution](g3doc/Rule-Based-Execution.png "Rule-based execution")
 
@@ -109,9 +110,9 @@ application to directly control the system calls it makes.
 In order to provide defense-in-depth and limit the host system surface, the
 gVisor container runtime is normally split into two separate processes. First,
 the *Sentry* process includes the kernel and is responsible for executing user
-code and handling system calls. Second, file system operations that extend beyond
-the sandbox (not internal proc or tmp files, pipes, etc.) are sent to a proxy,
-called a *Gofer*, via a 9P connection.
+code and handling system calls. Second, file system operations that extend
+beyond the sandbox (not internal proc or tmp files, pipes, etc.) are sent to a
+proxy, called a *Gofer*, via a 9P connection.
 
 ![Sentry](g3doc/Sentry-Gofer.png "Sentry and Gofer")
 
@@ -138,17 +139,17 @@ isolation (see below).
 The Sentry requires a *platform* to implement basic context switching and memory
 mapping functionality. Today, gVisor supports two platforms:
 
-* The **Ptrace** platform uses SYSEMU functionality to execute user code without
-  executing host system calls. This platform can run anywhere that `ptrace`
-  works (even VMs without nested virtualization).
+*   The **Ptrace** platform uses SYSEMU functionality to execute user code
+    without executing host system calls. This platform can run anywhere that
+    `ptrace` works (even VMs without nested virtualization).
 
-* The **KVM** platform (experimental) allows the Sentry to act as both guest OS
-  and VMM, switching back and forth between the two worlds seamlessly. The KVM
-  platform can run on bare-metal or on a VM with nested virtualization enabled.
-  While there is no virtualized hardware layer -- the sandbox retains a process
-  model -- gVisor leverages virtualization extensions available on modern
-  processors in order to improve isolation and performance of address space
-  switches.
+*   The **KVM** platform (experimental) allows the Sentry to act as both guest
+    OS and VMM, switching back and forth between the two worlds seamlessly. The
+    KVM platform can run on bare-metal or on a VM with nested virtualization
+    enabled. While there is no virtualized hardware layer -- the sandbox retains
+    a process model -- gVisor leverages virtualization extensions available on
+    modern processors in order to improve isolation and performance of address
+    space switches.
 
 ### Performance
 
@@ -168,31 +169,34 @@ Note that gVisor can only run on x86\_64 Linux 3.17+. In addition, gVisor only
 supports x86\_64 binaries inside the sandbox (i.e., it cannot run 32-bit
 binaries).
 
-### Download a Nightly Build
+### Download a Build
 
 The easiest way to get `runsc` is from the
 [latest nightly build][runsc-nightly]. After you download the binary, check it
-against the SHA512 [checksum file][runsc-nightly-sha].
+against the SHA512 [checksum file][runsc-nightly-sha]. Older builds can be found
+here:
+`https://storage.googleapis.com/gvisor/releases/nightly/${yyyy-mm-dd}/runsc` and
+`https://storage.googleapis.com/gvisor/releases/nightly/${yyyy-mm-dd}/runsc.sha512`
 
 **It is important to copy this binary to some place that is accessible to all
-users**, since `runsc` executes itself as user `nobody` to avoid unnecessary
-privileges. The `/usr/local/bin` directory is a good choice.
-
+users, and make is executable to all users**, since `runsc` executes itself as
+user `nobody` to avoid unnecessary privileges. The `/usr/local/bin` directory is
+a good place to put the `runsc` binary.
 
 ```
 wget https://storage.googleapis.com/gvisor/releases/nightly/latest/runsc
 wget https://storage.googleapis.com/gvisor/releases/nightly/latest/runsc.sha512
 sha512sum -c runsc.sha512
-chmod +x runsc
+chmod a+x runsc
 sudo mv runsc /usr/local/bin
 ```
 
-### Configuring Docker
+### Running with Docker
 
-Next, configure Docker to use `runsc` by adding a runtime entry to your Docker
+To use gVisor with Docker you must add `runsc` as a runtime to your Docker
 configuration (`/etc/docker/daemon.json`). You may have to create this file if
-it does not exist. Also, some Docker versions also require you to [specify the
-`storage-driver` field][docker-storage-driver].
+it does not exist. Also, some Docker versions also require you to
+[specify the `storage-driver` field][docker-storage-driver].
 
 In the end, the file should look something like:
 
@@ -206,7 +210,8 @@ In the end, the file should look something like:
 }
 ```
 
-You must restart the Docker daemon after making changes to this file, typically this is done via:
+You must restart the Docker daemon after making changes to this file, typically
+this is done via:
 
 ```
 sudo systemctl restart docker
@@ -224,20 +229,17 @@ Terminal support works too:
 docker run --runtime=runsc -it ubuntu /bin/bash
 ```
 
-### Kubernetes Support (Experimental)
+### Running with Kubernetes
 
-gVisor can run sandboxed containers in a Kubernetes cluster with cri-o, although
-this is not recommended for production environments yet. Follow [these
-instructions][cri-o-k8s] to run [cri-o][cri-o] on a node in a Kubernetes
-cluster. Build `runsc` and put it on the node, and set it as the
-`runtime_untrusted_workload` in `/etc/crio/crio.conf`.
+gVisor can run sandboxed containers in a Kubernetes cluster with Minikube. After
+the gVisor addon is enabled, pods with `io.kubernetes.cri.untrusted-workload`
+set to true will execute with `runsc`. Follow [these instructions][minikube] to
+enable gVisor addon.
 
-Any Pod without the `io.kubernetes.cri-o.TrustedSandbox` annotation (or with the
-annotation set to false) will be run with `runsc`.
-
-Currently, gVisor only supports Pods with a single container (not counting the
-ever-present pause container). Support for multiple containers within a single
-Pod is coming soon.
+You can also setup Kubernetes nodes to run pods in gvisor using the `containerd`
+CRI runtime and the `gvisor-containerd-shim`. Pods with the
+`io.kubernetes.cri.untrusted-workload` annotation will execute with `runsc`. You
+can find instructions [here][gvisor-containerd-shim].
 
 ## Advanced Usage
 
@@ -249,11 +251,11 @@ gVisor currently requires x86\_64 Linux to build.
 
 Make sure the following dependencies are installed:
 
-* [git][git]
-* [Bazel][bazel]
-* [Python][python]
-* [Docker version 17.09.0 or greater][docker]
-* Gold linker (e.g. `binutils-gold` package on Ubuntu)
+*   [git][git]
+*   [Bazel][bazel] 0.18+
+*   [Python][python]
+*   [Docker version 17.09.0 or greater][docker]
+*   Gold linker (e.g. `binutils-gold` package on Ubuntu)
 
 #### Getting the source
 
@@ -272,7 +274,6 @@ Build and install the `runsc` binary.
 bazel build runsc
 sudo cp ./bazel-bin/runsc/linux_amd64_pure_stripped/runsc /usr/local/bin
 ```
-
 
 ### Testing
 
@@ -293,7 +294,7 @@ Docker configuration (`/etc/docker/daemon.json`):
         "runsc": {
             "path": "/usr/local/bin/runsc",
             "runtimeArgs": [
-                "--debug-log-dir=/tmp/runsc",
+                "--debug-log=/tmp/runsc/",
                 "--debug",
                 "--strace"
             ]
@@ -357,52 +358,47 @@ configuration (`/etc/docker/daemon.json`):
 
 Then restart the Docker daemon.
 
+### Checkpoint/Restore
+
+gVisor has the ability to checkpoint a process, save its current state in a
+state file, and restore into a new container using the state file. For more
+information about the checkpoint and restore commands, see the
+[checkpoint/restore readme][checkpoint-restore].
+
 ## FAQ & Known Issues
-
-### What works?
-
-The following applications/images have been tested:
-
-* golang
-* httpd
-* java8
-* jenkins
-* mariadb
-* memcached
-* mongo
-* mysql
-* node
-* php
-* postgres
-* prometheus
-* python
-* redis
-* registry
-* tomcat
-* wordpress
-
-### What doesn't work yet?
-
-The following applications have been tested and may not yet work:
-
-* elasticsearch: Requires unimplemented socket ioctls. See [bug
-  #2](https://github.com/google/gvisor/issues/2).
-* nginx: Requires `ioctl(FIOASYNC)`, but see workaround in [bug
-  #1](https://github.com/google/gvisor/issues/1).
 
 ### Will my container work with gVisor?
 
 gVisor implements a large portion of the Linux surface and while we strive to
 make it broadly compatible, there are (and always will be) unimplemented
 features and bugs. The only real way to know if it will work is to try. If you
-find a container that doesn’t work and there is no known issue, please [file a
-bug][bug] indicating the full command you used to run the image. Providing the
-debug logs is also helpful.
+find a container that doesn’t work and there is no known issue, please
+[file a bug][bug] indicating the full command you used to run the image.
+Providing the debug logs is also helpful.
 
-### When I run my container, docker fails with `flag provided but not defined: -console`
+### What works?
 
-You're using an old version of Docker. Refer to the
-[Requirements](#requirements) section for the minimum version supported.
+The following applications/images have been tested:
+
+*   elasticsearch
+*   golang
+*   httpd
+*   java8
+*   jenkins
+*   mariadb
+*   memcached
+*   mongo
+*   mysql
+*   nginx
+*   node
+*   php
+*   postgres
+*   prometheus
+*   python
+*   redis
+*   registry
+*   tomcat
+*   wordpress
 
 ### My container runs fine with *runc* but fails with *runsc*.
 
@@ -410,7 +406,12 @@ If you’re having problems running a container with `runsc` it’s most likely 
 to a compatibility issue or a missing feature in gVisor. See **Debugging**,
 above.
 
-### I can’t see a file copied with `docker cp` or `kubectl cp`.
+### When I run my container, docker fails with `flag provided but not defined: -console`
+
+You're using an old version of Docker. Refer to the
+[Requirements](#requirements) section for the minimum version supported.
+
+### I can’t see a file copied with `docker cp`.
 
 For performance reasons, gVisor caches directory contents, and therefore it may
 not realize a new file was copied to a given directory. To invalidate the cache
@@ -419,10 +420,13 @@ contents again.
 
 This bug is tracked in [bug #4](https://github.com/google/gvisor/issues/4).
 
+Note that `kubectl cp` works because it does the copy by exec'ing inside the
+sandbox, and thus gVisor cache is aware of the new files and dirs.
+
 ## Technical details
 
-We plan to release a full paper with technical details and will include it
-here when available.
+We plan to release a full paper with technical details and will include it here
+when available.
 
 ## Community
 
@@ -439,14 +443,15 @@ See [Contributing.md](CONTRIBUTING.md).
 [apparmor]: https://wiki.ubuntu.com/AppArmor
 [bazel]: https://bazel.build
 [bug]: https://github.com/google/gvisor/issues
-[cri-o-k8s]: https://github.com/kubernetes-incubator/cri-o/blob/master/kubernetes.md
-[cri-o]: https://github.com/kubernetes-incubator/cri-o
+[checkpoint-restore]: https://gvisor.googlesource.com/gvisor/+/master/g3doc/checkpoint_restore.md
 [docker-storage-driver]: https://docs.docker.com/engine/reference/commandline/dockerd/#daemon-storage-driver
 [docker]: https://www.docker.com
 [git]: https://git-scm.com
+[gvisor-containerd-shim]: https://github.com/google/gvisor-containerd-shim
 [gvisor-security-list]: https://groups.google.com/forum/#!forum/gvisor-security
 [gvisor-users-list]: https://groups.google.com/forum/#!forum/gvisor-users
 [kvm]: https://www.linux-kvm.org
+[minikube]: https://github.com/kubernetes/minikube/blob/master/deploy/addons/gvisor/README.md
 [netstack]: https://github.com/google/netstack
 [oci]: https://www.opencontainers.org
 [python]: https://python.org

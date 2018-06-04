@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,10 +18,13 @@ import (
 	"bytes"
 	"fmt"
 
+	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/proc/seqfile"
 )
 
 // loadavgData backs /proc/loadavg.
+//
+// +stateify savable
 type loadavgData struct{}
 
 // NeedsUpdate implements seqfile.SeqSource.NeedsUpdate.
@@ -29,7 +32,8 @@ func (*loadavgData) NeedsUpdate(generation int64) bool {
 	return true
 }
 
-func (d *loadavgData) ReadSeqFileData(h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
+// ReadSeqFileData implements seqfile.SeqSource.ReadSeqFileData.
+func (d *loadavgData) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]seqfile.SeqData, int64) {
 	if h != nil {
 		return nil, 0
 	}

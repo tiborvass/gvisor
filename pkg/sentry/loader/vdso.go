@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/anon"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/fsutil"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/memmap"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/mm"
@@ -35,20 +36,6 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 	"gvisor.googlesource.com/gvisor/pkg/waiter"
 )
-
-// byteReaderFileOperations implements fs.FileOperations for reading
-// from a []byte source.
-type byteReader struct {
-	fsutil.NoopRelease
-	fsutil.PipeSeek
-	fsutil.NotDirReaddir
-	fsutil.NoFsync
-	fsutil.NoopFlush
-	fsutil.NoMMap
-	fsutil.NoIoctl
-	waiter.AlwaysReady
-	data []byte
-}
 
 type fileContext struct {
 	context.Context
@@ -63,8 +50,40 @@ func (f *fileContext) Value(key interface{}) interface{} {
 	}
 }
 
+// byteReader implements fs.FileOperations for reading from a []byte source.
+type byteReader struct {
+	waiter.AlwaysReady       `state:"nosave"`
+	fsutil.FileNoFsync       `state:"nosave"`
+	fsutil.FileNoIoctl       `state:"nosave"`
+	fsutil.FileNoMMap        `state:"nosave"`
+	fsutil.FileNoopFlush     `state:"nosave"`
+	fsutil.FileNoopRelease   `state:"nosave"`
+	fsutil.FileNotDirReaddir `state:"nosave"`
+	fsutil.FilePipeSeek      `state:"nosave"`
+
+	data []byte
+}
+
+var _ fs.FileOperations = (*byteReader)(nil)
+
+// newByteReaderFile creates a fake file to read data from.
 func newByteReaderFile(data []byte) *fs.File {
-	dirent := fs.NewTransientDirent(nil)
+	// Create a fake inode.
+	inode := fs.NewInode(
+		&fsutil.SimpleFileInode{},
+		fs.NewPseudoMountSource(),
+		fs.StableAttr{
+			Type:      fs.Anonymous,
+			DeviceID:  anon.PseudoDevice.DeviceID(),
+			InodeID:   anon.PseudoDevice.NextIno(),
+			BlockSize: usermem.PageSize,
+		})
+
+	// Use the fake inode to create a fake dirent.
+	dirent := fs.NewTransientDirent(inode)
+	defer dirent.DecRef()
+
+	// Use the fake dirent to make a fake file.
 	flags := fs.FileFlags{Read: true, Pread: true}
 	return fs.NewFile(&fileContext{Context: context.Background()}, dirent, flags, &byteReader{
 		data: data,
@@ -176,6 +195,8 @@ func validateVDSO(ctx context.Context, f *fs.File, size uint64) (elfInfo, error)
 //
 // NOTE: to support multiple architectures or operating systems, this
 // would need to contain a VDSO for each.
+//
+// +stateify savable
 type VDSO struct {
 	// ParamPage is the VDSO parameter page. This page should be updated to
 	// inform the VDSO for timekeeping data.
@@ -202,6 +223,7 @@ func PrepareVDSO(p platform.Platform) (*VDSO, error) {
 	// First make sure the VDSO is valid. vdsoFile does not use ctx, so a
 	// nil context can be passed.
 	info, err := validateVDSO(nil, vdsoFile, uint64(len(vdsoBin)))
+	vdsoFile.DecRef()
 	if err != nil {
 		return nil, err
 	}
@@ -260,12 +282,6 @@ func PrepareVDSO(p platform.Platform) (*VDSO, error) {
 //
 // loadVDSO takes a reference on the VDSO and parameter page FrameRegions.
 func loadVDSO(ctx context.Context, m *mm.MemoryManager, v *VDSO, bin loadedELF) (usermem.Addr, error) {
-	if v == nil {
-		// Should be used only by tests.
-		ctx.Warningf("No VDSO provided, skipping VDSO mapping")
-		return 0, nil
-	}
-
 	if v.os != bin.os {
 		ctx.Warningf("Binary ELF OS %v and VDSO ELF OS %v differ", bin.os, v.os)
 		return 0, syserror.ENOEXEC

@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,27 +36,35 @@ type Mappable interface {
 	// AddMapping notifies the Mappable of a mapping from addresses ar in ms to
 	// offsets [offset, offset+ar.Length()) in this Mappable.
 	//
+	// The writable flag indicates whether the backing data for a Mappable can
+	// be modified through the mapping. Effectively, this means a shared mapping
+	// where Translate may be called with at.Write == true. This is a property
+	// established at mapping creation and must remain constant throughout the
+	// lifetime of the mapping.
+	//
 	// Preconditions: offset+ar.Length() does not overflow.
-	AddMapping(ctx context.Context, ms MappingSpace, ar usermem.AddrRange, offset uint64) error
+	AddMapping(ctx context.Context, ms MappingSpace, ar usermem.AddrRange, offset uint64, writable bool) error
 
 	// RemoveMapping notifies the Mappable of the removal of a mapping from
 	// addresses ar in ms to offsets [offset, offset+ar.Length()) in this
 	// Mappable.
 	//
 	// Preconditions: offset+ar.Length() does not overflow. The removed mapping
-	// must exist.
-	RemoveMapping(ctx context.Context, ms MappingSpace, ar usermem.AddrRange, offset uint64)
+	// must exist. writable must match the corresponding call to AddMapping.
+	RemoveMapping(ctx context.Context, ms MappingSpace, ar usermem.AddrRange, offset uint64, writable bool)
 
 	// CopyMapping notifies the Mappable of an attempt to copy a mapping in ms
 	// from srcAR to dstAR. For most Mappables, this is equivalent to
-	// AddMapping.
+	// AddMapping. Note that it is possible that srcAR.Length() != dstAR.Length(),
+	// and also that srcAR.Length() == 0.
 	//
 	// CopyMapping is only called when a mapping is copied within a given
 	// MappingSpace; it is analogous to Linux's vm_operations_struct::mremap.
 	//
-	// Preconditions: offset+dstAR.Length() does not overflow. The mapping at
-	// srcAR must exist.
-	CopyMapping(ctx context.Context, ms MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64) error
+	// Preconditions: offset+srcAR.Length() and offset+dstAR.Length() do not
+	// overflow. The mapping at srcAR must exist. writable must match the
+	// corresponding call to AddMapping.
+	CopyMapping(ctx context.Context, ms MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64, writable bool) error
 
 	// Translate returns the Mappable's current mappings for at least the range
 	// of offsets specified by required, and at most the range of offsets
@@ -235,6 +243,40 @@ type MappingIdentity interface {
 	Msync(ctx context.Context, mr MappableRange) error
 }
 
+// MLockMode specifies the memory locking behavior of a memory mapping.
+type MLockMode int
+
+// Note that the ordering of MLockModes is significant; see
+// mm.MemoryManager.defMLockMode.
+const (
+	// MLockNone specifies that a mapping has no memory locking behavior.
+	//
+	// This must be the zero value for MLockMode.
+	MLockNone MLockMode = iota
+
+	// MLockEager specifies that a mapping is memory-locked, as by mlock() or
+	// similar. Pages in the mapping should be made, and kept, resident in
+	// physical memory as soon as possible.
+	//
+	// As of this writing, MLockEager does not cause memory-locking to be
+	// requested from the host; it only affects the sentry's memory management
+	// behavior.
+	//
+	// MLockEager is analogous to Linux's VM_LOCKED.
+	MLockEager
+
+	// MLockLazy specifies that a mapping is memory-locked, as by mlock() or
+	// similar. Pages in the mapping should be kept resident in physical memory
+	// once they have been made resident due to e.g. a page fault.
+	//
+	// As of this writing, MLockLazy does not cause memory-locking to be
+	// requested from the host; in fact, it has virtually no effect, except for
+	// interactions between mlocked pages and other syscalls.
+	//
+	// MLockLazy is analogous to Linux's VM_LOCKED | VM_LOCKONFAULT.
+	MLockLazy
+)
+
 // MMapOpts specifies a request to create a memory mapping.
 type MMapOpts struct {
 	// Length is the length of the mapping.
@@ -294,6 +336,9 @@ type MMapOpts struct {
 	// Precommit is true if the platform should eagerly commit resources to the
 	// mapping (see platform.AddressSpace.MapFile).
 	Precommit bool
+
+	// MLockMode specifies the memory locking behavior of the mapping.
+	MLockMode MLockMode
 
 	// Hint is the name used for the mapping in /proc/[pid]/maps. If Hint is
 	// empty, MappingIdentity.MappedName() will be used instead.

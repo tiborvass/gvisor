@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,8 +21,9 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/fsutil"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
+	ktime "gvisor.googlesource.com/gvisor/pkg/sentry/kernel/time"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/memmap"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/platform"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/safemem"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usage"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
@@ -43,15 +44,19 @@ import (
 // include an InvalidatorRegion associated with that reference. When the
 // referenced portion of the file is removed (with Truncate), the associated
 // InvalidatorRegion is invalidated.
+//
+// +stateify savable
 type fileInodeOperations struct {
-	fsutil.DeprecatedFileOperations `state:"nosave"`
-	fsutil.InodeNotDirectory        `state:"nosave"`
-	fsutil.InodeNotSocket           `state:"nosave"`
-	fsutil.InodeNotSymlink          `state:"nosave"`
-	fsutil.NoopWriteOut             `state:"nosave"`
+	fsutil.InodeGenericChecker `state:"nosave"`
+	fsutil.InodeNoopWriteOut   `state:"nosave"`
+	fsutil.InodeNotDirectory   `state:"nosave"`
+	fsutil.InodeNotSocket      `state:"nosave"`
+	fsutil.InodeNotSymlink     `state:"nosave"`
 
-	// platform is used to allocate memory that stores the file's contents.
-	platform platform.Platform
+	fsutil.InodeSimpleExtendedAttributes
+
+	// kernel is used to allocate platform memory that stores the file's contents.
+	kernel *kernel.Kernel
 
 	// memUsage is the default memory usage that will be reported by this file.
 	memUsage usage.MemoryKind
@@ -60,10 +65,10 @@ type fileInodeOperations struct {
 
 	// attr contains the unstable metadata for the file.
 	//
-	// attr is protected by attrMu. attr.Unstable.Size is protected by both
-	// attrMu and dataMu; reading it requires locking either mutex, while
-	// mutating it requires locking both.
-	attr fsutil.InMemoryAttributes
+	// attr is protected by attrMu. attr.Size is protected by both attrMu
+	// and dataMu; reading it requires locking either mutex, while mutating
+	// it requires locking both.
+	attr fs.UnstableAttr
 
 	mapsMu sync.Mutex `state:"nosave"`
 
@@ -81,13 +86,13 @@ type fileInodeOperations struct {
 	data fsutil.FileRangeSet
 }
 
+var _ fs.InodeOperations = (*fileInodeOperations)(nil)
+
 // NewInMemoryFile returns a new file backed by p.Memory().
-func NewInMemoryFile(ctx context.Context, usage usage.MemoryKind, uattr fs.UnstableAttr, p platform.Platform) fs.InodeOperations {
+func NewInMemoryFile(ctx context.Context, usage usage.MemoryKind, uattr fs.UnstableAttr) fs.InodeOperations {
 	return &fileInodeOperations{
-		attr: fsutil.InMemoryAttributes{
-			Unstable: uattr,
-		},
-		platform: p,
+		attr:     uattr,
+		kernel:   kernel.KernelFromContext(ctx),
 		memUsage: usage,
 	}
 }
@@ -96,7 +101,7 @@ func NewInMemoryFile(ctx context.Context, usage usage.MemoryKind, uattr fs.Unsta
 func (f *fileInodeOperations) Release(context.Context) {
 	f.dataMu.Lock()
 	defer f.dataMu.Unlock()
-	f.data.DropAll(f.platform.Memory())
+	f.data.DropAll(f.kernel.Platform.Memory())
 }
 
 // Mappable implements fs.InodeOperations.Mappable.
@@ -119,33 +124,12 @@ func (f *fileInodeOperations) GetFile(ctx context.Context, d *fs.Dirent, flags f
 // UnstableAttr returns unstable attributes of this tmpfs file.
 func (f *fileInodeOperations) UnstableAttr(ctx context.Context, inode *fs.Inode) (fs.UnstableAttr, error) {
 	f.attrMu.Lock()
-	defer f.attrMu.Unlock()
 	f.dataMu.RLock()
-	defer f.dataMu.RUnlock()
-	attr := f.attr.Unstable
+	attr := f.attr
 	attr.Usage = int64(f.data.Span())
+	f.dataMu.RUnlock()
+	f.attrMu.Unlock()
 	return attr, nil
-}
-
-// Getxattr implements fs.InodeOperations.Getxattr.
-func (f *fileInodeOperations) Getxattr(inode *fs.Inode, name string) ([]byte, error) {
-	f.attrMu.Lock()
-	defer f.attrMu.Unlock()
-	return f.attr.Getxattr(name)
-}
-
-// Setxattr implements fs.InodeOperations.Setxattr.
-func (f *fileInodeOperations) Setxattr(inode *fs.Inode, name string, value []byte) error {
-	f.attrMu.Lock()
-	defer f.attrMu.Unlock()
-	return f.attr.Setxattr(name, value)
-}
-
-// Listxattr implements fs.InodeOperations.Listxattr.
-func (f *fileInodeOperations) Listxattr(inode *fs.Inode) (map[string]struct{}, error) {
-	f.attrMu.Lock()
-	defer f.attrMu.Unlock()
-	return f.attr.Listxattr()
 }
 
 // Check implements fs.InodeOperations.Check.
@@ -154,36 +138,42 @@ func (f *fileInodeOperations) Check(ctx context.Context, inode *fs.Inode, p fs.P
 }
 
 // SetPermissions implements fs.InodeOperations.SetPermissions.
-func (f *fileInodeOperations) SetPermissions(ctx context.Context, inode *fs.Inode, p fs.FilePermissions) bool {
+func (f *fileInodeOperations) SetPermissions(ctx context.Context, _ *fs.Inode, p fs.FilePermissions) bool {
 	f.attrMu.Lock()
-	defer f.attrMu.Unlock()
-	return f.attr.SetPermissions(ctx, p)
+	f.attr.SetPermissions(ctx, p)
+	f.attrMu.Unlock()
+	return true
 }
 
 // SetTimestamps implements fs.InodeOperations.SetTimestamps.
-func (f *fileInodeOperations) SetTimestamps(ctx context.Context, inode *fs.Inode, ts fs.TimeSpec) error {
+func (f *fileInodeOperations) SetTimestamps(ctx context.Context, _ *fs.Inode, ts fs.TimeSpec) error {
 	f.attrMu.Lock()
-	defer f.attrMu.Unlock()
-	return f.attr.SetTimestamps(ctx, ts)
+	f.attr.SetTimestamps(ctx, ts)
+	f.attrMu.Unlock()
+	return nil
 }
 
 // SetOwner implements fs.InodeOperations.SetOwner.
-func (f *fileInodeOperations) SetOwner(ctx context.Context, inode *fs.Inode, owner fs.FileOwner) error {
+func (f *fileInodeOperations) SetOwner(ctx context.Context, _ *fs.Inode, owner fs.FileOwner) error {
 	f.attrMu.Lock()
-	defer f.attrMu.Unlock()
-	return f.attr.SetOwner(ctx, owner)
+	f.attr.SetOwner(ctx, owner)
+	f.attrMu.Unlock()
+	return nil
 }
 
 // Truncate implements fs.InodeOperations.Truncate.
-func (f *fileInodeOperations) Truncate(ctx context.Context, inode *fs.Inode, size int64) error {
+func (f *fileInodeOperations) Truncate(ctx context.Context, _ *fs.Inode, size int64) error {
 	f.attrMu.Lock()
 	defer f.attrMu.Unlock()
 
 	f.dataMu.Lock()
-	oldSize := f.attr.Unstable.Size
+	oldSize := f.attr.Size
 	if oldSize != size {
-		f.attr.Unstable.Size = size
-		f.attr.TouchModificationTime(ctx)
+		f.attr.Size = size
+		// Update mtime and ctime.
+		now := ktime.NowFromContext(ctx)
+		f.attr.ModificationTime = now
+		f.attr.StatusChangeTime = now
 	}
 	f.dataMu.Unlock()
 
@@ -210,7 +200,7 @@ func (f *fileInodeOperations) Truncate(ctx context.Context, inode *fs.Inode, siz
 	// and can remove them.
 	f.dataMu.Lock()
 	defer f.dataMu.Unlock()
-	f.data.Truncate(uint64(size), f.platform.Memory())
+	f.data.Truncate(uint64(size), f.kernel.Platform.Memory())
 
 	return nil
 }
@@ -218,21 +208,21 @@ func (f *fileInodeOperations) Truncate(ctx context.Context, inode *fs.Inode, siz
 // AddLink implements fs.InodeOperations.AddLink.
 func (f *fileInodeOperations) AddLink() {
 	f.attrMu.Lock()
-	f.attr.Unstable.Links++
+	f.attr.Links++
 	f.attrMu.Unlock()
 }
 
 // DropLink implements fs.InodeOperations.DropLink.
 func (f *fileInodeOperations) DropLink() {
 	f.attrMu.Lock()
-	f.attr.Unstable.Links--
+	f.attr.Links--
 	f.attrMu.Unlock()
 }
 
 // NotifyStatusChange implements fs.InodeOperations.NotifyStatusChange.
 func (f *fileInodeOperations) NotifyStatusChange(ctx context.Context) {
 	f.attrMu.Lock()
-	f.attr.TouchStatusChangeTime(ctx)
+	f.attr.StatusChangeTime = ktime.NowFromContext(ctx)
 	f.attrMu.Unlock()
 }
 
@@ -262,7 +252,7 @@ func (f *fileInodeOperations) read(ctx context.Context, dst usermem.IOSequence, 
 	// TODO: Separate out f.attr.Size and use atomics instead of
 	// f.dataMu.
 	f.dataMu.RLock()
-	size := f.attr.Unstable.Size
+	size := f.attr.Size
 	f.dataMu.RUnlock()
 	if offset >= size {
 		return 0, io.EOF
@@ -271,7 +261,7 @@ func (f *fileInodeOperations) read(ctx context.Context, dst usermem.IOSequence, 
 	n, err := dst.CopyOutFrom(ctx, &fileReadWriter{f, offset})
 	// Compare Linux's mm/filemap.c:do_generic_file_read() => file_accessed().
 	f.attrMu.Lock()
-	f.attr.TouchAccessTime(ctx)
+	f.attr.AccessTime = ktime.NowFromContext(ctx)
 	f.attrMu.Unlock()
 	return n, err
 }
@@ -285,7 +275,9 @@ func (f *fileInodeOperations) write(ctx context.Context, src usermem.IOSequence,
 	f.attrMu.Lock()
 	defer f.attrMu.Unlock()
 	// Compare Linux's mm/filemap.c:__generic_file_write_iter() => file_update_time().
-	f.attr.TouchModificationTime(ctx)
+	now := ktime.NowFromContext(ctx)
+	f.attr.ModificationTime = now
+	f.attr.StatusChangeTime = now
 	return src.CopyInTo(ctx, &fileReadWriter{f, offset})
 }
 
@@ -300,15 +292,15 @@ func (rw *fileReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 	defer rw.f.dataMu.RUnlock()
 
 	// Compute the range to read.
-	if rw.offset >= rw.f.attr.Unstable.Size {
+	if rw.offset >= rw.f.attr.Size {
 		return 0, io.EOF
 	}
-	end := fs.ReadEndOffset(rw.offset, int64(dsts.NumBytes()), rw.f.attr.Unstable.Size)
+	end := fs.ReadEndOffset(rw.offset, int64(dsts.NumBytes()), rw.f.attr.Size)
 	if end == rw.offset { // dsts.NumBytes() == 0?
 		return 0, nil
 	}
 
-	mem := rw.f.platform.Memory()
+	mem := rw.f.kernel.Platform.Memory()
 	var done uint64
 	seg, gap := rw.f.data.Find(uint64(rw.offset))
 	for rw.offset < end {
@@ -369,12 +361,12 @@ func (rw *fileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, error)
 	defer func() {
 		// If the write ends beyond the file's previous size, it causes the
 		// file to grow.
-		if rw.offset > rw.f.attr.Unstable.Size {
-			rw.f.attr.Unstable.Size = rw.offset
+		if rw.offset > rw.f.attr.Size {
+			rw.f.attr.Size = rw.offset
 		}
 	}()
 
-	mem := rw.f.platform.Memory()
+	mem := rw.f.kernel.Platform.Memory()
 	// Page-aligned mr for when we need to allocate memory. RoundUp can't
 	// overflow since end is an int64.
 	pgstartaddr := usermem.Addr(rw.offset).RoundDown()
@@ -424,23 +416,23 @@ func (rw *fileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, error)
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
-func (f *fileInodeOperations) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) error {
+func (f *fileInodeOperations) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64, writable bool) error {
 	f.mapsMu.Lock()
 	defer f.mapsMu.Unlock()
-	f.mappings.AddMapping(ms, ar, offset)
+	f.mappings.AddMapping(ms, ar, offset, writable)
 	return nil
 }
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
-func (f *fileInodeOperations) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) {
+func (f *fileInodeOperations) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64, writable bool) {
 	f.mapsMu.Lock()
 	defer f.mapsMu.Unlock()
-	f.mappings.RemoveMapping(ms, ar, offset)
+	f.mappings.RemoveMapping(ms, ar, offset, writable)
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
-func (f *fileInodeOperations) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64) error {
-	return f.AddMapping(ctx, ms, dstAR, offset)
+func (f *fileInodeOperations) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64, writable bool) error {
+	return f.AddMapping(ctx, ms, dstAR, offset, writable)
 }
 
 // Translate implements memmap.Mappable.Translate.
@@ -448,19 +440,22 @@ func (f *fileInodeOperations) Translate(ctx context.Context, required, optional 
 	f.dataMu.Lock()
 	defer f.dataMu.Unlock()
 
-	// Constrain translations to f.attr.Unstable.Size (rounded up) to prevent
+	// Constrain translations to f.attr.Size (rounded up) to prevent
 	// translation to pages that may be concurrently truncated.
-	pgend := fs.OffsetPageEnd(f.attr.Unstable.Size)
-	var buserr error
+	pgend := fs.OffsetPageEnd(f.attr.Size)
+	var beyondEOF bool
 	if required.End > pgend {
-		buserr = &memmap.BusError{io.EOF}
+		if required.Start >= pgend {
+			return nil, &memmap.BusError{io.EOF}
+		}
+		beyondEOF = true
 		required.End = pgend
 	}
 	if optional.End > pgend {
 		optional.End = pgend
 	}
 
-	mem := f.platform.Memory()
+	mem := f.kernel.Platform.Memory()
 	cerr := f.data.Fill(ctx, required, optional, mem, f.memUsage, func(_ context.Context, dsts safemem.BlockSeq, _ uint64) (uint64, error) {
 		// Newly-allocated pages are zeroed, so we don't need to do anything.
 		return dsts.NumBytes(), nil
@@ -481,9 +476,12 @@ func (f *fileInodeOperations) Translate(ctx context.Context, required, optional 
 	// Don't return the error returned by f.data.Fill if it occurred outside of
 	// required.
 	if translatedEnd < required.End && cerr != nil {
-		return ts, cerr
+		return ts, &memmap.BusError{cerr}
 	}
-	return ts, buserr
+	if beyondEOF {
+		return ts, &memmap.BusError{io.EOF}
+	}
+	return ts, nil
 }
 
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.

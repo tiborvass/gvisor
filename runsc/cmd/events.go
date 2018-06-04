@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,11 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"time"
 
-	"context"
 	"flag"
 	"github.com/google/subcommands"
 	"gvisor.googlesource.com/gvisor/pkg/log"
@@ -76,7 +76,7 @@ func (evs *Events) Execute(ctx context.Context, f *flag.FlagSet, args ...interfa
 
 	c, err := container.Load(conf.RootDir, id)
 	if err != nil {
-		Fatalf("error loading sandox: %v", err)
+		Fatalf("loading sandbox: %v", err)
 	}
 
 	// Repeatedly get stats from the container.
@@ -84,13 +84,13 @@ func (evs *Events) Execute(ctx context.Context, f *flag.FlagSet, args ...interfa
 		// Get the event and print it as JSON.
 		ev, err := c.Event()
 		if err != nil {
-			log.Warningf("error getting events for container: %v", err)
+			log.Warningf("Error getting events for container: %v", err)
 		}
 		// err must be preserved because it is used below when breaking
 		// out of the loop.
 		b, err := json.Marshal(ev)
 		if err != nil {
-			log.Warningf("error while marshalling event %v: %v", ev, err)
+			log.Warningf("Error while marshalling event %v: %v", ev, err)
 		} else {
 			os.Stdout.Write(b)
 		}

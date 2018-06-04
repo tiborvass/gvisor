@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package fs
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/ilist"
@@ -33,19 +34,21 @@ import (
 //
 // Lock ordering:
 //   Inotify.mu -> Inode.Watches.mu -> Watch.mu -> Inotify.evMu
+//
+// +stateify savable
 type Inotify struct {
 	// Unique identifier for this inotify instance. We don't just reuse the
 	// inotify fd because fds can be duped. These should not be exposed to the
 	// user, since we may aggressively reuse an id on S/R.
 	id uint64
 
-	// evMu *only* protects the event queue. We need a separate lock because
+	waiter.Queue `state:"nosave"`
+
+	// evMu *only* protects the events list. We need a separate lock because
 	// while queuing events, a watch needs to lock the event queue, and using mu
 	// for that would violate lock ordering since at that point the calling
 	// goroutine already holds Watch.target.Watches.mu.
 	evMu sync.Mutex `state:"nosave"`
-
-	waiter.Queue `state:"nosave"`
 
 	// A list of pending events for this inotify instance. Protected by evMu.
 	events ilist.List
@@ -209,7 +212,6 @@ func (i *Inotify) Ioctl(ctx context.Context, io usermem.IO, args arch.SyscallArg
 
 func (i *Inotify) queueEvent(ev *Event) {
 	i.evMu.Lock()
-	defer i.evMu.Unlock()
 
 	// Check if we should coalesce the event we're about to queue with the last
 	// one currently in the queue. Events are coalesced if they are identical.
@@ -218,11 +220,17 @@ func (i *Inotify) queueEvent(ev *Event) {
 			// "Coalesce" the two events by simply not queuing the new one. We
 			// don't need to raise a waiter.EventIn notification because no new
 			// data is available for reading.
+			i.evMu.Unlock()
 			return
 		}
 	}
 
 	i.events.PushBack(ev)
+
+	// Release mutex before notifying waiters because we don't control what they
+	// can do.
+	i.evMu.Unlock()
+
 	i.Queue.Notify(waiter.EventIn)
 }
 
@@ -279,13 +287,13 @@ func (i *Inotify) AddWatch(target *Dirent, mask uint32) int32 {
 		// same inode. Obtain an extra reference if necessary.
 		existing.Pin(target)
 
+		newmask := mask
 		if mergeMask := mask&linux.IN_MASK_ADD != 0; mergeMask {
 			// "Add (OR) events to watch mask for this pathname if it already
 			// exists (instead of replacing mask)." -- inotify(7)
-			existing.mask |= mask
-		} else {
-			existing.mask = mask
+			newmask |= atomic.LoadUint32(&existing.mask)
 		}
+		atomic.StoreUint32(&existing.mask, newmask)
 		return existing.wd
 	}
 

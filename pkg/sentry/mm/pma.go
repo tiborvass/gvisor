@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -138,6 +138,10 @@ func (mm *MemoryManager) getPMAsLocked(ctx context.Context, vseg vmaIterator, ar
 
 	var cowerr error
 	if opts.breakCOW {
+		if pend.Start() < ar.End {
+			// Adjust ar to reflect missing pmas.
+			ar.End = pend.Start()
+		}
 		var invalidated bool
 		pend, invalidated, cowerr = mm.breakCopyOnWriteLocked(pstart, ar)
 		if pend.Start() <= ar.Start {
@@ -188,6 +192,10 @@ func (mm *MemoryManager) getVecPMAsLocked(ctx context.Context, ars usermem.AddrR
 		if opts.breakCOW {
 			if !pstart.Ok() {
 				pstart = mm.findOrSeekPrevUpperBoundPMA(ar.Start, pend)
+			}
+			if pend.Start() < ar.End {
+				// Adjust ar to reflect missing pmas.
+				ar.End = pend.Start()
 			}
 			pend, _, cowerr = mm.breakCopyOnWriteLocked(pstart, ar)
 		}
@@ -578,10 +586,100 @@ func (mm *MemoryManager) invalidateLocked(ar usermem.AddrRange, invalidatePrivat
 	}
 }
 
+// Pin returns the platform.File ranges currently mapped by addresses in ar in
+// mm, acquiring a reference on the returned ranges which the caller must
+// release by calling Unpin. If not all addresses are mapped, Pin returns a
+// non-nil error. Note that Pin may return both a non-empty slice of
+// PinnedRanges and a non-nil error.
+//
+// Pin does not prevent mapped ranges from changing, making it unsuitable for
+// most I/O. It should only be used in contexts that would use get_user_pages()
+// in the Linux kernel.
+//
+// Preconditions: ar.Length() != 0. ar must be page-aligned.
+func (mm *MemoryManager) Pin(ctx context.Context, ar usermem.AddrRange, at usermem.AccessType, ignorePermissions bool) ([]PinnedRange, error) {
+	if checkInvariants {
+		if !ar.WellFormed() || ar.Length() <= 0 || !ar.IsPageAligned() {
+			panic(fmt.Sprintf("invalid ar: %v", ar))
+		}
+	}
+
+	// Ensure that we have usable vmas.
+	mm.mappingMu.RLock()
+	vseg, vend, verr := mm.getVMAsLocked(ctx, ar, at, ignorePermissions)
+	if vendaddr := vend.Start(); vendaddr < ar.End {
+		if vendaddr <= ar.Start {
+			mm.mappingMu.RUnlock()
+			return nil, verr
+		}
+		ar.End = vendaddr
+	}
+
+	// Ensure that we have usable pmas.
+	mm.activeMu.Lock()
+	pseg, pend, perr := mm.getPMAsLocked(ctx, vseg, ar, pmaOpts{
+		breakCOW: at.Write,
+	})
+	mm.mappingMu.RUnlock()
+	if pendaddr := pend.Start(); pendaddr < ar.End {
+		if pendaddr <= ar.Start {
+			mm.activeMu.Unlock()
+			return nil, perr
+		}
+		ar.End = pendaddr
+	}
+
+	// Gather pmas.
+	var prs []PinnedRange
+	for pseg.Ok() && pseg.Start() < ar.End {
+		psar := pseg.Range().Intersect(ar)
+		f := pseg.ValuePtr().file
+		fr := pseg.fileRangeOf(psar)
+		f.IncRef(fr)
+		prs = append(prs, PinnedRange{
+			Source: psar,
+			File:   f,
+			Offset: fr.Start,
+		})
+		pseg = pseg.NextSegment()
+	}
+	mm.activeMu.Unlock()
+
+	// Return the first error in order of progress through ar.
+	if perr != nil {
+		return prs, perr
+	}
+	return prs, verr
+}
+
+// PinnedRanges are returned by MemoryManager.Pin.
+type PinnedRange struct {
+	// Source is the corresponding range of addresses.
+	Source usermem.AddrRange
+
+	// File is the mapped file.
+	File platform.File
+
+	// Offset is the offset into File at which this PinnedRange begins.
+	Offset uint64
+}
+
+// FileRange returns the platform.File offsets mapped by pr.
+func (pr PinnedRange) FileRange() platform.FileRange {
+	return platform.FileRange{pr.Offset, pr.Offset + uint64(pr.Source.Length())}
+}
+
+// Unpin releases the reference held by prs.
+func Unpin(prs []PinnedRange) {
+	for i := range prs {
+		prs[i].File.DecRef(prs[i].FileRange())
+	}
+}
+
 // movePMAsLocked moves all pmas in oldAR to newAR.
 //
 // Preconditions: mm.activeMu must be locked for writing. oldAR.Length() != 0.
-// oldAR.Length() == newAR.Length(). !oldAR.Overlaps(newAR).
+// oldAR.Length() <= newAR.Length(). !oldAR.Overlaps(newAR).
 // mm.pmas.IsEmptyRange(newAR). oldAR and newAR must be page-aligned.
 func (mm *MemoryManager) movePMAsLocked(oldAR, newAR usermem.AddrRange) {
 	if checkInvariants {
@@ -591,8 +689,8 @@ func (mm *MemoryManager) movePMAsLocked(oldAR, newAR usermem.AddrRange) {
 		if !newAR.WellFormed() || newAR.Length() <= 0 || !newAR.IsPageAligned() {
 			panic(fmt.Sprintf("invalid newAR: %v", newAR))
 		}
-		if oldAR.Length() != newAR.Length() {
-			panic(fmt.Sprintf("old and new address ranges have different lengths: %v, %v", oldAR, newAR))
+		if oldAR.Length() > newAR.Length() {
+			panic(fmt.Sprintf("old address range %v may contain pmas that will not fit in new address range %v", oldAR, newAR))
 		}
 		if oldAR.Overlaps(newAR) {
 			panic(fmt.Sprintf("old and new address ranges overlap: %v, %v", oldAR, newAR))
@@ -612,8 +710,9 @@ func (mm *MemoryManager) movePMAsLocked(oldAR, newAR usermem.AddrRange) {
 			oldAR: pseg.Range(),
 			pma:   pseg.Value(),
 		})
-		mm.removeRSSLocked(pseg.Range())
 		pseg = mm.pmas.Remove(pseg).NextSegment()
+		// No RSS change is needed since we're re-inserting the same pmas
+		// below.
 	}
 
 	off := newAR.Start - oldAR.Start
@@ -621,7 +720,6 @@ func (mm *MemoryManager) movePMAsLocked(oldAR, newAR usermem.AddrRange) {
 	for i := range movedPMAs {
 		mpma := &movedPMAs[i]
 		pmaNewAR := usermem.AddrRange{mpma.oldAR.Start + off, mpma.oldAR.End + off}
-		mm.addRSSLocked(pmaNewAR)
 		pgap = mm.pmas.Insert(pgap, pmaNewAR, mpma.pma).NextGap()
 	}
 

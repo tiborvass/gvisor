@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,15 +17,30 @@ package pipe
 import (
 	"sync"
 
+	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/amutex"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/fsutil"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 )
 
-// inodeOperations wraps fs.InodeOperations operations with common pipe opening semantics.
+// inodeOperations implements fs.InodeOperations for pipes.
+//
+// +stateify savable
 type inodeOperations struct {
-	fs.InodeOperations
+	fsutil.InodeGenericChecker       `state:"nosave"`
+	fsutil.InodeNoExtendedAttributes `state:"nosave"`
+	fsutil.InodeNoopRelease          `state:"nosave"`
+	fsutil.InodeNoopTruncate         `state:"nosave"`
+	fsutil.InodeNoopWriteOut         `state:"nosave"`
+	fsutil.InodeNotDirectory         `state:"nosave"`
+	fsutil.InodeNotMappable          `state:"nosave"`
+	fsutil.InodeNotSocket            `state:"nosave"`
+	fsutil.InodeNotSymlink           `state:"nosave"`
+	fsutil.InodeNotVirtual           `state:"nosave"`
+
+	fsutil.InodeSimpleAttributes
 
 	// mu protects the fields below.
 	mu sync.Mutex `state:"nosave"`
@@ -44,12 +59,15 @@ type inodeOperations struct {
 	wWakeup chan struct{} `state:"nosave"`
 }
 
-// NewInodeOperations creates a new pipe fs.InodeOperations.
-func NewInodeOperations(base fs.InodeOperations, p *Pipe) fs.InodeOperations {
+var _ fs.InodeOperations = (*inodeOperations)(nil)
+
+// NewInodeOperations returns a new fs.InodeOperations for a given pipe.
+func NewInodeOperations(ctx context.Context, perms fs.FilePermissions, p *Pipe) *inodeOperations {
 	return &inodeOperations{
-		InodeOperations: base,
-		p:               p,
+		InodeSimpleAttributes: fsutil.NewInodeSimpleAttributes(ctx, fs.FileOwnerFromContext(ctx), perms, linux.PIPEFS_MAGIC),
+		p:                     p,
 	}
+
 }
 
 // GetFile implements fs.InodeOperations.GetFile. Named pipes have special blocking

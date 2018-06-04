@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,169 +13,209 @@
 // limitations under the License.
 
 // Package pagetables provides a generic implementation of pagetables.
+//
+// The core functions must be safe to call from a nosplit context. Furthermore,
+// this pagetables implementation goes to lengths to ensure that all functions
+// are free from runtime allocation. Calls to NewPTEs/FreePTEs may be made
+// during walks, but these can be cached elsewhere if required.
 package pagetables
 
 import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 )
 
-// Node is a single node within a set of page tables.
-type Node struct {
-	// unalignedData has unaligned data. Unfortunately, we can't really
-	// rely on the allocator to give us what we want here. So we just throw
-	// it at the wall and use the portion that matches. Gross. This may be
-	// changed in the future to use a different allocation mechanism.
-	//
-	// Access must happen via functions found in pagetables_unsafe.go.
-	unalignedData [(2 * usermem.PageSize) - 1]byte
-
-	// physical is the translated address of these entries.
-	//
-	// This is filled in at creation time.
-	physical uintptr
-}
-
 // PageTables is a set of page tables.
 type PageTables struct {
-	// root is the pagetable root.
-	root *Node
+	// Allocator is used to allocate nodes.
+	Allocator Allocator
 
-	// translator is the translator passed at creation.
-	translator Translator
+	// root is the pagetable root.
+	root *PTEs
+
+	// rootPhysical is the cached physical address of the root.
+	//
+	// This is saved only to prevent constant translation.
+	rootPhysical uintptr
 
 	// archPageTables includes architecture-specific features.
 	archPageTables
-
-	// allNodes is a set of nodes indexed by translator address.
-	allNodes map[uintptr]*Node
-}
-
-// Translator translates to guest physical addresses.
-type Translator interface {
-	// TranslateToPhysical translates the given pointer object into a
-	// "physical" address. We do not require that it translates back, the
-	// reverse mapping is maintained internally.
-	TranslateToPhysical(*PTEs) uintptr
 }
 
 // New returns new PageTables.
-func New(t Translator, opts Opts) *PageTables {
-	p := &PageTables{
-		translator: t,
-		allNodes:   make(map[uintptr]*Node),
-	}
-	p.root = p.allocNode()
-	p.init(opts)
+func New(a Allocator) *PageTables {
+	p := new(PageTables)
+	p.Init(a)
 	return p
 }
 
-// New returns a new set of PageTables derived from the given one.
+// Init initializes a set of PageTables.
 //
-// This function should always be preferred to New if there are existing
-// pagetables, as this function preserves architectural constraints relevant to
-// managing multiple sets of pagetables.
-func (p *PageTables) New() *PageTables {
-	np := &PageTables{
-		translator: p.translator,
-		allNodes:   make(map[uintptr]*Node),
+//go:nosplit
+func (p *PageTables) Init(allocator Allocator) {
+	p.Allocator = allocator
+	p.root = p.Allocator.NewPTEs()
+	p.rootPhysical = p.Allocator.PhysicalFor(p.root)
+}
+
+// mapVisitor is used for map.
+type mapVisitor struct {
+	target   uintptr // Input.
+	physical uintptr // Input.
+	opts     MapOpts // Input.
+	prev     bool    // Output.
+}
+
+// visit is used for map.
+//
+//go:nosplit
+func (v *mapVisitor) visit(start uintptr, pte *PTE, align uintptr) {
+	p := v.physical + (start - uintptr(v.target))
+	if pte.Valid() && (pte.Address() != p || pte.Opts() != v.opts) {
+		v.prev = true
 	}
-	np.root = np.allocNode()
-	np.initFrom(&p.archPageTables)
-	return np
+	if p&align != 0 {
+		// We will install entries at a smaller granulaity if we don't
+		// install a valid entry here, however we must zap any existing
+		// entry to ensure this happens.
+		pte.Clear()
+		return
+	}
+	pte.Set(p, v.opts)
 }
 
-// setPageTable sets the given index as a page table.
-func (p *PageTables) setPageTable(n *Node, index int, child *Node) {
-	phys := p.translator.TranslateToPhysical(child.PTEs())
-	p.allNodes[phys] = child
-	pte := &n.PTEs()[index]
-	pte.setPageTable(phys)
-}
+//go:nosplit
+func (*mapVisitor) requiresAlloc() bool { return true }
 
-// clearPageTable clears the given entry.
-func (p *PageTables) clearPageTable(n *Node, index int) {
-	pte := &n.PTEs()[index]
-	physical := pte.Address()
-	pte.Clear()
-	delete(p.allNodes, physical)
-}
-
-// getPageTable returns the page table entry.
-func (p *PageTables) getPageTable(n *Node, index int) *Node {
-	pte := &n.PTEs()[index]
-	physical := pte.Address()
-	child := p.allNodes[physical]
-	return child
-}
+//go:nosplit
+func (*mapVisitor) requiresSplit() bool { return true }
 
 // Map installs a mapping with the given physical address.
 //
 // True is returned iff there was a previous mapping in the range.
 //
-// Precondition: addr & length must be aligned, their sum must not overflow.
+// Precondition: addr & length must be page-aligned, their sum must not overflow.
+//
+//go:nosplit
 func (p *PageTables) Map(addr usermem.Addr, length uintptr, opts MapOpts, physical uintptr) bool {
 	if !opts.AccessType.Any() {
 		return p.Unmap(addr, length)
 	}
-	prev := false
-	end, ok := addr.AddLength(uint64(length))
-	if !ok {
-		panic("pagetables.Map: overflow")
+	w := mapWalker{
+		pageTables: p,
+		visitor: mapVisitor{
+			target:   uintptr(addr),
+			physical: physical,
+			opts:     opts,
+		},
 	}
-	p.iterateRange(uintptr(addr), uintptr(end), true, func(s, e uintptr, pte *PTE, align uintptr) {
-		p := physical + (s - uintptr(addr))
-		prev = prev || (pte.Valid() && (p != pte.Address() || opts != pte.Opts()))
-		if p&align != 0 {
-			// We will install entries at a smaller granulaity if
-			// we don't install a valid entry here, however we must
-			// zap any existing entry to ensure this happens.
-			pte.Clear()
-			return
-		}
-		pte.Set(p, opts)
-	})
-	return prev
+	w.iterateRange(uintptr(addr), uintptr(addr)+length)
+	return w.visitor.prev
+}
+
+// unmapVisitor is used for unmap.
+type unmapVisitor struct {
+	count int
+}
+
+//go:nosplit
+func (*unmapVisitor) requiresAlloc() bool { return false }
+
+//go:nosplit
+func (*unmapVisitor) requiresSplit() bool { return true }
+
+// visit unmaps the given entry.
+//
+//go:nosplit
+func (v *unmapVisitor) visit(start uintptr, pte *PTE, align uintptr) {
+	pte.Clear()
+	v.count++
 }
 
 // Unmap unmaps the given range.
 //
 // True is returned iff there was a previous mapping in the range.
+//
+// Precondition: addr & length must be page-aligned.
+//
+//go:nosplit
 func (p *PageTables) Unmap(addr usermem.Addr, length uintptr) bool {
-	count := 0
-	p.iterateRange(uintptr(addr), uintptr(addr)+length, false, func(s, e uintptr, pte *PTE, align uintptr) {
-		pte.Clear()
-		count++
-	})
-	return count > 0
+	w := unmapWalker{
+		pageTables: p,
+		visitor: unmapVisitor{
+			count: 0,
+		},
+	}
+	w.iterateRange(uintptr(addr), uintptr(addr)+length)
+	return w.visitor.count > 0
 }
 
-// Release releases this address space.
-//
-// This must be called to release the PCID.
-func (p *PageTables) Release() {
-	// Clear all pages.
-	p.Unmap(0, ^uintptr(0))
-	p.release()
+// emptyVisitor is used for emptiness checks.
+type emptyVisitor struct {
+	count int
 }
+
+//go:nosplit
+func (*emptyVisitor) requiresAlloc() bool { return false }
+
+//go:nosplit
+func (*emptyVisitor) requiresSplit() bool { return false }
+
+// visit unmaps the given entry.
+//
+//go:nosplit
+func (v *emptyVisitor) visit(start uintptr, pte *PTE, align uintptr) {
+	v.count++
+}
+
+// IsEmpty checks if the given range is empty.
+//
+// Precondition: addr & length must be page-aligned.
+//
+//go:nosplit
+func (p *PageTables) IsEmpty(addr usermem.Addr, length uintptr) bool {
+	w := emptyWalker{
+		pageTables: p,
+	}
+	w.iterateRange(uintptr(addr), uintptr(addr)+length)
+	return w.visitor.count == 0
+}
+
+// lookupVisitor is used for lookup.
+type lookupVisitor struct {
+	target   uintptr // Input.
+	physical uintptr // Output.
+	opts     MapOpts // Output.
+}
+
+// visit matches the given address.
+//
+//go:nosplit
+func (v *lookupVisitor) visit(start uintptr, pte *PTE, align uintptr) {
+	if !pte.Valid() {
+		return
+	}
+	v.physical = pte.Address() + (start - uintptr(v.target))
+	v.opts = pte.Opts()
+}
+
+//go:nosplit
+func (*lookupVisitor) requiresAlloc() bool { return false }
+
+//go:nosplit
+func (*lookupVisitor) requiresSplit() bool { return false }
 
 // Lookup returns the physical address for the given virtual address.
+//
+//go:nosplit
 func (p *PageTables) Lookup(addr usermem.Addr) (physical uintptr, opts MapOpts) {
 	mask := uintptr(usermem.PageSize - 1)
-	off := uintptr(addr) & mask
-	addr = addr &^ usermem.Addr(mask)
-	p.iterateRange(uintptr(addr), uintptr(addr+usermem.PageSize), false, func(s, e uintptr, pte *PTE, align uintptr) {
-		if !pte.Valid() {
-			return
-		}
-		physical = pte.Address() + (s - uintptr(addr)) + off
-		opts = pte.Opts()
-	})
-	return
-}
-
-// allocNode allocates a new page.
-func (p *PageTables) allocNode() *Node {
-	n := new(Node)
-	n.physical = p.translator.TranslateToPhysical(n.PTEs())
-	return n
+	offset := uintptr(addr) & mask
+	w := lookupWalker{
+		pageTables: p,
+		visitor: lookupVisitor{
+			target: uintptr(addr &^ usermem.Addr(mask)),
+		},
+	}
+	w.iterateRange(uintptr(addr), uintptr(addr)+1)
+	return w.visitor.physical + offset, w.visitor.opts
 }

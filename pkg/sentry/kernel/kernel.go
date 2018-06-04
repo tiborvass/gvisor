@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,11 @@
 // Lock order (outermost locks must be taken first):
 //
 // Kernel.extMu
-//   TaskSet.mu
-//     SignalHandlers.mu
-//       Task.mu
+//   ThreadGroup.timerMu
+//     ktime.Timer.mu (for kernelCPUClockTicker and IntervalTimer)
+//       TaskSet.mu
+//         SignalHandlers.mu
+//           Task.mu
 //
 // Locking SignalHandlers.mu in multiple SignalHandlers requires locking
 // TaskSet.mu exclusively first. Locking Task.mu in multiple Tasks at the same
@@ -29,6 +31,7 @@
 package kernel
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -38,6 +41,7 @@ import (
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/cpuid"
+	"gvisor.googlesource.com/gvisor/pkg/eventchannel"
 	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
@@ -47,6 +51,7 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/inet"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/epoll"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/sched"
 	ktime "gvisor.googlesource.com/gvisor/pkg/sentry/kernel/time"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/limits"
@@ -55,12 +60,17 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/netlink/port"
 	sentrytime "gvisor.googlesource.com/gvisor/pkg/sentry/time"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/unimpl"
+	uspb "gvisor.googlesource.com/gvisor/pkg/sentry/unimpl/unimplemented_syscall_go_proto"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/uniqueid"
 	"gvisor.googlesource.com/gvisor/pkg/state"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip"
 )
 
 // Kernel represents an emulated Linux kernel. It must be initialized by calling
 // Init() or LoadFrom().
+//
+// +stateify savable
 type Kernel struct {
 	// extMu serializes external changes to the Kernel with calls to
 	// Kernel.SaveTo. (Kernel.SaveTo requires that the state of the Kernel
@@ -85,22 +95,28 @@ type Kernel struct {
 	platform.Platform `state:"nosave"`
 
 	// See InitKernelArgs for the meaning of these fields.
-	featureSet        *cpuid.FeatureSet
-	timekeeper        *Timekeeper
-	tasks             *TaskSet
-	rootUserNamespace *auth.UserNamespace
-	networkStack      inet.Stack `state:"nosave"`
-	applicationCores  uint
-	useHostCores      bool
-	extraAuxv         []arch.AuxEntry
-	vdso              *loader.VDSO
-	rootUTSNamespace  *UTSNamespace
-	rootIPCNamespace  *IPCNamespace
+	featureSet                  *cpuid.FeatureSet
+	timekeeper                  *Timekeeper
+	tasks                       *TaskSet
+	rootUserNamespace           *auth.UserNamespace
+	networkStack                inet.Stack `state:"nosave"`
+	applicationCores            uint
+	useHostCores                bool
+	extraAuxv                   []arch.AuxEntry
+	vdso                        *loader.VDSO
+	rootUTSNamespace            *UTSNamespace
+	rootIPCNamespace            *IPCNamespace
+	rootAbstractSocketNamespace *AbstractSocketNamespace
 
 	// mounts holds the state of the virtual filesystem. mounts is initially
 	// nil, and must be set by calling Kernel.SetRootMountNamespace before
 	// Kernel.CreateProcess can succeed.
 	mounts *fs.MountNamespace
+
+	// futexes is the "root" futex.Manager, from which all others are forked.
+	// This is necessary to ensure that shared futexes are coherent across all
+	// tasks, including those created by CreateProcess.
+	futexes *futex.Manager
 
 	// globalInit is the thread group whose leader has ID 1 in the root PID
 	// namespace. globalInit is stored separately so that it is accessible even
@@ -157,7 +173,10 @@ type Kernel struct {
 
 	// exitErr is the error causing the sandbox to exit, if any. It is
 	// protected by extMu.
-	exitErr error
+	exitErr error `state:"nosave"`
+
+	// danglingEndpoints is used to save / restore tcpip.DanglingEndpoints.
+	danglingEndpoints struct{} `state:".([]tcpip.Endpoint)"`
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -193,11 +212,14 @@ type InitKernelArgs struct {
 	// Vdso holds the VDSO and its parameter page.
 	Vdso *loader.VDSO
 
-	// RootUTSNamespace is the root UTS namepsace.
+	// RootUTSNamespace is the root UTS namespace.
 	RootUTSNamespace *UTSNamespace
 
-	// RootIPCNamespace is the root IPC namepsace.
+	// RootIPCNamespace is the root IPC namespace.
 	RootIPCNamespace *IPCNamespace
+
+	// RootAbstractSocketNamespace is the root Abstract Socket namespace.
+	RootAbstractSocketNamespace *AbstractSocketNamespace
 }
 
 // Init initialize the Kernel with no tasks.
@@ -223,6 +245,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.rootUserNamespace = args.RootUserNamespace
 	k.rootUTSNamespace = args.RootUTSNamespace
 	k.rootIPCNamespace = args.RootIPCNamespace
+	k.rootAbstractSocketNamespace = args.RootAbstractSocketNamespace
 	k.networkStack = args.NetworkStack
 	k.applicationCores = args.ApplicationCores
 	if args.UseHostCores {
@@ -241,6 +264,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.vdso = args.Vdso
 	k.realtimeClock = &timekeeperClock{tk: args.Timekeeper, c: sentrytime.Realtime}
 	k.monotonicClock = &timekeeperClock{tk: args.Timekeeper, c: sentrytime.Monotonic}
+	k.futexes = futex.NewManager()
 	k.netlinkPorts = port.New()
 
 	return nil
@@ -324,7 +348,8 @@ func (ts *TaskSet) flushWritesToFiles(ctx context.Context) error {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 	for t := range ts.Root.tids {
-		if fdmap := t.FDMap(); fdmap != nil {
+		// We can skip locking Task.mu here since the kernel is paused.
+		if fdmap := t.fds; fdmap != nil {
 			for _, desc := range fdmap.files {
 				if flags := desc.file.Flags(); !flags.Write {
 					continue
@@ -373,7 +398,8 @@ func (ts *TaskSet) unregisterEpollWaiters() {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 	for t := range ts.Root.tids {
-		if fdmap := t.FDMap(); fdmap != nil {
+		// We can skip locking Task.mu here since the kernel is paused.
+		if fdmap := t.fds; fdmap != nil {
 			for _, desc := range fdmap.files {
 				if desc.file != nil {
 					if e, ok := desc.file.FileOperations.(*epoll.EventPoll); ok {
@@ -421,6 +447,8 @@ func (k *Kernel) LoadFrom(r io.Reader, p platform.Platform, net inet.Stack) erro
 	if err := fs.AsyncErrorBarrier(); err != nil {
 		return err
 	}
+
+	tcpip.AsyncLoading.Wait()
 
 	log.Infof("Overall load took [%s]", time.Since(loadStart))
 
@@ -496,6 +524,20 @@ type CreateProcessArgs struct {
 
 	// IPCNamespace is the initial IPC namespace.
 	IPCNamespace *IPCNamespace
+
+	// AbstractSocketNamespace is the initial Abstract Socket namespace.
+	AbstractSocketNamespace *AbstractSocketNamespace
+
+	// Root optionally contains the dirent that serves as the root for the
+	// process. If nil, the mount namespace's root is used as the process'
+	// root.
+	//
+	// Anyone setting Root must donate a reference (i.e. increment it) to
+	// keep it alive until it is decremented by CreateProcess.
+	Root *fs.Dirent
+
+	// ContainerID is the container that the process belongs to.
+	ContainerID string
 }
 
 // NewContext returns a context.Context that represents the task that will be
@@ -533,10 +575,18 @@ func (ctx *createProcessContext) Value(key interface{}) interface{} {
 	case auth.CtxCredentials:
 		return ctx.args.Credentials
 	case fs.CtxRoot:
-		if ctx.k.mounts == nil {
-			return nil
+		if ctx.args.Root != nil {
+			// Take a refernce on the root dirent that will be
+			// given to the caller.
+			ctx.args.Root.IncRef()
+			return ctx.args.Root
 		}
-		return ctx.k.mounts.Root()
+		if ctx.k.mounts != nil {
+			// MountNamespace.Root() will take a reference on the
+			// root dirent for us.
+			return ctx.k.mounts.Root()
+		}
+		return nil
 	case ktime.CtxRealtimeClock:
 		return ctx.k.RealtimeClock()
 	case limits.CtxLimits:
@@ -545,8 +595,12 @@ func (ctx *createProcessContext) Value(key interface{}) interface{} {
 		return ctx.k
 	case uniqueid.CtxGlobalUniqueID:
 		return ctx.k.UniqueID()
+	case uniqueid.CtxGlobalUniqueIDProvider:
+		return ctx.k
 	case uniqueid.CtxInotifyCookie:
 		return ctx.k.GenerateInotifyCookie()
+	case unimpl.CtxEvents:
+		return ctx.k
 	default:
 		return nil
 	}
@@ -560,29 +614,34 @@ func (ctx *createProcessContext) Value(key interface{}) interface{} {
 //
 // CreateProcess has no analogue in Linux; it is used to create the initial
 // application task, as well as processes started by the control server.
-func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, error) {
+func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, error) {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
 	log.Infof("EXEC: %v", args.Argv)
 
 	if k.mounts == nil {
-		return nil, fmt.Errorf("no kernel MountNamespace")
+		return nil, 0, fmt.Errorf("no kernel MountNamespace")
 	}
 
-	tg := NewThreadGroup(k.tasks.Root, NewSignalHandlers(), linux.SIGCHLD, args.Limits, k.monotonicClock)
+	tg := k.newThreadGroup(k.tasks.Root, NewSignalHandlers(), linux.SIGCHLD, args.Limits, k.monotonicClock)
 	ctx := args.NewContext(k)
 
 	// Grab the root directory.
-	root := fs.RootFromContext(ctx)
+	root := args.Root
+	if root == nil {
+		root = fs.RootFromContext(ctx)
+	}
 	defer root.DecRef()
+	args.Root = nil
 
 	// Grab the working directory.
+	remainingTraversals := uint(args.MaxSymlinkTraversals)
 	wd := root // Default.
 	if args.WorkingDirectory != "" {
 		var err error
-		wd, err = k.mounts.FindInode(ctx, root, nil, args.WorkingDirectory, args.MaxSymlinkTraversals)
+		wd, err = k.mounts.FindInode(ctx, root, nil, args.WorkingDirectory, &remainingTraversals)
 		if err != nil {
-			return nil, fmt.Errorf("failed to find initial working directory %q: %v", args.WorkingDirectory, err)
+			return nil, 0, fmt.Errorf("failed to find initial working directory %q: %v", args.WorkingDirectory, err)
 		}
 		defer wd.DecRef()
 	}
@@ -590,47 +649,53 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, error) {
 	if args.Filename == "" {
 		// Was anything provided?
 		if len(args.Argv) == 0 {
-			return nil, fmt.Errorf("no filename or command provided")
+			return nil, 0, fmt.Errorf("no filename or command provided")
 		}
 		if !filepath.IsAbs(args.Argv[0]) {
-			return nil, fmt.Errorf("'%s' is not an absolute path", args.Argv[0])
+			return nil, 0, fmt.Errorf("'%s' is not an absolute path", args.Argv[0])
 		}
 		args.Filename = args.Argv[0]
 	}
 
 	// Create a fresh task context.
-	tc, err := k.LoadTaskImage(ctx, k.mounts, root, wd, args.MaxSymlinkTraversals, args.Filename, args.Argv, args.Envv, k.featureSet)
-	if err != nil {
-		return nil, err
+	remainingTraversals = uint(args.MaxSymlinkTraversals)
+	tc, se := k.LoadTaskImage(ctx, k.mounts, root, wd, &remainingTraversals, args.Filename, args.Argv, args.Envv, k.featureSet)
+	if se != nil {
+		return nil, 0, errors.New(se.String())
 	}
-	tr := newTaskResources(args.FDMap, newFSContext(root, wd, args.Umask))
-	// NewTask unconditionally takes ownership of tr, so we never have to call
-	// tr.release.
+
+	// Take a reference on the FDMap, which will be transferred to
+	// TaskSet.NewTask().
+	args.FDMap.IncRef()
 
 	// Create the task.
 	config := &TaskConfig{
-		Kernel:         k,
-		ThreadGroup:    tg,
-		TaskContext:    tc,
-		TaskResources:  tr,
-		Credentials:    args.Credentials,
-		UTSNamespace:   args.UTSNamespace,
-		IPCNamespace:   args.IPCNamespace,
-		AllowedCPUMask: sched.NewFullCPUSet(k.applicationCores),
+		Kernel:                  k,
+		ThreadGroup:             tg,
+		TaskContext:             tc,
+		FSContext:               newFSContext(root, wd, args.Umask),
+		FDMap:                   args.FDMap,
+		Credentials:             args.Credentials,
+		AllowedCPUMask:          sched.NewFullCPUSet(k.applicationCores),
+		UTSNamespace:            args.UTSNamespace,
+		IPCNamespace:            args.IPCNamespace,
+		AbstractSocketNamespace: args.AbstractSocketNamespace,
+		ContainerID:             args.ContainerID,
 	}
 	t, err := k.tasks.NewTask(config)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	// Success.
+	tgid := k.tasks.Root.IDOfThreadGroup(tg)
 	if k.started {
 		tid := k.tasks.Root.IDOfTask(t)
 		t.Start(tid)
 	} else if k.globalInit == nil {
 		k.globalInit = tg
 	}
-	return tg, nil
+	return tg, tgid, nil
 }
 
 // Start starts execution of all tasks in k.
@@ -648,7 +713,7 @@ func (k *Kernel) Start() error {
 	}
 
 	k.started = true
-	k.cpuClockTicker = ktime.NewTimer(k.monotonicClock, kernelCPUClockListener{k})
+	k.cpuClockTicker = ktime.NewTimer(k.monotonicClock, newKernelCPUClockTicker(k))
 	k.cpuClockTicker.Swap(ktime.Setting{
 		Enabled: true,
 		Period:  linux.ClockTick,
@@ -684,11 +749,14 @@ func (k *Kernel) pauseTimeLocked() {
 	// mutex, while holding the Timer mutex.)
 	for t := range k.tasks.Root.tids {
 		if t == t.tg.leader {
-			t.tg.tm.pause()
+			t.tg.itimerRealTimer.Pause()
+			for _, it := range t.tg.timers {
+				it.PauseTimer()
+			}
 		}
 		// This means we'll iterate FDMaps shared by multiple tasks repeatedly,
 		// but ktime.Timer.Pause is idempotent so this is harmless.
-		if fdm := t.tr.FDMap; fdm != nil {
+		if fdm := t.fds; fdm != nil {
 			for _, desc := range fdm.files {
 				if tfd, ok := desc.file.FileOperations.(*timerfd.TimerOperations); ok {
 					tfd.PauseTimer()
@@ -713,9 +781,12 @@ func (k *Kernel) resumeTimeLocked() {
 	k.timekeeper.ResumeUpdates()
 	for t := range k.tasks.Root.tids {
 		if t == t.tg.leader {
-			t.tg.tm.resume()
+			t.tg.itimerRealTimer.Resume()
+			for _, it := range t.tg.timers {
+				it.ResumeTimer()
+			}
 		}
-		if fdm := t.tr.FDMap; fdm != nil {
+		if fdm := t.fds; fdm != nil {
 			for _, desc := range fdm.files {
 				if tfd, ok := desc.file.FileOperations.(*timerfd.TimerOperations); ok {
 					tfd.ResumeTimer()
@@ -760,12 +831,55 @@ func (k *Kernel) Unpause() {
 //
 // context is used only for debugging to describe how the signal was received.
 //
-// Returns false if signal could not be sent because the Kernel is not fully
-// initialized yet.
-func (k *Kernel) SendExternalSignal(info *arch.SignalInfo, context string) bool {
+// Preconditions: Kernel must have an init process.
+func (k *Kernel) SendExternalSignal(info *arch.SignalInfo, context string) {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
-	return k.sendExternalSignal(info, context)
+	k.sendExternalSignal(info, context)
+}
+
+// SendContainerSignal sends the given signal to all processes inside the
+// namespace that match the given container ID.
+func (k *Kernel) SendContainerSignal(cid string, info *arch.SignalInfo) error {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	k.tasks.mu.RLock()
+	defer k.tasks.mu.RUnlock()
+
+	var lastErr error
+	for t := range k.tasks.Root.tids {
+		if t == t.tg.leader && t.ContainerID() == cid {
+			t.tg.signalHandlers.mu.Lock()
+			defer t.tg.signalHandlers.mu.Unlock()
+			infoCopy := *info
+			if err := t.sendSignalLocked(&infoCopy, true /*group*/); err != nil {
+				lastErr = err
+			}
+		}
+	}
+	return lastErr
+}
+
+// SendProcessGroupSignal sends a signal to all processes inside the process
+// group. It is analagous to kernel/signal.c:kill_pgrp.
+func (k *Kernel) SendProcessGroupSignal(pg *ProcessGroup, info *arch.SignalInfo) error {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	k.tasks.mu.RLock()
+	defer k.tasks.mu.RUnlock()
+
+	var lastErr error
+	for t := range k.tasks.Root.tids {
+		if t == t.tg.leader && t.tg.ProcessGroup() == pg {
+			t.tg.signalHandlers.mu.Lock()
+			defer t.tg.signalHandlers.mu.Unlock()
+			infoCopy := *info
+			if err := t.sendSignalLocked(&infoCopy, true /*group*/); err != nil {
+				lastErr = err
+			}
+		}
+	}
+	return lastErr
 }
 
 // FeatureSet returns the FeatureSet.
@@ -796,6 +910,11 @@ func (k *Kernel) RootUTSNamespace() *UTSNamespace {
 // RootIPCNamespace returns the root IPCNamespace.
 func (k *Kernel) RootIPCNamespace() *IPCNamespace {
 	return k.rootIPCNamespace
+}
+
+// RootAbstractSocketNamespace returns the root AbstractSocketNamespace.
+func (k *Kernel) RootAbstractSocketNamespace() *AbstractSocketNamespace {
+	return k.rootAbstractSocketNamespace
 }
 
 // RootMountNamespace returns the MountNamespace.
@@ -889,11 +1008,22 @@ func (k *Kernel) SetExitError(err error) {
 	}
 }
 
+var _ tcpip.Clock = (*Kernel)(nil)
+
 // NowNanoseconds implements tcpip.Clock.NowNanoseconds.
 func (k *Kernel) NowNanoseconds() int64 {
 	now, err := k.timekeeper.GetTime(sentrytime.Realtime)
 	if err != nil {
 		panic("Kernel.NowNanoseconds: " + err.Error())
+	}
+	return now
+}
+
+// NowMonotonic implements tcpip.Clock.NowMonotonic.
+func (k *Kernel) NowMonotonic() int64 {
+	now, err := k.timekeeper.GetTime(sentrytime.Monotonic)
+	if err != nil {
+		panic("Kernel.NowMonotonic: " + err.Error())
 	}
 	return now
 }
@@ -909,6 +1039,16 @@ func (k *Kernel) SupervisorContext() context.Context {
 		Logger: log.Log(),
 		k:      k,
 	}
+}
+
+// EmitUnimplementedEvent emits an UnimplementedSyscall event via the event
+// channel.
+func (k *Kernel) EmitUnimplementedEvent(ctx context.Context) {
+	t := TaskFromContext(ctx)
+	eventchannel.Emit(&uspb.UnimplementedSyscall{
+		Tid:       int32(t.ThreadID()),
+		Registers: t.Arch().StateData().Proto(),
+	})
 }
 
 type supervisorContext struct {
@@ -947,22 +1087,13 @@ func (ctx supervisorContext) Value(key interface{}) interface{} {
 		return ctx.k
 	case uniqueid.CtxGlobalUniqueID:
 		return ctx.k.UniqueID()
+	case uniqueid.CtxGlobalUniqueIDProvider:
+		return ctx.k
 	case uniqueid.CtxInotifyCookie:
 		return ctx.k.GenerateInotifyCookie()
+	case unimpl.CtxEvents:
+		return ctx.k
 	default:
 		return nil
 	}
-}
-
-type kernelCPUClockListener struct {
-	k *Kernel
-}
-
-// Notify implements ktime.TimerListener.Notify.
-func (l kernelCPUClockListener) Notify(exp uint64) {
-	atomic.AddUint64(&l.k.cpuClock, exp)
-}
-
-// Destroy implements ktime.TimerListener.Destroy.
-func (l kernelCPUClockListener) Destroy() {
 }

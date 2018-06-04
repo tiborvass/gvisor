@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -78,6 +78,8 @@ var netstackErrorTranslations = map[*tcpip.Error]*Error{
 	tcpip.ErrNoLinkAddress:         ErrHostDown,
 	tcpip.ErrBadAddress:            ErrBadAddress,
 	tcpip.ErrNetworkUnreachable:    ErrNetworkUnreachable,
+	tcpip.ErrMessageTooLong:        ErrMessageTooLong,
+	tcpip.ErrNoBufferSpace:         ErrNoBufferSpace,
 }
 
 // TranslateNetstackError converts an error from the tcpip package to a sentry

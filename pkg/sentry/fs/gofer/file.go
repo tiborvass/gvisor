@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package gofer
 
 import (
+	"fmt"
 	"syscall"
 
 	"gvisor.googlesource.com/gvisor/pkg/log"
@@ -33,8 +34,10 @@ import (
 var openedWX = metric.MustCreateNewUint64Metric("/gofer/opened_write_execute_file", true /* sync */, "Number of times a writable+executable file was opened from a gofer.")
 
 // fileOperations implements fs.FileOperations for a remote file system.
+//
+// +stateify savable
 type fileOperations struct {
-	fsutil.NoIoctl     `state:"nosave"`
+	fsutil.FileNoIoctl `state:"nosave"`
 	waiter.AlwaysReady `state:"nosave"`
 
 	// inodeOperations is the inodeOperations backing the file. It is protected
@@ -57,11 +60,29 @@ type fileOperations struct {
 var _ fs.FileOperations = (*fileOperations)(nil)
 
 // NewFile returns a file. NewFile is not appropriate with host pipes and sockets.
-func NewFile(ctx context.Context, dirent *fs.Dirent, flags fs.FileFlags, i *inodeOperations, handles *handles) *fs.File {
+//
+// The `name` argument is only used to log a warning if we are returning a
+// writeable+executable file. (A metric counter is incremented in this case as
+// well.) Note that we cannot call d.BaseName() directly in this function,
+// because that would lead to a lock order violation, since this is called in
+// d.Create which holds d.mu, while d.BaseName() takes d.parent.mu, and the two
+// locks must be taken in the opposite order.
+func NewFile(ctx context.Context, dirent *fs.Dirent, name string, flags fs.FileFlags, i *inodeOperations, handles *handles) *fs.File {
 	// Remote file systems enforce readability/writability at an offset,
 	// see fs/9p/vfs_inode.c:v9fs_vfs_atomic_open -> fs/open.c:finish_open.
 	flags.Pread = true
 	flags.Pwrite = true
+
+	if fs.IsFile(dirent.Inode.StableAttr) {
+		// If cache policy is "remote revalidating", then we must
+		// ensure that we have a host FD. Otherwise, the
+		// sentry-internal page cache will be used, and we can end up
+		// in an inconsistent state if the remote file changes.
+		cp := dirent.Inode.InodeOperations.(*inodeOperations).session().cachePolicy
+		if cp == cacheRemoteRevalidating && handles.Host == nil {
+			panic(fmt.Sprintf("remote-revalidating cache policy requires gofer to donate host FD, but file %q did not have host FD", name))
+		}
+	}
 
 	f := &fileOperations{
 		inodeOperations: i,
@@ -70,7 +91,6 @@ func NewFile(ctx context.Context, dirent *fs.Dirent, flags fs.FileFlags, i *inod
 	}
 	if flags.Write {
 		if err := dirent.Inode.CheckPermission(ctx, fs.PermMask{Execute: true}); err == nil {
-			name, _ := dirent.FullName(fs.RootFromContext(ctx))
 			openedWX.Increment()
 			log.Warningf("Opened a writable executable: %q", name)
 		}
@@ -93,7 +113,7 @@ func (f *fileOperations) Readdir(ctx context.Context, file *fs.File, serializer 
 		DirCursor:  &f.dirCursor,
 	}
 	n, err := fs.DirentReaddir(ctx, file.Dirent, f, root, dirCtx, file.Offset())
-	if f.inodeOperations.session().cachePolicy != cacheNone {
+	if f.inodeOperations.session().cachePolicy.cacheUAttrs(file.Dirent.Inode) {
 		f.inodeOperations.cachingInodeOps.TouchAccessTime(ctx, file.Dirent.Inode)
 	}
 	return n, err
@@ -105,7 +125,7 @@ func (f *fileOperations) IterateDir(ctx context.Context, dirCtx *fs.DirCtx, offs
 	defer f.inodeOperations.readdirMu.Unlock()
 
 	// Fetch directory entries if needed.
-	if f.inodeOperations.readdirCache == nil || f.inodeOperations.session().cachePolicy == cacheNone {
+	if !f.inodeOperations.session().cachePolicy.cacheReaddir() || f.inodeOperations.readdirCache == nil {
 		entries, err := f.readdirAll(ctx)
 		if err != nil {
 			return offset, err
@@ -183,13 +203,19 @@ func (f *fileOperations) Write(ctx context.Context, file *fs.File, src usermem.I
 		// Not all remote file systems enforce this so this client does.
 		return 0, syserror.EISDIR
 	}
-
-	// Do cached IO for regular files only. Some character devices expect no caching.
-	isFile := fs.IsFile(file.Dirent.Inode.StableAttr)
-	if f.inodeOperations.session().cachePolicy == cacheNone || !isFile {
-		return src.CopyInTo(ctx, f.handles.readWriterAt(ctx, offset))
+	cp := f.inodeOperations.session().cachePolicy
+	if cp.useCachingInodeOps(file.Dirent.Inode) {
+		n, err := f.inodeOperations.cachingInodeOps.Write(ctx, src, offset)
+		if err != nil {
+			return n, err
+		}
+		if cp.writeThrough(file.Dirent.Inode) {
+			// Write out the file.
+			err = f.inodeOperations.cachingInodeOps.WriteOut(ctx, file.Dirent.Inode)
+		}
+		return n, err
 	}
-	return f.inodeOperations.cachingInodeOps.Write(ctx, src, offset)
+	return src.CopyInTo(ctx, f.handles.readWriterAt(ctx, offset))
 }
 
 // Read implements fs.FileOperations.Read.
@@ -199,12 +225,10 @@ func (f *fileOperations) Read(ctx context.Context, file *fs.File, dst usermem.IO
 		return 0, syserror.EISDIR
 	}
 
-	// Do cached IO for regular files only. Some character devices expect no caching.
-	isFile := fs.IsFile(file.Dirent.Inode.StableAttr)
-	if f.inodeOperations.session().cachePolicy == cacheNone || !isFile {
-		return dst.CopyOutFrom(ctx, f.handles.readWriterAt(ctx, offset))
+	if f.inodeOperations.session().cachePolicy.useCachingInodeOps(file.Dirent.Inode) {
+		return f.inodeOperations.cachingInodeOps.Read(ctx, file, dst, offset)
 	}
-	return f.inodeOperations.cachingInodeOps.Read(ctx, file, dst, offset)
+	return dst.CopyOutFrom(ctx, f.handles.readWriterAt(ctx, offset))
 }
 
 // Fsync implements fs.FileOperations.Fsync.
@@ -243,10 +267,7 @@ func (f *fileOperations) Flush(ctx context.Context, file *fs.File) error {
 
 // ConfigureMMap implements fs.FileOperations.ConfigureMMap.
 func (f *fileOperations) ConfigureMMap(ctx context.Context, file *fs.File, opts *memmap.MMapOpts) error {
-	if !isFileCachable(f.inodeOperations.session(), file.Dirent.Inode) {
-		return syserror.ENODEV
-	}
-	return fsutil.GenericConfigureMMap(file, f.inodeOperations.cachingInodeOps, opts)
+	return f.inodeOperations.configureMMap(file, opts)
 }
 
 // Seek implements fs.FileOperations.Seek.

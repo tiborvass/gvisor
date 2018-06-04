@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,9 +23,24 @@ import (
 
 // Constants for open(2).
 const (
-	O_NONBLOCK = 00004000
-	O_CLOEXEC  = 02000000
-	O_PATH     = 010000000
+	O_ACCMODE   = 00000003
+	O_RDONLY    = 00000000
+	O_WRONLY    = 00000001
+	O_RDWR      = 00000002
+	O_CREAT     = 00000100
+	O_EXCL      = 00000200
+	O_NOCTTY    = 00000400
+	O_TRUNC     = 00001000
+	O_APPEND    = 00002000
+	O_NONBLOCK  = 00004000
+	O_ASYNC     = 00020000
+	O_DIRECT    = 00040000
+	O_LARGEFILE = 00100000
+	O_DIRECTORY = 00200000
+	O_NOFOLLOW  = 00400000
+	O_CLOEXEC   = 02000000
+	O_SYNC      = 04010000
+	O_PATH      = 010000000
 )
 
 // Constants for fstatat(2).
@@ -135,6 +150,14 @@ const (
 	PermissionsMask = 0777
 )
 
+// Values for preadv2/pwritev2.
+const (
+	RWF_HIPRI = 0x00000001
+	RWF_DSYNC = 0x00000002
+	RWF_SYNC  = 0x00000004
+	RWF_VALID = RWF_HIPRI | RWF_DSYNC | RWF_SYNC
+)
+
 // Stat represents struct stat.
 type Stat struct {
 	Dev      uint64
@@ -201,32 +224,11 @@ var modeExtraBits = abi.FlagSet{
 }
 
 var fileType = abi.ValueSet{
-	{
-		Value: ModeSocket,
-		Name:  "S_IFSOCK",
-	},
-	{
-		Value: ModeSymlink,
-		Name:  "S_IFLINK",
-	},
-	{
-		Value: ModeRegular,
-		Name:  "S_IFREG",
-	},
-	{
-		Value: ModeBlockDevice,
-		Name:  "S_IFBLK",
-	},
-	{
-		Value: ModeDirectory,
-		Name:  "S_IFDIR",
-	},
-	{
-		Value: ModeCharacterDevice,
-		Name:  "S_IFCHR",
-	},
-	{
-		Value: ModeNamedPipe,
-		Name:  "S_IFIFO",
-	},
+	ModeSocket:          "S_IFSOCK",
+	ModeSymlink:         "S_IFLINK",
+	ModeRegular:         "S_IFREG",
+	ModeBlockDevice:     "S_IFBLK",
+	ModeDirectory:       "S_IFDIR",
+	ModeCharacterDevice: "S_IFCHR",
+	ModeNamedPipe:       "S_IFIFO",
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -63,6 +63,9 @@ func wrgsmsr(addr uintptr)
 
 // writeCR3 writes the CR3 value.
 func writeCR3(phys uintptr)
+
+// readCR3 reads the current CR3 value.
+func readCR3() uintptr
 
 // readCR2 reads the current CR2 value.
 func readCR2() uintptr

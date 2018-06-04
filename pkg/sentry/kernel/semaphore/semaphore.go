@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,6 +42,8 @@ const (
 )
 
 // Registry maintains a set of semaphores that can be found by key or ID.
+//
+// +stateify savable
 type Registry struct {
 	// userNS owning the ipc name this registry belongs to. Immutable.
 	userNS *auth.UserNamespace
@@ -52,6 +54,8 @@ type Registry struct {
 }
 
 // Set represents a set of semaphores that can be operated atomically.
+//
+// +stateify savable
 type Set struct {
 	// registry owning this sem set. Immutable.
 	registry *Registry
@@ -79,6 +83,8 @@ type Set struct {
 }
 
 // sem represents a single semanphore from a set.
+//
+// +stateify savable
 type sem struct {
 	value   int16
 	waiters waiterList `state:"zerovalue"`
@@ -86,6 +92,8 @@ type sem struct {
 
 // waiter represents a caller that is waiting for the semaphore value to
 // become positive or zero.
+//
+// +stateify savable
 type waiter struct {
 	waiterEntry
 
@@ -118,6 +126,9 @@ func (r *Registry) FindOrCreate(ctx context.Context, key, nsems int32, mode linu
 	if !private {
 		// Look up an existing semaphore.
 		if set := r.findByKey(key); set != nil {
+			set.mu.Lock()
+			defer set.mu.Unlock()
+
 			// Check that caller can access semaphore set.
 			creds := auth.CredentialsFromContext(ctx)
 			if !set.checkPerms(creds, fs.PermsFromMode(mode)) {
@@ -169,6 +180,9 @@ func (r *Registry) RemoveID(id int32, creds *auth.Credentials) error {
 	if set == nil {
 		return syserror.EINVAL
 	}
+
+	set.mu.Lock()
+	defer set.mu.Unlock()
 
 	// "The effective user ID of the calling process must match the creator or
 	// owner of the semaphore set, or the caller must be privileged."
@@ -444,11 +458,9 @@ func (s *Set) checkPerms(creds *auth.Credentials, reqPerms fs.PermMask) bool {
 	return s.checkCapability(creds)
 }
 
+// destroy destroys the set. Caller must hold 's.mu'.
 func (s *Set) destroy() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Notify all waiters. Tney will fail on the next attempt to execute
+	// Notify all waiters. They will fail on the next attempt to execute
 	// operations and return error.
 	s.dead = true
 	for _, s := range s.sems {
