@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -76,17 +76,15 @@ func isRenameEvent(eventMask uint32) bool {
 
 // Notify queues a new event on this watch.
 func (w *Watch) Notify(name string, events uint32, cookie uint32) {
-	mask := atomic.LoadUint32(&w.mask)
-	if mask&events == 0 {
+	unmaskableBits := ^uint32(0) &^ linux.IN_ALL_EVENTS
+	effectiveMask := unmaskableBits | atomic.LoadUint32(&w.mask)
+	matchedEvents := effectiveMask & events
+
+	if matchedEvents == 0 {
 		// We weren't watching for this event.
 		return
 	}
 
-	// Event mask should include bits matched from the watch plus all control
-	// event bits.
-	unmaskableBits := ^uint32(0) &^ linux.IN_ALL_EVENTS
-	effectiveMask := unmaskableBits | mask
-	matchedEvents := effectiveMask & events
 	w.owner.queueEvent(newEvent(w.wd, name, matchedEvents, cookie))
 }
 

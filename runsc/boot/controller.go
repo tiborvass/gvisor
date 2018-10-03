@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,16 +30,12 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/state"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/time"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/watchdog"
-	"gvisor.googlesource.com/gvisor/pkg/tcpip/stack"
 	"gvisor.googlesource.com/gvisor/pkg/urpc"
 )
 
 const (
 	// ContainerCheckpoint checkpoints a container.
 	ContainerCheckpoint = "containerManager.Checkpoint"
-
-	// ContainerCreate creates a container.
-	ContainerCreate = "containerManager.Create"
 
 	// ContainerDestroy is used to stop a non-root container and free all
 	// associated resources in the sandbox.
@@ -81,6 +77,9 @@ const (
 	// and return its ExitStatus.
 	ContainerWait = "containerManager.Wait"
 
+	// ContainerWaitForLoader blocks until the container's loader has been created.
+	ContainerWaitForLoader = "containerManager.WaitForLoader"
+
 	// ContainerWaitPID is used to wait on a process with a certain PID in
 	// the sandbox and return its ExitStatus.
 	ContainerWaitPID = "containerManager.WaitPID"
@@ -112,22 +111,21 @@ type controller struct {
 	manager *containerManager
 }
 
-// newController creates a new controller. The caller must call
-// controller.srv.StartServing() to start the controller.
-func newController(fd int, l *Loader) (*controller, error) {
+// newController creates a new controller and starts it listening.
+func newController(fd int, k *kernel.Kernel, w *watchdog.Watchdog) (*controller, error) {
 	srv, err := server.CreateFromFD(fd)
 	if err != nil {
 		return nil, err
 	}
 
 	manager := &containerManager{
-		startChan:       make(chan struct{}),
-		startResultChan: make(chan error),
-		l:               l,
+		startChan:         make(chan struct{}),
+		startResultChan:   make(chan error),
+		loaderCreatedChan: make(chan struct{}),
 	}
 	srv.Register(manager)
 
-	if eps, ok := l.k.NetworkStack().(*epsocket.Stack); ok {
+	if eps, ok := k.NetworkStack().(*epsocket.Stack); ok {
 		net := &Network{
 			Stack: eps.Stack,
 		}
@@ -135,6 +133,10 @@ func newController(fd int, l *Loader) (*controller, error) {
 	}
 
 	srv.Register(&debug{})
+
+	if err := srv.StartServing(); err != nil {
+		return nil, err
+	}
 
 	return &controller{
 		srv:     srv,
@@ -155,29 +157,35 @@ type containerManager struct {
 
 	// l is the loader that creates containers and sandboxes.
 	l *Loader
+
+	// loaderCreatedChan is used to signal when the loader has been created.
+	// After a loader is created, a notify method is called that writes to
+	// this channel.
+	loaderCreatedChan chan struct{}
 }
 
 // StartRoot will start the root container process.
 func (cm *containerManager) StartRoot(cid *string, _ *struct{}) error {
-	log.Debugf("containerManager.StartRoot %q", *cid)
+	log.Debugf("containerManager.StartRoot")
 	// Tell the root container to start and wait for the result.
 	cm.startChan <- struct{}{}
 	if err := <-cm.startResultChan; err != nil {
-		return fmt.Errorf("starting sandbox: %v", err)
+		return fmt.Errorf("failed to start sandbox: %v", err)
 	}
 	return nil
 }
 
-// Processes retrieves information about processes running in the sandbox.
-func (cm *containerManager) Processes(cid *string, out *[]*control.Process) error {
-	log.Debugf("containerManager.Processes: %q", *cid)
-	return control.Processes(cm.l.k, *cid, out)
+// ProcessesArgs container arguments to Processes method.
+type ProcessesArgs struct {
+	// CID restricts the result to processes belonging to
+	// the given container. Empty means all.
+	CID string
 }
 
-// Create creates a container within a sandbox.
-func (cm *containerManager) Create(cid *string, _ *struct{}) error {
-	log.Debugf("containerManager.Create: %q", *cid)
-	return cm.l.createContainer(*cid)
+// Processes retrieves information about processes running in the sandbox.
+func (cm *containerManager) Processes(args *ProcessesArgs, out *[]*control.Process) error {
+	log.Debugf("containerManager.Processes")
+	return control.Processes(cm.l.k, args.CID, out)
 }
 
 // StartArgs contains arguments to the Start method.
@@ -202,12 +210,6 @@ type StartArgs struct {
 // Start runs a created container within a sandbox.
 func (cm *containerManager) Start(args *StartArgs, _ *struct{}) error {
 	log.Debugf("containerManager.Start: %+v", args)
-
-	defer func() {
-		for _, f := range args.FilePayload.Files {
-			f.Close()
-		}
-	}()
 
 	// Validate arguments.
 	if args == nil {
@@ -235,7 +237,6 @@ func (cm *containerManager) Start(args *StartArgs, _ *struct{}) error {
 
 	err := cm.l.startContainer(cm.l.k, args.Spec, args.Conf, args.CID, args.FilePayload.Files)
 	if err != nil {
-		log.Debugf("containerManager.Start failed %q: %+v", args.CID, args)
 		return err
 	}
 	log.Debugf("Container %q started", args.CID)
@@ -256,7 +257,6 @@ func (cm *containerManager) ExecuteAsync(args *control.ExecArgs, pid *int32) err
 	log.Debugf("containerManager.ExecuteAsync: %+v", args)
 	tgid, err := cm.l.executeAsync(args)
 	if err != nil {
-		log.Debugf("containerManager.ExecuteAsync failed: %+v: %v", args, err)
 		return err
 	}
 	*pid = int32(tgid)
@@ -275,8 +275,14 @@ func (cm *containerManager) Checkpoint(o *control.SaveOpts, _ *struct{}) error {
 
 // Pause suspends a container.
 func (cm *containerManager) Pause(_, _ *struct{}) error {
-	log.Debugf("containerManager.Pause")
 	cm.l.k.Pause()
+	return nil
+}
+
+// WaitForLoader blocks until the container's loader has been created.
+func (cm *containerManager) WaitForLoader(_, _ *struct{}) error {
+	log.Debugf("containerManager.WaitForLoader")
+	<-cm.loaderCreatedChan
 	return nil
 }
 
@@ -319,7 +325,7 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 
 	p, err := createPlatform(cm.l.conf, int(deviceFile.Fd()))
 	if err != nil {
-		return fmt.Errorf("creating platform: %v", err)
+		return fmt.Errorf("error creating platform: %v", err)
 	}
 	k := &kernel.Kernel{
 		Platform: p,
@@ -330,24 +336,21 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 	fds := &fdDispenser{fds: cm.l.goferFDs}
 	renv, err := createRestoreEnvironment(cm.l.spec, cm.l.conf, fds)
 	if err != nil {
-		return fmt.Errorf("creating RestoreEnvironment: %v", err)
+		return fmt.Errorf("error creating RestoreEnvironment: %v", err)
 	}
 	fs.SetRestoreEnvironment(*renv)
 
 	// Prepare to load from the state file.
 	networkStack, err := newEmptyNetworkStack(cm.l.conf, k)
 	if err != nil {
-		return fmt.Errorf("creating network: %v", err)
-	}
-	if eps, ok := networkStack.(*epsocket.Stack); ok {
-		stack.StackFromEnv = eps.Stack // FIXME
+		return fmt.Errorf("failed to create network: %v", err)
 	}
 	info, err := o.FilePayload.Files[0].Stat()
 	if err != nil {
 		return err
 	}
 	if info.Size() == 0 {
-		return fmt.Errorf("file cannot be empty")
+		return fmt.Errorf("error file was empty")
 	}
 
 	// Load the state.
@@ -385,7 +388,7 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 	// Tell the root container to start and wait for the result.
 	cm.startChan <- struct{}{}
 	if err := <-cm.startResultChan; err != nil {
-		return fmt.Errorf("starting sandbox: %v", err)
+		return fmt.Errorf("failed to start sandbox: %v", err)
 	}
 
 	return nil
@@ -393,7 +396,6 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 
 // Resume unpauses a container.
 func (cm *containerManager) Resume(_, _ *struct{}) error {
-	log.Debugf("containerManager.Resume")
 	cm.l.k.Unpause()
 	return nil
 }
@@ -401,9 +403,7 @@ func (cm *containerManager) Resume(_, _ *struct{}) error {
 // Wait waits for the init process in the given container.
 func (cm *containerManager) Wait(cid *string, waitStatus *uint32) error {
 	log.Debugf("containerManager.Wait")
-	err := cm.l.waitContainer(*cid, waitStatus)
-	log.Debugf("containerManager.Wait returned, waitStatus: %v: %v", waitStatus, err)
-	return err
+	return cm.l.waitContainer(*cid, waitStatus)
 }
 
 // WaitPIDArgs are arguments to the WaitPID method.
@@ -425,38 +425,6 @@ func (cm *containerManager) WaitPID(args *WaitPIDArgs, waitStatus *uint32) error
 	return cm.l.waitPID(kernel.ThreadID(args.PID), args.CID, args.ClearStatus, waitStatus)
 }
 
-// SignalDeliveryMode enumerates different signal delivery modes.
-type SignalDeliveryMode int
-
-const (
-	// DeliverToProcess delivers the signal to the container process with
-	// the specified PID. If PID is 0, then the container init process is
-	// signaled.
-	DeliverToProcess SignalDeliveryMode = iota
-
-	// DeliverToAllProcesses delivers the signal to all processes in the
-	// container. PID must be 0.
-	DeliverToAllProcesses
-
-	// DeliverToForegroundProcessGroup delivers the signal to the
-	// foreground process group in the same TTY session as the specified
-	// process. If PID is 0, then the signal is delivered to the foreground
-	// process group for the TTY for the init process.
-	DeliverToForegroundProcessGroup
-)
-
-func (s SignalDeliveryMode) String() string {
-	switch s {
-	case DeliverToProcess:
-		return "Process"
-	case DeliverToAllProcesses:
-		return "All"
-	case DeliverToForegroundProcessGroup:
-		return "Foreground Process Group"
-	}
-	return fmt.Sprintf("unknown signal delivery mode: %d", s)
-}
-
 // SignalArgs are arguments to the Signal method.
 type SignalArgs struct {
 	// CID is the container ID.
@@ -465,20 +433,36 @@ type SignalArgs struct {
 	// Signo is the signal to send to the process.
 	Signo int32
 
-	// PID is the process ID in the given container that will be signaled.
-	// If 0, the root container will be signalled.
-	PID int32
-
-	// Mode is the signal delivery mode.
-	Mode SignalDeliveryMode
+	// All is set when signal should be sent to all processes in the container.
+	// When false, the signal is sent to the root container process only.
+	All bool
 }
 
-// Signal sends a signal to one or more processes in a container. If args.PID
-// is 0, then the container init process is used. Depending on the
-// args.SignalDeliveryMode option, the signal may be sent directly to the
-// indicated process, to all processes in the container, or to the foreground
-// process group.
+// Signal sends a signal to the root process of the container.
 func (cm *containerManager) Signal(args *SignalArgs, _ *struct{}) error {
-	log.Debugf("containerManager.Signal %+v", args)
-	return cm.l.signal(args.CID, args.PID, args.Signo, args.Mode)
+	log.Debugf("containerManager.Signal %q %d, all: %t", args.CID, args.Signo, args.All)
+	return cm.l.signalContainer(args.CID, args.Signo, args.All)
+}
+
+// SignalProcessArgs are arguments to the Signal method.
+type SignalProcessArgs struct {
+	// CID is the container ID.
+	CID string
+
+	// PID is the process ID in the given container that will be signaled.
+	PID int32
+
+	// Signo is the signal to send to the process.
+	Signo int32
+
+	// SendToForegroundProcess indicates that the signal should be sent to
+	// the foreground process group in the session that PID belongs to.
+	// This is only valid if the process is attached to a host TTY.
+	SendToForegroundProcess bool
+}
+
+// SignalProcess sends a signal to a particular process in the container.
+func (cm *containerManager) SignalProcess(args *SignalProcessArgs, _ *struct{}) error {
+	log.Debugf("containerManager.Signal: %+v", args)
+	return cm.l.signalProcess(args.CID, args.PID, args.Signo, args.SendToForegroundProcess)
 }

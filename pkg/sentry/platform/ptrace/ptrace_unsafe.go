@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -130,13 +130,13 @@ func (t *thread) getSignalInfo(si *arch.SignalInfo) error {
 // call attach on it.
 //
 // Precondition: the OS thread must be locked and own t.
-func (t *thread) clone() (*thread, error) {
-	r, ok := usermem.Addr(t.initRegs.Rsp).RoundUp()
+func (t *thread) clone(initRegs *syscall.PtraceRegs) (*thread, error) {
+	r, ok := usermem.Addr(initRegs.Rsp).RoundUp()
 	if !ok {
 		return nil, syscall.EINVAL
 	}
 	rval, err := t.syscallIgnoreInterrupt(
-		&t.initRegs,
+		initRegs,
 		syscall.SYS_CLONE,
 		arch.SyscallArgument{Value: uintptr(
 			syscall.CLONE_FILES |
@@ -153,7 +153,7 @@ func (t *thread) clone() (*thread, error) {
 		arch.SyscallArgument{},
 		// We use these registers initially, but really they
 		// could be anything. We're going to stop immediately.
-		arch.SyscallArgument{Value: uintptr(unsafe.Pointer(&t.initRegs))})
+		arch.SyscallArgument{Value: uintptr(unsafe.Pointer(initRegs))})
 	if err != nil {
 		return nil, err
 	}

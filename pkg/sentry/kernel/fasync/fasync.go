@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,10 +32,8 @@ func New() fs.FileAsync {
 }
 
 // FileAsync sends signals when the registered file is ready for IO.
-//
-// +stateify savable
 type FileAsync struct {
-	mu        sync.Mutex `state:"nosave"`
+	mu        sync.Mutex
 	e         waiter.Entry
 	requester *auth.Credentials
 
@@ -59,11 +57,6 @@ func (a *FileAsync) Callback(e *waiter.Entry) {
 	}
 	if tg != nil {
 		t = tg.Leader()
-	}
-	if t == nil {
-		// No recipient has been registered.
-		a.mu.Unlock()
-		return
 	}
 	c := t.Credentials()
 	// Logic from sigio_perm in fs/fcntl.c.

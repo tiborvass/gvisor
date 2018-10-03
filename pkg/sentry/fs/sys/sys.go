@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,13 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 )
 
+// sys is a root sys node.
+//
+// +stateify savable
+type sys struct {
+	ramfs.Dir
+}
+
 func newFile(node fs.InodeOperations, msrc *fs.MountSource) *fs.Inode {
 	sattr := fs.StableAttr{
 		DeviceID:  sysfsDevice.DeviceID(),
@@ -33,7 +40,8 @@ func newFile(node fs.InodeOperations, msrc *fs.MountSource) *fs.Inode {
 }
 
 func newDir(ctx context.Context, msrc *fs.MountSource, contents map[string]*fs.Inode) *fs.Inode {
-	d := ramfs.NewDir(ctx, contents, fs.RootOwner, fs.FilePermsFromMode(0555))
+	d := &sys{}
+	d.InitDir(ctx, contents, fs.RootOwner, fs.FilePermsFromMode(0555))
 	return fs.NewInode(d, msrc, fs.StableAttr{
 		DeviceID:  sysfsDevice.DeviceID(),
 		InodeID:   sysfsDevice.NextIno(),

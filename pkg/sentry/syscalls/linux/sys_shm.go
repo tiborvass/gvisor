@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ import (
 
 // Shmget implements shmget(2).
 func Shmget(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	key := shm.Key(args[0].Int())
+	key := args[0].Int()
 	size := uint64(args[1].SizeT())
 	flag := args[2].Int()
 
@@ -43,7 +43,7 @@ func Shmget(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 }
 
 // findSegment retrives a shm segment by the given id.
-func findSegment(t *kernel.Task, id shm.ID) (*shm.Shm, error) {
+func findSegment(t *kernel.Task, id int32) (*shm.Shm, error) {
 	r := t.IPCNamespace().ShmRegistry()
 	segment := r.FindByID(id)
 	if segment == nil {
@@ -55,7 +55,7 @@ func findSegment(t *kernel.Task, id shm.ID) (*shm.Shm, error) {
 
 // Shmat implements shmat(2).
 func Shmat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	id := shm.ID(args[0].Int())
+	id := args[0].Int()
 	addr := args[1].Pointer()
 	flag := args[2].Int()
 
@@ -86,7 +86,7 @@ func Shmdt(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 
 // Shmctl implements shmctl(2).
 func Shmctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	id := shm.ID(args[0].Int())
+	id := args[0].Int()
 	cmd := args[1].Int()
 	buf := args[2].Pointer()
 
@@ -144,10 +144,9 @@ func Shmctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 		return 0, nil, nil
 
 	case linux.SHM_LOCK, linux.SHM_UNLOCK:
-		// We currently do not support memory locking anywhere.
+		// We currently do not support memmory locking anywhere.
 		// mlock(2)/munlock(2) are currently stubbed out as no-ops so do the
 		// same here.
-		t.Kernel().EmitUnimplementedEvent(t)
 		return 0, nil, nil
 
 	default:

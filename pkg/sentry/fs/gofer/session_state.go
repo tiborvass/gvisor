@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -84,13 +84,13 @@ func (s *session) afterLoad() {
 	}
 
 	// Manually restore the connection.
-	conn, err := unet.NewSocket(opts.fd)
+	s.conn, err = unet.NewSocket(opts.fd)
 	if err != nil {
 		panic(fmt.Sprintf("failed to create Socket for FD %d: %v", opts.fd, err))
 	}
 
 	// Manually restore the client.
-	s.client, err = p9.NewClient(conn, s.msize, s.version)
+	s.client, err = p9.NewClient(s.conn, s.msize, s.version)
 	if err != nil {
 		panic(fmt.Sprintf("failed to connect client to server: %v", err))
 	}

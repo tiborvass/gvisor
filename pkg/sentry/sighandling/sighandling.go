@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,17 +23,18 @@ import (
 	"syscall"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
+	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 )
 
 // numSignals is the number of normal (non-realtime) signals on Linux.
 const numSignals = 32
 
-// handleSignals listens for incoming signals and calls the given handler
-// function.
+// forwardSignals listens for incoming signals and delivers them to k.
 //
 // It starts when the start channel is closed, stops when the stop channel
 // is closed, and closes done once it will no longer deliver signals to k.
-func handleSignals(sigchans []chan os.Signal, handler func(linux.Signal), start, stop, done chan struct{}) {
+func forwardSignals(k *kernel.Kernel, sigchans []chan os.Signal, start, stop, done chan struct{}) {
 	// Build a select case.
 	sc := []reflect.SelectCase{{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(start)}}
 	for _, sigchan := range sigchans {
@@ -97,19 +98,18 @@ func handleSignals(sigchans []chan os.Signal, handler func(linux.Signal), start,
 			}
 		}
 
-		// Pass the signal to the handler.
-		handler(signal)
+		k.SendExternalSignal(&arch.SignalInfo{Signo: int32(signal)}, "sentry")
 	}
 }
 
-// PrepareHandler ensures that synchronous signals are passed to the given
-// handler function and returns a callback that starts signal delivery, which
-// itself returns a callback that stops signal handling.
+// PrepareForwarding ensures that synchronous signals are forwarded to k and
+// returns a callback that starts signal delivery, which itself returns a
+// callback that stops signal forwarding.
 //
 // Note that this function permanently takes over signal handling. After the
 // stop callback, signals revert to the default Go runtime behavior, which
 // cannot be overridden with external calls to signal.Notify.
-func PrepareHandler(handler func(linux.Signal)) func() func() {
+func PrepareForwarding(k *kernel.Kernel, skipSignal syscall.Signal) func() func() {
 	start := make(chan struct{})
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -125,10 +125,15 @@ func PrepareHandler(handler func(linux.Signal)) func() func() {
 	for sig := 1; sig <= numSignals+1; sig++ {
 		sigchan := make(chan os.Signal, 1)
 		sigchans = append(sigchans, sigchan)
+
+		if syscall.Signal(sig) == skipSignal {
+			continue
+		}
+
 		signal.Notify(sigchan, syscall.Signal(sig))
 	}
 	// Start up our listener.
-	go handleSignals(sigchans, handler, start, stop, done) // S/R-SAFE: synchronized by Kernel.extMu.
+	go forwardSignals(k, sigchans, start, stop, done) // S/R-SAFE: synchronized by Kernel.extMu.
 
 	return func() func() {
 		close(start)

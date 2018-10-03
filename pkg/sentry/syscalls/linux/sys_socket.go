@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,9 +27,9 @@ import (
 	ktime "gvisor.googlesource.com/gvisor/pkg/sentry/kernel/time"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/socket"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/control"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 )
 
 // minListenBacklog is the minimum reasonable backlog for listening sockets.
@@ -62,10 +62,6 @@ var messageHeader64Len = uint64(binary.Size(MessageHeader64{}))
 
 // multipleMessageHeader64Len is the length of a multipeMessageHeader64 struct.
 var multipleMessageHeader64Len = uint64(binary.Size(multipleMessageHeader64{}))
-
-// baseRecvFlags are the flags that are accepted across recvmsg(2),
-// recvmmsg(2), and recvfrom(2).
-const baseRecvFlags = linux.MSG_OOB | linux.MSG_DONTROUTE | linux.MSG_DONTWAIT | linux.MSG_NOSIGNAL | linux.MSG_WAITALL | linux.MSG_TRUNC | linux.MSG_CTRUNC
 
 // MessageHeader64 is the 64-bit representation of the msghdr struct used in
 // the recvmsg and sendmsg syscalls.
@@ -184,7 +180,7 @@ func Socket(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	}
 
 	// Create the new socket.
-	s, e := socket.New(t, domain, transport.SockType(stype&0xf), protocol)
+	s, e := socket.New(t, domain, unix.SockType(stype&0xf), protocol)
 	if e != nil {
 		return 0, nil, e.ToError()
 	}
@@ -223,7 +219,7 @@ func SocketPair(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sy
 	}
 
 	// Create the socket pair.
-	s1, s2, e := socket.Pair(t, domain, transport.SockType(stype&0xf), protocol)
+	s1, s2, e := socket.Pair(t, domain, unix.SockType(stype&0xf), protocol)
 	if e != nil {
 		return 0, nil, e.ToError()
 	}
@@ -606,7 +602,7 @@ func RecvMsg(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysca
 	}
 
 	// Reject flags that we don't handle yet.
-	if flags & ^(baseRecvFlags|linux.MSG_PEEK|linux.MSG_CMSG_CLOEXEC|linux.MSG_ERRQUEUE) != 0 {
+	if flags & ^(linux.MSG_DONTWAIT|linux.MSG_NOSIGNAL|linux.MSG_PEEK|linux.MSG_TRUNC|linux.MSG_CTRUNC|linux.MSG_CMSG_CLOEXEC|linux.MSG_ERRQUEUE) != 0 {
 		return 0, nil, syscall.EINVAL
 	}
 
@@ -616,11 +612,9 @@ func RecvMsg(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysca
 
 	var haveDeadline bool
 	var deadline ktime.Time
-	if dl := s.RecvTimeout(); dl > 0 {
+	if dl := s.RecvTimeout(); dl != 0 {
 		deadline = t.Kernel().MonotonicClock().Now().Add(time.Duration(dl) * time.Nanosecond)
 		haveDeadline = true
-	} else if dl < 0 {
-		flags |= linux.MSG_DONTWAIT
 	}
 
 	n, err := recvSingleMsg(t, s, msgPtr, flags, haveDeadline, deadline)
@@ -641,7 +635,7 @@ func RecvMMsg(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 	}
 
 	// Reject flags that we don't handle yet.
-	if flags & ^(baseRecvFlags|linux.MSG_CMSG_CLOEXEC|linux.MSG_ERRQUEUE) != 0 {
+	if flags & ^(linux.MSG_DONTWAIT|linux.MSG_NOSIGNAL|linux.MSG_TRUNC|linux.MSG_CTRUNC|linux.MSG_CMSG_CLOEXEC|linux.MSG_ERRQUEUE) != 0 {
 		return 0, nil, syscall.EINVAL
 	}
 
@@ -677,11 +671,10 @@ func RecvMMsg(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 	}
 
 	if !haveDeadline {
-		if dl := s.RecvTimeout(); dl > 0 {
+		dl := s.RecvTimeout()
+		if dl != 0 {
 			deadline = t.Kernel().MonotonicClock().Now().Add(time.Duration(dl) * time.Nanosecond)
 			haveDeadline = true
-		} else if dl < 0 {
-			flags |= linux.MSG_DONTWAIT
 		}
 	}
 
@@ -757,7 +750,7 @@ func recvSingleMsg(t *kernel.Task, s socket.Socket, msgPtr usermem.Addr, flags i
 
 	controlData := make([]byte, 0, msg.ControlLen)
 
-	if cr, ok := s.(transport.Credentialer); ok && cr.Passcred() {
+	if cr, ok := s.(unix.Credentialer); ok && cr.Passcred() {
 		creds, _ := cms.Unix.Credentials.(control.SCMCredentials)
 		controlData = control.PackCredentials(t, creds, controlData)
 	}
@@ -798,7 +791,7 @@ func recvFrom(t *kernel.Task, fd kdefs.FD, bufPtr usermem.Addr, bufLen uint64, f
 	}
 
 	// Reject flags that we don't handle yet.
-	if flags & ^(baseRecvFlags|linux.MSG_PEEK|linux.MSG_CONFIRM) != 0 {
+	if flags & ^(linux.MSG_DONTWAIT|linux.MSG_NOSIGNAL|linux.MSG_PEEK|linux.MSG_TRUNC|linux.MSG_CTRUNC|linux.MSG_CONFIRM) != 0 {
 		return 0, syscall.EINVAL
 	}
 
@@ -828,11 +821,10 @@ func recvFrom(t *kernel.Task, fd kdefs.FD, bufPtr usermem.Addr, bufLen uint64, f
 
 	var haveDeadline bool
 	var deadline ktime.Time
-	if dl := s.RecvTimeout(); dl > 0 {
+
+	if dl := s.RecvTimeout(); dl != 0 {
 		deadline = t.Kernel().MonotonicClock().Now().Add(time.Duration(dl) * time.Nanosecond)
 		haveDeadline = true
-	} else if dl < 0 {
-		flags |= linux.MSG_DONTWAIT
 	}
 
 	n, sender, senderLen, cm, e := s.RecvMsg(t, dst, int(flags), haveDeadline, deadline, nameLenPtr != 0, 0)
@@ -1009,17 +1001,8 @@ func sendSingleMsg(t *kernel.Task, s socket.Socket, file *fs.File, msgPtr userme
 		return 0, err
 	}
 
-	var haveDeadline bool
-	var deadline ktime.Time
-	if dl := s.SendTimeout(); dl > 0 {
-		deadline = t.Kernel().MonotonicClock().Now().Add(time.Duration(dl) * time.Nanosecond)
-		haveDeadline = true
-	} else if dl < 0 {
-		flags |= linux.MSG_DONTWAIT
-	}
-
 	// Call the syscall implementation.
-	n, e := s.SendMsg(t, src, to, int(flags), haveDeadline, deadline, socket.ControlMessages{Unix: controlMessages})
+	n, e := s.SendMsg(t, src, to, int(flags), socket.ControlMessages{Unix: controlMessages})
 	err = handleIOError(t, n != 0, e.ToError(), kernel.ERESTARTSYS, "sendmsg", file)
 	if err != nil {
 		controlMessages.Release()
@@ -1069,17 +1052,8 @@ func sendTo(t *kernel.Task, fd kdefs.FD, bufPtr usermem.Addr, bufLen uint64, fla
 		return 0, err
 	}
 
-	var haveDeadline bool
-	var deadline ktime.Time
-	if dl := s.SendTimeout(); dl > 0 {
-		deadline = t.Kernel().MonotonicClock().Now().Add(time.Duration(dl) * time.Nanosecond)
-		haveDeadline = true
-	} else if dl < 0 {
-		flags |= linux.MSG_DONTWAIT
-	}
-
 	// Call the syscall implementation.
-	n, e := s.SendMsg(t, src, to, int(flags), haveDeadline, deadline, socket.ControlMessages{Unix: control.New(t, s, nil)})
+	n, e := s.SendMsg(t, src, to, int(flags), socket.ControlMessages{Unix: control.New(t, s, nil)})
 	return uintptr(n), handleIOError(t, n != 0, e.ToError(), kernel.ERESTARTSYS, "sendto", file)
 }
 

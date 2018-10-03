@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -686,10 +686,10 @@ func (rw *inodeReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, error
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
-func (c *CachingInodeOperations) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64, writable bool) error {
+func (c *CachingInodeOperations) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) error {
 	// Hot path. Avoid defers.
 	c.mapsMu.Lock()
-	mapped := c.mappings.AddMapping(ms, ar, offset, writable)
+	mapped := c.mappings.AddMapping(ms, ar, offset)
 	// Do this unconditionally since whether we have c.backingFile.FD() >= 0
 	// can change across save/restore.
 	for _, r := range mapped {
@@ -705,10 +705,10 @@ func (c *CachingInodeOperations) AddMapping(ctx context.Context, ms memmap.Mappi
 }
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
-func (c *CachingInodeOperations) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64, writable bool) {
+func (c *CachingInodeOperations) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) {
 	// Hot path. Avoid defers.
 	c.mapsMu.Lock()
-	unmapped := c.mappings.RemoveMapping(ms, ar, offset, writable)
+	unmapped := c.mappings.RemoveMapping(ms, ar, offset)
 	for _, r := range unmapped {
 		c.hostFileMapper.DecRefOn(r)
 	}
@@ -739,8 +739,8 @@ func (c *CachingInodeOperations) RemoveMapping(ctx context.Context, ms memmap.Ma
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
-func (c *CachingInodeOperations) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64, writable bool) error {
-	return c.AddMapping(ctx, ms, dstAR, offset, writable)
+func (c *CachingInodeOperations) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64) error {
+	return c.AddMapping(ctx, ms, dstAR, offset)
 }
 
 // Translate implements memmap.Mappable.Translate.

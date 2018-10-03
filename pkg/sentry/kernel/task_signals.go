@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,10 +22,8 @@ import (
 	"time"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
-	"gvisor.googlesource.com/gvisor/pkg/eventchannel"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
-	ucspb "gvisor.googlesource.com/gvisor/pkg/sentry/kernel/uncaught_signal_go_proto"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 )
@@ -186,23 +184,6 @@ func (t *Task) deliverSignal(info *arch.SignalInfo, act arch.SignalAct) taskRunS
 	case SignalActionTerm, SignalActionCore:
 		// "Default action is to terminate the process." - signal(7)
 		t.Debugf("Signal %d: terminating thread group", info.Signo)
-
-		// Emit an event channel messages related to this uncaught signal.
-		ucs := &ucspb.UncaughtSignal{
-			Tid:          int32(t.Kernel().TaskSet().Root.IDOfTask(t)),
-			Pid:          int32(t.Kernel().TaskSet().Root.IDOfThreadGroup(t.ThreadGroup())),
-			Registers:    t.Arch().StateData().Proto(),
-			SignalNumber: info.Signo,
-		}
-
-		// Attach an fault address if appropriate.
-		switch linux.Signal(info.Signo) {
-		case linux.SIGSEGV, linux.SIGFPE, linux.SIGILL, linux.SIGTRAP, linux.SIGBUS:
-			ucs.FaultAddr = info.Addr()
-		}
-
-		eventchannel.Emit(ucs)
-
 		t.PrepareGroupExit(ExitStatus{Signo: int(info.Signo)})
 		return (*runExit)(nil)
 
@@ -375,6 +356,72 @@ func (tg *ThreadGroup) SendSignal(info *arch.SignalInfo) error {
 	defer tg.pidns.owner.mu.RUnlock()
 	tg.signalHandlers.mu.Lock()
 	defer tg.signalHandlers.mu.Unlock()
+	return tg.leader.sendSignalLocked(info, true /* group */)
+}
+
+// Preconditions: The TaskSet mutex must be locked.
+func (t *Task) onCPULocked(includeSys bool) bool {
+	// Task is exiting.
+	if t.exitState != TaskExitNone {
+		return false
+	}
+
+	switch t.TaskGoroutineSchedInfo().State {
+	case TaskGoroutineRunningSys:
+		return includeSys
+	case TaskGoroutineRunningApp:
+		return true
+	default:
+		return false
+	}
+}
+
+// SendTimerSignal mimics the process timer signal delivery behavior in linux:
+// signals are delivered to the thread that triggers the timer expiration (see
+// kernel/time/posix-cpu-timers.c:check_process_timers(). This
+// means
+//   1) the thread is running on cpu at the time.
+//   2) a thread runs more frequently will get more of those signals.
+//
+// We approximate this behavior by selecting a running task in a round-robin
+// fashion. Statistically, a thread running more often should have a higher
+// probability to be selected.
+func (tg *ThreadGroup) SendTimerSignal(info *arch.SignalInfo, includeSys bool) error {
+	tg.pidns.owner.mu.RLock()
+	defer tg.pidns.owner.mu.RUnlock()
+	tg.signalHandlers.mu.Lock()
+	defer tg.signalHandlers.mu.Unlock()
+
+	// Find the next running threads.
+	var t *Task
+	if tg.lastTimerSignalTask == nil {
+		t = tg.tasks.Front()
+	} else {
+		t = tg.lastTimerSignalTask.Next()
+	}
+
+	// Iterate from lastTimerSignalTask.Next() to the last task in the task list.
+	for t != nil {
+		if t.onCPULocked(includeSys) {
+			tg.lastTimerSignalTask = t
+			return t.sendSignalLocked(info, true /* group */)
+		}
+		t = t.Next()
+	}
+
+	// t is nil when we reach here. If lastTimerSignalTask is not nil, iterate
+	// from Front to lastTimerSignalTask.
+	if tg.lastTimerSignalTask != nil {
+		for t := tg.tasks.Front(); t != tg.lastTimerSignalTask.Next(); t = t.Next() {
+			if t.onCPULocked(includeSys) {
+				tg.lastTimerSignalTask = t
+				return t.sendSignalLocked(info, true /* group */)
+			}
+		}
+	}
+
+	// No running threads? Just try the leader.
+	tg.lastTimerSignalTask = tg.leader
 	return tg.leader.sendSignalLocked(info, true /* group */)
 }
 

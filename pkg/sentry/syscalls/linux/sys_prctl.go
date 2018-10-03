@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -87,10 +87,6 @@ func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		}
 
 	case linux.PR_SET_MM:
-		if !t.HasCapability(linux.CAP_SYS_RESOURCE) {
-			return 0, nil, syscall.EPERM
-		}
-
 		switch args[1].Int() {
 		case linux.PR_SET_MM_EXE_FILE:
 			fd := kdefs.FD(args[2].Int())
@@ -108,22 +104,6 @@ func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 
 			// Set the underlying executable.
 			t.MemoryManager().SetExecutable(file.Dirent)
-
-		case linux.PR_SET_MM_AUXV,
-			linux.PR_SET_MM_START_CODE,
-			linux.PR_SET_MM_END_CODE,
-			linux.PR_SET_MM_START_DATA,
-			linux.PR_SET_MM_END_DATA,
-			linux.PR_SET_MM_START_STACK,
-			linux.PR_SET_MM_START_BRK,
-			linux.PR_SET_MM_BRK,
-			linux.PR_SET_MM_ARG_START,
-			linux.PR_SET_MM_ARG_END,
-			linux.PR_SET_MM_ENV_START,
-			linux.PR_SET_MM_ENV_END:
-
-			t.Kernel().EmitUnimplementedEvent(t)
-			fallthrough
 		default:
 			return 0, nil, syscall.EINVAL
 		}
@@ -171,29 +151,8 @@ func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		}
 		return 0, nil, t.DropBoundingCapability(cp)
 
-	case linux.PR_GET_DUMPABLE,
-		linux.PR_SET_DUMPABLE,
-		linux.PR_GET_TIMING,
-		linux.PR_SET_TIMING,
-		linux.PR_GET_TSC,
-		linux.PR_SET_TSC,
-		linux.PR_TASK_PERF_EVENTS_DISABLE,
-		linux.PR_TASK_PERF_EVENTS_ENABLE,
-		linux.PR_GET_TIMERSLACK,
-		linux.PR_SET_TIMERSLACK,
-		linux.PR_MCE_KILL,
-		linux.PR_MCE_KILL_GET,
-		linux.PR_GET_TID_ADDRESS,
-		linux.PR_SET_CHILD_SUBREAPER,
-		linux.PR_GET_CHILD_SUBREAPER,
-		linux.PR_GET_THP_DISABLE,
-		linux.PR_SET_THP_DISABLE,
-		linux.PR_MPX_ENABLE_MANAGEMENT,
-		linux.PR_MPX_DISABLE_MANAGEMENT:
-
-		t.Kernel().EmitUnimplementedEvent(t)
-		fallthrough
 	default:
+		t.Warningf("Unsupported prctl %d", option)
 		return 0, nil, syscall.EINVAL
 	}
 

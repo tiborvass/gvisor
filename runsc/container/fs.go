@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -73,13 +73,9 @@ var optionsMap = map[string]mapping{
 // This allows the gofer serving the containers to be chroot under this
 // directory to create an extra layer to security in case the gofer gets
 // compromised.
-// Returns list of mounts equivalent to 'spec.Mounts' with all destination paths
-// cleaned and with symlinks resolved.
-func setupFS(spec *specs.Spec, conf *boot.Config, bundleDir string) ([]specs.Mount, error) {
-	rv := make([]specs.Mount, 0, len(spec.Mounts))
+func setupFS(spec *specs.Spec, conf *boot.Config, bundleDir string) error {
 	for _, m := range spec.Mounts {
 		if m.Type != "bind" || !specutils.IsSupportedDevMount(m) {
-			rv = append(rv, m)
 			continue
 		}
 
@@ -87,39 +83,21 @@ func setupFS(spec *specs.Spec, conf *boot.Config, bundleDir string) ([]specs.Mou
 		// container.
 		dst, err := resolveSymlinks(spec.Root.Path, m.Destination)
 		if err != nil {
-			return nil, fmt.Errorf("resolving symlinks to %q: %v", m.Destination, err)
+			return fmt.Errorf("failed to resolve symlinks: %v", err)
 		}
 
 		flags := optionsToFlags(m.Options)
 		flags |= syscall.MS_BIND
 		log.Infof("Mounting src: %q, dst: %q, flags: %#x", m.Source, dst, flags)
 		if err := specutils.Mount(m.Source, dst, m.Type, flags); err != nil {
-			return nil, fmt.Errorf("mounting %v: %v", m, err)
+			return fmt.Errorf("failed to mount %v: %v", m, err)
 		}
 
 		// Make the mount a slave, so that for recursive bind mount, umount won't
 		// propagate to the source.
 		flags = syscall.MS_SLAVE | syscall.MS_REC
 		if err := syscall.Mount("", dst, "", uintptr(flags), ""); err != nil {
-			return nil, fmt.Errorf("mount rslave dst: %q, flags: %#x, err: %v", dst, flags, err)
-		}
-
-		cpy := m
-		relDst, err := filepath.Rel(spec.Root.Path, dst)
-		if err != nil {
-			panic(fmt.Sprintf("%q could not be made relative to %q: %v", dst, spec.Root.Path, err))
-		}
-		cpy.Destination = filepath.Join("/", relDst)
-		rv = append(rv, cpy)
-	}
-
-	if spec.Process.Cwd != "" {
-		dst, err := resolveSymlinks(spec.Root.Path, spec.Process.Cwd)
-		if err != nil {
-			return nil, fmt.Errorf("resolving symlinks to %q: %v", spec.Process.Cwd, err)
-		}
-		if err := os.MkdirAll(dst, 0755); err != nil {
-			return nil, err
+			return fmt.Errorf("failed to rslave mount dst: %q, flags: %#x, err: %v", dst, flags, err)
 		}
 	}
 
@@ -127,17 +105,17 @@ func setupFS(spec *specs.Spec, conf *boot.Config, bundleDir string) ([]specs.Mou
 	if spec.Root.Readonly {
 		isMountPoint, readonly, err := mountInfo(spec.Root.Path)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if readonly {
-			return rv, nil
+			return nil
 		}
 		if !isMountPoint {
 			// Readonly root is not a mount point nor read-only. Can't do much other
 			// than just logging a warning. The gofer will prevent files to be open
 			// in write mode.
 			log.Warningf("Mount where root is located is not read-only and cannot be changed: %q", spec.Root.Path)
-			return rv, nil
+			return nil
 		}
 
 		// If root is a mount point but not read-only, we can change mount options
@@ -146,10 +124,10 @@ func setupFS(spec *specs.Spec, conf *boot.Config, bundleDir string) ([]specs.Mou
 		flags := uintptr(syscall.MS_BIND | syscall.MS_REMOUNT | syscall.MS_RDONLY | syscall.MS_REC)
 		src := spec.Root.Path
 		if err := syscall.Mount(src, src, "bind", flags, ""); err != nil {
-			return nil, fmt.Errorf("remounting root as read-only with source: %q, target: %q, flags: %#x, err: %v", spec.Root.Path, spec.Root.Path, flags, err)
+			return fmt.Errorf("failed to remount root as read-only with source: %q, target: %q, flags: %#x, err: %v", spec.Root.Path, spec.Root.Path, flags, err)
 		}
 	}
-	return rv, nil
+	return nil
 }
 
 // mountInfo returns whether the path is a mount point and whether the mount

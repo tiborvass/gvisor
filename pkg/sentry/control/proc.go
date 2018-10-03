@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -87,16 +86,6 @@ type ExecArgs struct {
 
 	// ContainerID is the container for the process being executed.
 	ContainerID string
-}
-
-// String prints the arguments as a string.
-func (args ExecArgs) String() string {
-	a := make([]string, len(args.Argv))
-	copy(a, args.Argv)
-	if args.Filename != "" {
-		a[0] = args.Filename
-	}
-	return strings.Join(a, " ")
 }
 
 // Exec runs a new task.

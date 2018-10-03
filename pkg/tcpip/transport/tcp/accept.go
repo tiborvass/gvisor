@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,13 +15,13 @@
 package tcp
 
 import (
-	"crypto/sha1"
 	"encoding/binary"
 	"hash"
 	"io"
 	"sync"
 	"time"
 
+	"crypto/sha1"
 	"gvisor.googlesource.com/gvisor/pkg/rand"
 	"gvisor.googlesource.com/gvisor/pkg/sleep"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip"
@@ -215,7 +215,7 @@ func (l *listenContext) createConnectedEndpoint(s *segment, iss seqnum.Value, ir
 	n.maybeEnableSACKPermitted(rcvdSynOpts)
 
 	// Register new endpoint so that packets are routed to it.
-	if err := n.stack.RegisterTransportEndpoint(n.boundNICID, n.effectiveNetProtos, ProtocolNumber, n.id, n, n.reusePort); err != nil {
+	if err := n.stack.RegisterTransportEndpoint(n.boundNICID, n.effectiveNetProtos, ProtocolNumber, n.id, n); err != nil {
 		n.Close()
 		return nil, err
 	}
@@ -245,7 +245,11 @@ func (l *listenContext) createEndpointAndPerformHandshake(s *segment, opts *head
 	}
 
 	// Perform the 3-way handshake.
-	h := newHandshake(ep, l.rcvWnd)
+	h, err := newHandshake(ep, l.rcvWnd)
+	if err != nil {
+		ep.Close()
+		return nil, err
+	}
 
 	h.resetToSynRcvd(cookie, irs, opts)
 	if err := h.execute(); err != nil {

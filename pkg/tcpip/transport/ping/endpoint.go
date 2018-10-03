@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -100,7 +100,7 @@ func (e *endpoint) Close() {
 	e.shutdownFlags = tcpip.ShutdownRead | tcpip.ShutdownWrite
 	switch e.state {
 	case stateBound, stateConnected:
-		e.stack.UnregisterTransportEndpoint(e.regNICID, []tcpip.NetworkProtocolNumber{e.netProto}, e.transProto, e.id, e)
+		e.stack.UnregisterTransportEndpoint(e.regNICID, []tcpip.NetworkProtocolNumber{e.netProto}, e.transProto, e.id)
 	}
 
 	// Close the receive list and drain it.
@@ -299,11 +299,7 @@ func (e *endpoint) Write(p tcpip.Payload, opts tcpip.WriteOptions) (uintptr, <-c
 		err = sendPing6(route, e.id.LocalPort, v)
 	}
 
-	if err != nil {
-		return 0, nil, err
-	}
-
-	return uintptr(len(v)), nil, nil
+	return uintptr(len(v)), nil, err
 }
 
 // Peek only returns data from a single datagram, so do nothing here.
@@ -358,15 +354,9 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 			*o = 1
 		}
 		e.rcvMu.Unlock()
-		return nil
-
-	case *tcpip.KeepaliveEnabledOption:
-		*o = 0
-		return nil
-
-	default:
-		return tcpip.ErrUnknownProtocolOption
 	}
+
+	return tcpip.ErrUnknownProtocolOption
 }
 
 func sendPing4(r *stack.Route, ident uint16, data buffer.View) *tcpip.Error {
@@ -541,14 +531,14 @@ func (e *endpoint) registerWithStack(nicid tcpip.NICID, netProtos []tcpip.Networ
 	if id.LocalPort != 0 {
 		// The endpoint already has a local port, just attempt to
 		// register it.
-		err := e.stack.RegisterTransportEndpoint(nicid, netProtos, e.transProto, id, e, false)
+		err := e.stack.RegisterTransportEndpoint(nicid, netProtos, e.transProto, id, e)
 		return id, err
 	}
 
 	// We need to find a port for the endpoint.
 	_, err := e.stack.PickEphemeralPort(func(p uint16) (bool, *tcpip.Error) {
 		id.LocalPort = p
-		err := e.stack.RegisterTransportEndpoint(nicid, netProtos, e.transProto, id, e, false)
+		err := e.stack.RegisterTransportEndpoint(nicid, netProtos, e.transProto, id, e)
 		switch err {
 		case nil:
 			return true, nil
@@ -597,7 +587,7 @@ func (e *endpoint) bindLocked(addr tcpip.FullAddress, commit func() *tcpip.Error
 	if commit != nil {
 		if err := commit(); err != nil {
 			// Unregister, the commit failed.
-			e.stack.UnregisterTransportEndpoint(addr.NIC, netProtos, e.transProto, id, e)
+			e.stack.UnregisterTransportEndpoint(addr.NIC, netProtos, e.transProto, id)
 			return err
 		}
 	}

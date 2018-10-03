@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -69,6 +69,10 @@ func (t *Task) run(threadID uintptr) {
 	// (runExitMain.execute) so that when
 	// Platform.CooperativelySharesAddressSpace() == true, we give up the
 	// AddressSpace before the task goroutine finishes executing.
+
+	// Ensure that thread group timers for execution time reflect that this
+	// task now exists.
+	t.tg.tm.kick()
 
 	// If this is a newly-started task, it should check for participation in
 	// group stops. If this is a task resuming after restore, it was

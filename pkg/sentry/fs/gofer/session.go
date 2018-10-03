@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/device"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/fsutil"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 	"gvisor.googlesource.com/gvisor/pkg/unet"
 )
 
@@ -36,23 +36,23 @@ type endpointMaps struct {
 	// direntMap links sockets to their dirents.
 	// It is filled concurrently with the keyMap and is stored upon save.
 	// Before saving, this map is used to populate the pathMap.
-	direntMap map[transport.BoundEndpoint]*fs.Dirent
+	direntMap map[unix.BoundEndpoint]*fs.Dirent
 
 	// keyMap links MultiDeviceKeys (containing inode IDs) to their sockets.
 	// It is not stored during save because the inode ID may change upon restore.
-	keyMap map[device.MultiDeviceKey]transport.BoundEndpoint `state:"nosave"`
+	keyMap map[device.MultiDeviceKey]unix.BoundEndpoint `state:"nosave"`
 
 	// pathMap links the sockets to their paths.
 	// It is filled before saving from the direntMap and is stored upon save.
 	// Upon restore, this map is used to re-populate the keyMap.
-	pathMap map[transport.BoundEndpoint]string
+	pathMap map[unix.BoundEndpoint]string
 }
 
 // add adds the endpoint to the maps.
 // A reference is taken on the dirent argument.
 //
 // Precondition: maps must have been locked with 'lock'.
-func (e *endpointMaps) add(key device.MultiDeviceKey, d *fs.Dirent, ep transport.BoundEndpoint) {
+func (e *endpointMaps) add(key device.MultiDeviceKey, d *fs.Dirent, ep unix.BoundEndpoint) {
 	e.keyMap[key] = ep
 	d.IncRef()
 	e.direntMap[ep] = d
@@ -81,7 +81,7 @@ func (e *endpointMaps) lock() func() {
 // get returns the endpoint mapped to the given key.
 //
 // Precondition: maps must have been locked for reading.
-func (e *endpointMaps) get(key device.MultiDeviceKey) transport.BoundEndpoint {
+func (e *endpointMaps) get(key device.MultiDeviceKey) unix.BoundEndpoint {
 	return e.keyMap[key]
 }
 
@@ -90,6 +90,10 @@ func (e *endpointMaps) get(key device.MultiDeviceKey) transport.BoundEndpoint {
 // +stateify savable
 type session struct {
 	refs.AtomicRefCount
+
+	// conn is a unet.Socket that wraps the readFD/writeFD mount option,
+	// see fs/gofer/fs.go.
+	conn *unet.Socket `state:"nosave"`
 
 	// msize is the value of the msize mount option, see fs/gofer/fs.go.
 	msize uint32 `state:"wait"`
@@ -138,7 +142,7 @@ type session struct {
 
 // Destroy tears down the session.
 func (s *session) Destroy() {
-	s.client.Close()
+	s.conn.Close()
 }
 
 // Revalidate implements MountSource.Revalidate.
@@ -197,17 +201,11 @@ func newInodeOperations(ctx context.Context, s *session, file contextFile, qid p
 		}
 	}
 
-	var hm *fsutil.HostMappable
-	if s.cachePolicy == cacheRemoteRevalidating && fs.IsFile(sattr) {
-		hm = fsutil.NewHostMappable()
-	}
-
 	fileState := &inodeFileState{
-		s:            s,
-		file:         file,
-		sattr:        sattr,
-		key:          deviceKey,
-		hostMappable: hm,
+		s:     s,
+		file:  file,
+		sattr: sattr,
+		key:   deviceKey,
 	}
 
 	uattr := unstable(ctx, valid, attr, s.mounter, s.client)
@@ -237,6 +235,7 @@ func Root(ctx context.Context, dev string, filesystem fs.Filesystem, superBlockF
 	// Construct the session.
 	s := &session{
 		connID:          dev,
+		conn:            conn,
 		msize:           o.msize,
 		version:         o.version,
 		cachePolicy:     o.policy,
@@ -253,7 +252,7 @@ func Root(ctx context.Context, dev string, filesystem fs.Filesystem, superBlockF
 	m := fs.NewMountSource(s, filesystem, superBlockFlags)
 
 	// Send the Tversion request.
-	s.client, err = p9.NewClient(conn, s.msize, s.version)
+	s.client, err = p9.NewClient(s.conn, s.msize, s.version)
 	if err != nil {
 		// Drop our reference on the session, it needs to be torn down.
 		s.DecRef()
@@ -286,9 +285,9 @@ func Root(ctx context.Context, dev string, filesystem fs.Filesystem, superBlockF
 // newEndpointMaps creates a new endpointMaps.
 func newEndpointMaps() *endpointMaps {
 	return &endpointMaps{
-		direntMap: make(map[transport.BoundEndpoint]*fs.Dirent),
-		keyMap:    make(map[device.MultiDeviceKey]transport.BoundEndpoint),
-		pathMap:   make(map[transport.BoundEndpoint]string),
+		direntMap: make(map[unix.BoundEndpoint]*fs.Dirent),
+		keyMap:    make(map[device.MultiDeviceKey]unix.BoundEndpoint),
+		pathMap:   make(map[unix.BoundEndpoint]string),
 	}
 }
 
@@ -342,7 +341,7 @@ func (s *session) fillPathMap() error {
 func (s *session) restoreEndpointMaps(ctx context.Context) error {
 	// When restoring, only need to create the keyMap because the dirent and path
 	// maps got stored through the save.
-	s.endpoints.keyMap = make(map[device.MultiDeviceKey]transport.BoundEndpoint)
+	s.endpoints.keyMap = make(map[device.MultiDeviceKey]unix.BoundEndpoint)
 	if err := s.fillKeyMap(ctx); err != nil {
 		return fmt.Errorf("failed to insert sockets into endpoint map: %v", err)
 	}
@@ -350,6 +349,6 @@ func (s *session) restoreEndpointMaps(ctx context.Context) error {
 	// Re-create pathMap because it can no longer be trusted as socket paths can
 	// change while process continues to run. Empty pathMap will be re-filled upon
 	// next save.
-	s.endpoints.pathMap = make(map[transport.BoundEndpoint]string)
+	s.endpoints.pathMap = make(map[unix.BoundEndpoint]string)
 	return nil
 }

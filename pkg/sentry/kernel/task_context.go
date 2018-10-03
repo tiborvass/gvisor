@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,9 @@
 package kernel
 
 import (
+	"errors"
 	"fmt"
 
-	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/cpuid"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
@@ -26,10 +26,10 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/loader"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/mm"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
-	"gvisor.googlesource.com/gvisor/pkg/syserr"
 )
 
-var errNoSyscalls = syserr.New("no syscall table found", linux.ENOEXEC)
+// ErrNoSyscalls is returned if there is no syscall table.
+var ErrNoSyscalls = errors.New("no syscall table found")
 
 // Auxmap contains miscellaneous data for the task.
 type Auxmap map[string]interface{}
@@ -72,7 +72,7 @@ func (tc *TaskContext) release() {
 // TaskContext shares an address space with the original; otherwise, the copied
 // TaskContext has an independent address space that is initially a duplicate
 // of the original's.
-func (tc *TaskContext) Fork(ctx context.Context, k *Kernel, shareAddressSpace bool) (*TaskContext, error) {
+func (tc *TaskContext) Fork(ctx context.Context, shareAddressSpace bool) (*TaskContext, error) {
 	newTC := &TaskContext{
 		Arch: tc.Arch.Fork(),
 		st:   tc.st,
@@ -93,7 +93,8 @@ func (tc *TaskContext) Fork(ctx context.Context, k *Kernel, shareAddressSpace bo
 			return nil, err
 		}
 		newTC.MemoryManager = newMM
-		newTC.fu = k.futexes.Fork()
+		// TODO: revisit when shmem is supported.
+		newTC.fu = futex.NewManager()
 	}
 	return newTC, nil
 }
@@ -113,6 +114,14 @@ func (t *Task) Arch() arch.Context {
 // must be locked.
 func (t *Task) MemoryManager() *mm.MemoryManager {
 	return t.tc.MemoryManager
+}
+
+// Futex returns t's futex manager.
+//
+// Preconditions: The caller must be running on the task goroutine, or t.mu
+// must be locked.
+func (t *Task) Futex() *futex.Manager {
+	return t.tc.fu
 }
 
 // SyscallTable returns t's syscall table.
@@ -142,7 +151,7 @@ func (t *Task) Stack() *arch.Stack {
 //  * argv: Binary argv
 //  * envv: Binary envv
 //  * fs: Binary FeatureSet
-func (k *Kernel) LoadTaskImage(ctx context.Context, mounts *fs.MountNamespace, root, wd *fs.Dirent, maxTraversals *uint, filename string, argv, envv []string, fs *cpuid.FeatureSet) (*TaskContext, *syserr.Error) {
+func (k *Kernel) LoadTaskImage(ctx context.Context, mounts *fs.MountNamespace, root, wd *fs.Dirent, maxTraversals uint, filename string, argv, envv []string, fs *cpuid.FeatureSet) (*TaskContext, error) {
 	// Prepare a new user address space to load into.
 	m := mm.NewMemoryManager(k)
 	defer m.DecUsers(ctx)
@@ -155,9 +164,8 @@ func (k *Kernel) LoadTaskImage(ctx context.Context, mounts *fs.MountNamespace, r
 	// Lookup our new syscall table.
 	st, ok := LookupSyscallTable(os, ac.Arch())
 	if !ok {
-		// No syscall table found. This means that the ELF binary does not match
-		// the architecture.
-		return nil, errNoSyscalls
+		// No syscall table found. Yikes.
+		return nil, ErrNoSyscalls
 	}
 
 	if !m.IncUsers() {
@@ -167,7 +175,7 @@ func (k *Kernel) LoadTaskImage(ctx context.Context, mounts *fs.MountNamespace, r
 		Name:          name,
 		Arch:          ac,
 		MemoryManager: m,
-		fu:            k.futexes.Fork(),
+		fu:            futex.NewManager(),
 		st:            st,
 	}, nil
 }

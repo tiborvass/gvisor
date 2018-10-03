@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,8 +22,8 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/socket"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.googlesource.com/gvisor/pkg/syserr"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 )
 
 // Protocol is the implementation of a netlink socket protocol.
@@ -66,10 +66,10 @@ type socketProvider struct {
 }
 
 // Socket implements socket.Provider.Socket.
-func (*socketProvider) Socket(t *kernel.Task, stype transport.SockType, protocol int) (*fs.File, *syserr.Error) {
+func (*socketProvider) Socket(t *kernel.Task, stype unix.SockType, protocol int) (*fs.File, *syserr.Error) {
 	// Netlink sockets must be specified as datagram or raw, but they
 	// behave the same regardless of type.
-	if stype != transport.SockDgram && stype != transport.SockRaw {
+	if stype != unix.SockDgram && stype != unix.SockRaw {
 		return nil, syserr.ErrSocketNotSupported
 	}
 
@@ -94,7 +94,7 @@ func (*socketProvider) Socket(t *kernel.Task, stype transport.SockType, protocol
 }
 
 // Pair implements socket.Provider.Pair by returning an error.
-func (*socketProvider) Pair(*kernel.Task, transport.SockType, int) (*fs.File, *fs.File, *syserr.Error) {
+func (*socketProvider) Pair(*kernel.Task, unix.SockType, int) (*fs.File, *fs.File, *syserr.Error) {
 	// Netlink sockets never supports creating socket pairs.
 	return nil, nil, syserr.ErrNotSupported
 }

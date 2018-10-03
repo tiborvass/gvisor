@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 package cmd
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -27,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"context"
 	"flag"
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -111,14 +111,14 @@ func (ex *Exec) SetFlags(f *flag.FlagSet) {
 func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
 	e, id, err := ex.parseArgs(f)
 	if err != nil {
-		Fatalf("parsing process spec: %v", err)
+		Fatalf("error parsing process spec: %v", err)
 	}
 	conf := args[0].(*boot.Config)
 	waitStatus := args[1].(*syscall.WaitStatus)
 
 	c, err := container.Load(conf.RootDir, id)
 	if err != nil {
-		Fatalf("loading sandbox: %v", err)
+		Fatalf("error loading sandbox: %v", err)
 	}
 
 	// Replace empty settings with defaults from container.
@@ -128,13 +128,13 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 	if e.Envv == nil {
 		e.Envv, err = resolveEnvs(c.Spec.Process.Env, ex.env)
 		if err != nil {
-			Fatalf("getting environment variables: %v", err)
+			Fatalf("error getting environment variables: %v", err)
 		}
 	}
 	if e.Capabilities == nil {
 		e.Capabilities, err = specutils.Capabilities(c.Spec.Process.Capabilities)
 		if err != nil {
-			Fatalf("creating capabilities: %v", err)
+			Fatalf("error creating capabilities: %v", err)
 		}
 	}
 
@@ -146,10 +146,16 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 		return ex.execAndWait(waitStatus)
 	}
 
+	if ex.pidFile != "" {
+		if err := ioutil.WriteFile(ex.pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
+			Fatalf("error writing pid file: %v", err)
+		}
+	}
+
 	// Start the new process and get it pid.
 	pid, err := c.Execute(e)
 	if err != nil {
-		Fatalf("getting processes for container: %v", err)
+		Fatalf("error getting processes for container: %v", err)
 	}
 
 	if e.StdioIsPty {
@@ -163,30 +169,24 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 	if ex.internalPidFile != "" {
 		pidStr := []byte(strconv.Itoa(int(pid)))
 		if err := ioutil.WriteFile(ex.internalPidFile, pidStr, 0644); err != nil {
-			Fatalf("writing internal pid file %q: %v", ex.internalPidFile, err)
-		}
-	}
-
-	// Generate the pid file after the internal pid file is generated, so that users
-	// can safely assume that the internal pid file is ready after `runsc exec -d`
-	// returns.
-	if ex.pidFile != "" {
-		if err := ioutil.WriteFile(ex.pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
-			Fatalf("writing pid file: %v", err)
+			Fatalf("error writing internal pid file %q: %v", ex.internalPidFile, err)
 		}
 	}
 
 	// Wait for the process to exit.
 	ws, err := c.WaitPID(pid, ex.clearStatus)
 	if err != nil {
-		Fatalf("waiting on pid %d: %v", pid, err)
+		Fatalf("error waiting on pid %d: %v", pid, err)
 	}
 	*waitStatus = ws
 	return subcommands.ExitSuccess
 }
 
 func (ex *Exec) execAndWait(waitStatus *syscall.WaitStatus) subcommands.ExitStatus {
-	binPath := specutils.ExePath
+	binPath, err := specutils.BinPath()
+	if err != nil {
+		Fatalf("error getting bin path: %v", err)
+	}
 	var args []string
 
 	// The command needs to write a pid file so that execAndWait can tell
@@ -196,7 +196,7 @@ func (ex *Exec) execAndWait(waitStatus *syscall.WaitStatus) subcommands.ExitStat
 	if pidFile == "" {
 		tmpDir, err := ioutil.TempDir("", "exec-pid-")
 		if err != nil {
-			Fatalf("creating TempDir: %v", err)
+			Fatalf("error creating TempDir: %v", err)
 		}
 		defer os.RemoveAll(tmpDir)
 		pidFile = filepath.Join(tmpDir, "pid")
@@ -216,7 +216,6 @@ func (ex *Exec) execAndWait(waitStatus *syscall.WaitStatus) subcommands.ExitStat
 	}
 
 	cmd := exec.Command(binPath, args...)
-	cmd.Args[0] = "runsc-exec"
 
 	// Exec stdio defaults to current process stdio.
 	cmd.Stdin = os.Stdin
@@ -230,7 +229,7 @@ func (ex *Exec) execAndWait(waitStatus *syscall.WaitStatus) subcommands.ExitStat
 		// socket.
 		tty, err := console.NewWithSocket(ex.consoleSocket)
 		if err != nil {
-			Fatalf("setting up console with socket %q: %v", ex.consoleSocket, err)
+			Fatalf("error setting up console with socket %q: %v", ex.consoleSocket, err)
 		}
 		defer tty.Close()
 
@@ -305,7 +304,7 @@ func (ex *Exec) argsFromCLI(argv []string) (*control.ExecArgs, error) {
 	for _, s := range ex.extraKGIDs {
 		kgid, err := strconv.Atoi(s)
 		if err != nil {
-			Fatalf("parsing GID: %s, %v", s, err)
+			Fatalf("error parsing GID: %s, %v", s, err)
 		}
 		extraKGIDs = append(extraKGIDs, auth.KGID(kgid))
 	}

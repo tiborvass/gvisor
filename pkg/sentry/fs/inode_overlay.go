@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 )
 
 func overlayHasWhiteout(parent *Inode, name string) bool {
@@ -356,7 +356,7 @@ func overlayRename(ctx context.Context, o *overlayEntry, oldParent *Dirent, rena
 	return nil
 }
 
-func overlayBind(ctx context.Context, o *overlayEntry, name string, data transport.BoundEndpoint, perm FilePermissions) (*Dirent, error) {
+func overlayBind(ctx context.Context, o *overlayEntry, name string, data unix.BoundEndpoint, perm FilePermissions) (*Dirent, error) {
 	o.copyMu.RLock()
 	defer o.copyMu.RUnlock()
 	// We do not support doing anything exciting with sockets unless there
@@ -383,19 +383,15 @@ func overlayBind(ctx context.Context, o *overlayEntry, name string, data transpo
 	return NewDirent(newOverlayInode(ctx, entry, inode.MountSource), name), nil
 }
 
-func overlayBoundEndpoint(o *overlayEntry, path string) transport.BoundEndpoint {
+func overlayBoundEndpoint(o *overlayEntry, path string) unix.BoundEndpoint {
 	o.copyMu.RLock()
 	defer o.copyMu.RUnlock()
 
 	if o.upper != nil {
 		return o.upper.InodeOperations.BoundEndpoint(o.upper, path)
 	}
-
-	// If the lower is itself an overlay, recurse.
-	if o.lower.overlay != nil {
-		return overlayBoundEndpoint(o.lower.overlay, path)
-	}
-	// Lower is not an overlay. Call BoundEndpoint directly.
+	// If a socket is already in the lower file system, allow connections
+	// to it.
 	return o.lower.InodeOperations.BoundEndpoint(o.lower, path)
 }
 
@@ -594,6 +590,19 @@ func overlayStatFS(ctx context.Context, o *overlayEntry) (Info, error) {
 	i.Type = linux.OVERLAYFS_SUPER_MAGIC
 
 	return i, nil
+}
+
+func overlayHandleOps(o *overlayEntry) HandleOperations {
+	// Hot path. Avoid defers.
+	var hops HandleOperations
+	o.copyMu.RLock()
+	if o.upper != nil {
+		hops = o.upper.HandleOps()
+	} else {
+		hops = o.lower.HandleOps()
+	}
+	o.copyMu.RUnlock()
+	return hops
 }
 
 // NewTestOverlayDir returns an overlay Inode for tests.

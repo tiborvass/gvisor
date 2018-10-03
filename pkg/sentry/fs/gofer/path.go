@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,8 +22,8 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/device"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 )
 
 // Lookup loads an Inode at name into a Dirent based on the session's cache
@@ -128,7 +128,7 @@ func (i *inodeOperations) Create(ctx context.Context, dir *fs.Inode, name string
 		File: newFile,
 		Host: hostFile,
 	}
-	if iops.session().cachePolicy.cacheHandles(d.Inode) {
+	if iops.session().cachePolicy.usePageCache(d.Inode) {
 		iops.fileState.setHandlesForCachedIO(flags, h)
 	}
 	return NewFile(ctx, d, name, flags, iops, h), nil
@@ -180,7 +180,7 @@ func (i *inodeOperations) CreateDirectory(ctx context.Context, dir *fs.Inode, s 
 }
 
 // Bind implements InodeOperations.Bind.
-func (i *inodeOperations) Bind(ctx context.Context, dir *fs.Inode, name string, ep transport.BoundEndpoint, perm fs.FilePermissions) (*fs.Dirent, error) {
+func (i *inodeOperations) Bind(ctx context.Context, dir *fs.Inode, name string, ep unix.BoundEndpoint, perm fs.FilePermissions) (*fs.Dirent, error) {
 	if i.session().endpoints == nil {
 		return nil, syscall.EOPNOTSUPP
 	}

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/unimpl"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 )
@@ -35,7 +34,7 @@ type TTYFileOperations struct {
 	fileOperations
 
 	// mu protects the fields below.
-	mu sync.Mutex `state:"nosave"`
+	mu sync.Mutex
 
 	// FGProcessGroup is the foreground process group this TTY.  Will be
 	// nil if not set or if this file has been released.
@@ -180,35 +179,6 @@ func (t *TTYFileOperations) Ioctl(ctx context.Context, io usermem.IO, args arch.
 		err := ioctlSetWinsize(fd, &winsize)
 		return 0, err
 
-	// Unimplemented commands.
-	case linux.TIOCSETD,
-		linux.TIOCSBRK,
-		linux.TIOCCBRK,
-		linux.TCSBRK,
-		linux.TCSBRKP,
-		linux.TIOCSTI,
-		linux.TIOCCONS,
-		linux.FIONBIO,
-		linux.TIOCEXCL,
-		linux.TIOCNXCL,
-		linux.TIOCGEXCL,
-		linux.TIOCNOTTY,
-		linux.TIOCSCTTY,
-		linux.TIOCGSID,
-		linux.TIOCGETD,
-		linux.TIOCVHANGUP,
-		linux.TIOCGDEV,
-		linux.TIOCMGET,
-		linux.TIOCMSET,
-		linux.TIOCMBIC,
-		linux.TIOCMBIS,
-		linux.TIOCGICOUNT,
-		linux.TCFLSH,
-		linux.TIOCSSERIAL,
-		linux.TIOCGPTPEER:
-
-		unimpl.EmitUnimplementedEvent(ctx)
-		fallthrough
 	default:
 		return 0, syserror.ENOTTY
 	}

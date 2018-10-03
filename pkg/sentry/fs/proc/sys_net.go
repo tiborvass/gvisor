@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,17 +17,13 @@ package proc
 import (
 	"fmt"
 	"io"
-	"sync"
 
-	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/fsutil"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/proc/device"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/ramfs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/inet"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
-	"gvisor.googlesource.com/gvisor/pkg/waiter"
 )
 
 type tcpMemDir int
@@ -37,37 +33,21 @@ const (
 	tcpWMem
 )
 
-// tcpMemInode is used to read/write the size of netstack tcp buffers.
-//
-// TODO: If we have multiple proc mounts, concurrent writes can
-// leave netstack and the proc files in an inconsistent state. Since we set the
-// buffer size from these proc files on restore, we may also race and end up in
-// an inconsistent state on restore.
-//
 // +stateify savable
-type tcpMemInode struct {
-	fsutil.SimpleFileInode
-	dir tcpMemDir
-	s   inet.Stack `state:"wait"`
-
-	// size stores the tcp buffer size during save, and sets the buffer
-	// size in netstack in restore. We must save/restore this here, since
-	// netstack itself is stateless.
+type tcpMem struct {
+	ramfs.Entry
+	s    inet.Stack
 	size inet.TCPBufferSize
-
-	// mu protects against concurrent reads/writes to files based on this
-	// inode.
-	mu sync.Mutex `state:"nosave"`
+	dir  tcpMemDir
 }
 
-var _ fs.InodeOperations = (*tcpMemInode)(nil)
+func newTCPMem(s inet.Stack, size inet.TCPBufferSize, dir tcpMemDir) *tcpMem {
+	return &tcpMem{s: s, size: size, dir: dir}
+}
 
-func newTCPMemInode(ctx context.Context, msrc *fs.MountSource, s inet.Stack, dir tcpMemDir) *fs.Inode {
-	tm := &tcpMemInode{
-		SimpleFileInode: *fsutil.NewSimpleFileInode(ctx, fs.RootOwner, fs.FilePermsFromMode(0444), linux.PROC_SUPER_MAGIC),
-		s:               s,
-		dir:             dir,
-	}
+func newTCPMemInode(ctx context.Context, msrc *fs.MountSource, s inet.Stack, size inet.TCPBufferSize, dir tcpMemDir) *fs.Inode {
+	tm := newTCPMem(s, size, dir)
+	tm.InitEntry(ctx, fs.RootOwner, fs.FilePermsFromMode(0644))
 	sattr := fs.StableAttr{
 		DeviceID:  device.ProcDevice.DeviceID(),
 		InodeID:   device.ProcDevice.NextIno(),
@@ -77,105 +57,59 @@ func newTCPMemInode(ctx context.Context, msrc *fs.MountSource, s inet.Stack, dir
 	return fs.NewInode(tm, msrc, sattr)
 }
 
-// GetFile implements fs.InodeOperations.GetFile.
-func (m *tcpMemInode) GetFile(ctx context.Context, dirent *fs.Dirent, flags fs.FileFlags) (*fs.File, error) {
-	flags.Pread = true
-	return fs.NewFile(ctx, dirent, flags, &tcpMemFile{tcpMemInode: m}), nil
-}
-
-// +stateify savable
-type tcpMemFile struct {
-	waiter.AlwaysReady       `state:"nosave"`
-	fsutil.FileGenericSeek   `state:"nosave"`
-	fsutil.FileNoIoctl       `state:"nosave"`
-	fsutil.FileNoMMap        `state:"nosave"`
-	fsutil.FileNoopRelease   `state:"nosave"`
-	fsutil.FileNoopFlush     `state:"nosave"`
-	fsutil.FileNoopFsync     `state:"nosave"`
-	fsutil.FileNotDirReaddir `state:"nosave"`
-
-	tcpMemInode *tcpMemInode
-}
-
-var _ fs.FileOperations = (*tcpMemFile)(nil)
-
-// Read implements fs.FileOperations.Read.
-func (f *tcpMemFile) Read(ctx context.Context, _ *fs.File, dst usermem.IOSequence, offset int64) (int64, error) {
+// DeprecatedPreadv implements fs.InodeOperations.DeprecatedPreadv.
+func (m *tcpMem) DeprecatedPreadv(ctx context.Context, dst usermem.IOSequence, offset int64) (int64, error) {
 	if offset != 0 {
 		return 0, io.EOF
 	}
-	f.tcpMemInode.mu.Lock()
-	defer f.tcpMemInode.mu.Unlock()
-
-	size, err := readSize(f.tcpMemInode.dir, f.tcpMemInode.s)
-	if err != nil {
-		return 0, err
-	}
-	s := fmt.Sprintf("%d\t%d\t%d\n", size.Min, size.Default, size.Max)
+	s := fmt.Sprintf("%d\t%d\t%d\n", m.size.Min, m.size.Default, m.size.Max)
 	n, err := dst.CopyOut(ctx, []byte(s))
 	return int64(n), err
 }
 
-// Write implements fs.FileOperations.Write.
-func (f *tcpMemFile) Write(ctx context.Context, _ *fs.File, src usermem.IOSequence, offset int64) (int64, error) {
+// Truncate implements fs.InodeOperations.Truncate.
+func (*tcpMem) Truncate(context.Context, *fs.Inode, int64) error {
+	return nil
+}
+
+// DeprecatedPwritev implements fs.InodeOperations.DeprecatedPwritev.
+func (m *tcpMem) DeprecatedPwritev(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
 	if src.NumBytes() == 0 {
 		return 0, nil
 	}
-	f.tcpMemInode.mu.Lock()
-	defer f.tcpMemInode.mu.Unlock()
-
 	src = src.TakeFirst(usermem.PageSize - 1)
-	size, err := readSize(f.tcpMemInode.dir, f.tcpMemInode.s)
-	if err != nil {
-		return 0, err
-	}
-	buf := []int32{int32(size.Min), int32(size.Default), int32(size.Max)}
+
+	buf := []int32{int32(m.size.Min), int32(m.size.Default), int32(m.size.Max)}
 	n, cperr := usermem.CopyInt32StringsInVec(ctx, src.IO, src.Addrs, buf, src.Opts)
-	newSize := inet.TCPBufferSize{
+	size := inet.TCPBufferSize{
 		Min:     int(buf[0]),
 		Default: int(buf[1]),
 		Max:     int(buf[2]),
 	}
-	if err := writeSize(f.tcpMemInode.dir, f.tcpMemInode.s, newSize); err != nil {
+	var err error
+	switch m.dir {
+	case tcpRMem:
+		err = m.s.SetTCPReceiveBufferSize(size)
+	case tcpWMem:
+		err = m.s.SetTCPSendBufferSize(size)
+	default:
+		panic(fmt.Sprintf("unknown tcpMem.dir: %v", m.dir))
+	}
+	if err != nil {
 		return n, err
 	}
 	return n, cperr
 }
 
-func readSize(dirType tcpMemDir, s inet.Stack) (inet.TCPBufferSize, error) {
-	switch dirType {
-	case tcpRMem:
-		return s.TCPReceiveBufferSize()
-	case tcpWMem:
-		return s.TCPSendBufferSize()
-	default:
-		panic(fmt.Sprintf("unknown tcpMemFile type: %v", dirType))
-	}
-}
-
-func writeSize(dirType tcpMemDir, s inet.Stack, size inet.TCPBufferSize) error {
-	switch dirType {
-	case tcpRMem:
-		return s.SetTCPReceiveBufferSize(size)
-	case tcpWMem:
-		return s.SetTCPSendBufferSize(size)
-	default:
-		panic(fmt.Sprintf("unknown tcpMemFile type: %v", dirType))
-	}
-}
-
 // +stateify savable
 type tcpSack struct {
-	stack   inet.Stack `state:"wait"`
-	enabled *bool
-	fsutil.SimpleFileInode
+	ramfs.Entry
+	s inet.Stack
 }
 
 func newTCPSackInode(ctx context.Context, msrc *fs.MountSource, s inet.Stack) *fs.Inode {
-	ts := &tcpSack{
-		SimpleFileInode: *fsutil.NewSimpleFileInode(ctx, fs.RootOwner, fs.FilePermsFromMode(0444), linux.PROC_SUPER_MAGIC),
-		stack:           s,
-	}
+	ts := &tcpSack{s: s}
+	ts.InitEntry(ctx, fs.RootOwner, fs.FilePermsFromMode(0644))
 	sattr := fs.StableAttr{
 		DeviceID:  device.ProcDevice.DeviceID(),
 		InodeID:   device.ProcDevice.NextIno(),
@@ -185,48 +119,18 @@ func newTCPSackInode(ctx context.Context, msrc *fs.MountSource, s inet.Stack) *f
 	return fs.NewInode(ts, msrc, sattr)
 }
 
-// GetFile implements fs.InodeOperations.GetFile.
-func (s *tcpSack) GetFile(ctx context.Context, dirent *fs.Dirent, flags fs.FileFlags) (*fs.File, error) {
-	flags.Pread = true
-	flags.Pwrite = true
-	return fs.NewFile(ctx, dirent, flags, &tcpSackFile{
-		tcpSack: s,
-		stack:   s.stack,
-	}), nil
-}
-
-// +stateify savable
-type tcpSackFile struct {
-	waiter.AlwaysReady       `state:"nosave"`
-	fsutil.FileGenericSeek   `state:"nosave"`
-	fsutil.FileNoIoctl       `state:"nosave"`
-	fsutil.FileNoMMap        `state:"nosave"`
-	fsutil.FileNoopRelease   `state:"nosave"`
-	fsutil.FileNoopFlush     `state:"nosave"`
-	fsutil.FileNoopFsync     `state:"nosave"`
-	fsutil.FileNotDirReaddir `state:"nosave"`
-
-	tcpSack *tcpSack
-
-	stack inet.Stack `state:"wait"`
-}
-
-// Read implements fs.FileOperations.Read.
-func (f *tcpSackFile) Read(ctx context.Context, _ *fs.File, dst usermem.IOSequence, offset int64) (int64, error) {
+func (s *tcpSack) DeprecatedPreadv(ctx context.Context, dst usermem.IOSequence, offset int64) (int64, error) {
 	if offset != 0 {
 		return 0, io.EOF
 	}
 
-	if f.tcpSack.enabled == nil {
-		sack, err := f.stack.TCPSACKEnabled()
-		if err != nil {
-			return 0, err
-		}
-		f.tcpSack.enabled = &sack
+	sack, err := s.s.TCPSACKEnabled()
+	if err != nil {
+		return 0, err
 	}
 
 	val := "0\n"
-	if *f.tcpSack.enabled {
+	if sack {
 		// Technically, this is not quite compatible with Linux. Linux
 		// stores these as an integer, so if you write "2" into
 		// tcp_sack, you should get 2 back. Tough luck.
@@ -236,8 +140,13 @@ func (f *tcpSackFile) Read(ctx context.Context, _ *fs.File, dst usermem.IOSequen
 	return int64(n), err
 }
 
-// Write implements fs.FileOperations.Write.
-func (f *tcpSackFile) Write(ctx context.Context, _ *fs.File, src usermem.IOSequence, offset int64) (int64, error) {
+// Truncate implements fs.InodeOperations.Truncate.
+func (*tcpSack) Truncate(context.Context, *fs.Inode, int64) error {
+	return nil
+}
+
+// DeprecatedPwritev implements fs.InodeOperations.DeprecatedPwritev.
+func (s *tcpSack) DeprecatedPwritev(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
 	if src.NumBytes() == 0 {
 		return 0, nil
 	}
@@ -248,104 +157,96 @@ func (f *tcpSackFile) Write(ctx context.Context, _ *fs.File, src usermem.IOSeque
 	if err != nil {
 		return n, err
 	}
-	if f.tcpSack.enabled == nil {
-		f.tcpSack.enabled = new(bool)
-	}
-	*f.tcpSack.enabled = v != 0
-	return n, f.tcpSack.stack.SetTCPSACKEnabled(*f.tcpSack.enabled)
+	return n, s.s.SetTCPSACKEnabled(v != 0)
 }
 
 func (p *proc) newSysNetCore(ctx context.Context, msrc *fs.MountSource, s inet.Stack) *fs.Inode {
+	d := &ramfs.Dir{}
+	d.InitDir(ctx, nil, fs.RootOwner, fs.FilePermsFromMode(0555))
+
 	// The following files are simple stubs until they are implemented in
 	// netstack, most of these files are configuration related. We use the
 	// value closest to the actual netstack behavior or any empty file,
 	// all of these files will have mode 0444 (read-only for all users).
-	contents := map[string]*fs.Inode{
-		"default_qdisc": newStaticProcInode(ctx, msrc, []byte("pfifo_fast")),
-		"message_burst": newStaticProcInode(ctx, msrc, []byte("10")),
-		"message_cost":  newStaticProcInode(ctx, msrc, []byte("5")),
-		"optmem_max":    newStaticProcInode(ctx, msrc, []byte("0")),
-		"rmem_default":  newStaticProcInode(ctx, msrc, []byte("212992")),
-		"rmem_max":      newStaticProcInode(ctx, msrc, []byte("212992")),
-		"somaxconn":     newStaticProcInode(ctx, msrc, []byte("128")),
-		"wmem_default":  newStaticProcInode(ctx, msrc, []byte("212992")),
-		"wmem_max":      newStaticProcInode(ctx, msrc, []byte("212992")),
-	}
+	d.AddChild(ctx, "default_qdisc", p.newStubProcFSFile(ctx, msrc, []byte("pfifo_fast")))
+	d.AddChild(ctx, "message_burst", p.newStubProcFSFile(ctx, msrc, []byte("10")))
+	d.AddChild(ctx, "message_cost", p.newStubProcFSFile(ctx, msrc, []byte("5")))
+	d.AddChild(ctx, "optmem_max", p.newStubProcFSFile(ctx, msrc, []byte("0")))
+	d.AddChild(ctx, "rmem_default", p.newStubProcFSFile(ctx, msrc, []byte("212992")))
+	d.AddChild(ctx, "rmem_max", p.newStubProcFSFile(ctx, msrc, []byte("212992")))
+	d.AddChild(ctx, "somaxconn", p.newStubProcFSFile(ctx, msrc, []byte("128")))
+	d.AddChild(ctx, "wmem_default", p.newStubProcFSFile(ctx, msrc, []byte("212992")))
+	d.AddChild(ctx, "wmem_max", p.newStubProcFSFile(ctx, msrc, []byte("212992")))
 
-	d := ramfs.NewDir(ctx, contents, fs.RootOwner, fs.FilePermsFromMode(0555))
-	return newProcInode(d, msrc, fs.SpecialDirectory, nil)
+	return newFile(d, msrc, fs.SpecialDirectory, nil)
 }
 
 func (p *proc) newSysNetIPv4Dir(ctx context.Context, msrc *fs.MountSource, s inet.Stack) *fs.Inode {
-	contents := map[string]*fs.Inode{
-		// Add tcp_sack.
-		"tcp_sack": newTCPSackInode(ctx, msrc, s),
-
-		// The following files are simple stubs until they are
-		// implemented in netstack, most of these files are
-		// configuration related. We use the value closest to the
-		// actual netstack behavior or any empty file, all of these
-		// files will have mode 0444 (read-only for all users).
-		"ip_local_port_range":     newStaticProcInode(ctx, msrc, []byte("16000   65535")),
-		"ip_local_reserved_ports": newStaticProcInode(ctx, msrc, []byte("")),
-		"ipfrag_time":             newStaticProcInode(ctx, msrc, []byte("30")),
-		"ip_nonlocal_bind":        newStaticProcInode(ctx, msrc, []byte("0")),
-		"ip_no_pmtu_disc":         newStaticProcInode(ctx, msrc, []byte("1")),
-
-		// tcp_allowed_congestion_control tell the user what they are
-		// able to do as an unprivledged process so we leave it empty.
-		"tcp_allowed_congestion_control":   newStaticProcInode(ctx, msrc, []byte("")),
-		"tcp_available_congestion_control": newStaticProcInode(ctx, msrc, []byte("reno")),
-		"tcp_congestion_control":           newStaticProcInode(ctx, msrc, []byte("reno")),
-
-		// Many of the following stub files are features netstack
-		// doesn't support. The unsupported features return "0" to
-		// indicate they are disabled.
-		"tcp_base_mss":              newStaticProcInode(ctx, msrc, []byte("1280")),
-		"tcp_dsack":                 newStaticProcInode(ctx, msrc, []byte("0")),
-		"tcp_early_retrans":         newStaticProcInode(ctx, msrc, []byte("0")),
-		"tcp_fack":                  newStaticProcInode(ctx, msrc, []byte("0")),
-		"tcp_fastopen":              newStaticProcInode(ctx, msrc, []byte("0")),
-		"tcp_fastopen_key":          newStaticProcInode(ctx, msrc, []byte("")),
-		"tcp_invalid_ratelimit":     newStaticProcInode(ctx, msrc, []byte("0")),
-		"tcp_keepalive_intvl":       newStaticProcInode(ctx, msrc, []byte("0")),
-		"tcp_keepalive_probes":      newStaticProcInode(ctx, msrc, []byte("0")),
-		"tcp_keepalive_time":        newStaticProcInode(ctx, msrc, []byte("7200")),
-		"tcp_mtu_probing":           newStaticProcInode(ctx, msrc, []byte("0")),
-		"tcp_no_metrics_save":       newStaticProcInode(ctx, msrc, []byte("1")),
-		"tcp_probe_interval":        newStaticProcInode(ctx, msrc, []byte("0")),
-		"tcp_probe_threshold":       newStaticProcInode(ctx, msrc, []byte("0")),
-		"tcp_retries1":              newStaticProcInode(ctx, msrc, []byte("3")),
-		"tcp_retries2":              newStaticProcInode(ctx, msrc, []byte("15")),
-		"tcp_rfc1337":               newStaticProcInode(ctx, msrc, []byte("1")),
-		"tcp_slow_start_after_idle": newStaticProcInode(ctx, msrc, []byte("1")),
-		"tcp_synack_retries":        newStaticProcInode(ctx, msrc, []byte("5")),
-		"tcp_syn_retries":           newStaticProcInode(ctx, msrc, []byte("3")),
-		"tcp_timestamps":            newStaticProcInode(ctx, msrc, []byte("1")),
-	}
+	d := &ramfs.Dir{}
+	d.InitDir(ctx, nil, fs.RootOwner, fs.FilePermsFromMode(0555))
 
 	// Add tcp_rmem.
-	if _, err := s.TCPReceiveBufferSize(); err == nil {
-		contents["tcp_rmem"] = newTCPMemInode(ctx, msrc, s, tcpRMem)
+	if rs, err := s.TCPReceiveBufferSize(); err == nil {
+		d.AddChild(ctx, "tcp_rmem", newTCPMemInode(ctx, msrc, s, rs, tcpRMem))
 	}
 
 	// Add tcp_wmem.
-	if _, err := s.TCPSendBufferSize(); err == nil {
-		contents["tcp_wmem"] = newTCPMemInode(ctx, msrc, s, tcpWMem)
+	if ss, err := s.TCPSendBufferSize(); err == nil {
+		d.AddChild(ctx, "tcp_wmem", newTCPMemInode(ctx, msrc, s, ss, tcpWMem))
 	}
 
-	d := ramfs.NewDir(ctx, contents, fs.RootOwner, fs.FilePermsFromMode(0555))
-	return newProcInode(d, msrc, fs.SpecialDirectory, nil)
+	// Add tcp_sack.
+	d.AddChild(ctx, "tcp_sack", newTCPSackInode(ctx, msrc, s))
+
+	// The following files are simple stubs until they are implemented in
+	// netstack, most of these files are configuration related. We use the
+	// value closest to the actual netstack behavior or any empty file,
+	// all of these files will have mode 0444 (read-only for all users).
+	d.AddChild(ctx, "ip_local_port_range", p.newStubProcFSFile(ctx, msrc, []byte("16000   65535")))
+	d.AddChild(ctx, "ip_local_reserved_ports", p.newStubProcFSFile(ctx, msrc, []byte("")))
+	d.AddChild(ctx, "ipfrag_time", p.newStubProcFSFile(ctx, msrc, []byte("30")))
+	d.AddChild(ctx, "ip_nonlocal_bind", p.newStubProcFSFile(ctx, msrc, []byte("0")))
+	d.AddChild(ctx, "ip_no_pmtu_disc", p.newStubProcFSFile(ctx, msrc, []byte("1")))
+
+	// tcp_allowed_congestion_control tell the user what they are able to do as an
+	// unprivledged process so we leave it empty.
+	d.AddChild(ctx, "tcp_allowed_congestion_control", p.newStubProcFSFile(ctx, msrc, []byte("")))
+	d.AddChild(ctx, "tcp_available_congestion_control", p.newStubProcFSFile(ctx, msrc, []byte("reno")))
+	d.AddChild(ctx, "tcp_congestion_control", p.newStubProcFSFile(ctx, msrc, []byte("reno")))
+
+	// Many of the following stub files are features netstack doesn't support
+	// and are therefore "0" for disabled.
+	d.AddChild(ctx, "tcp_base_mss", p.newStubProcFSFile(ctx, msrc, []byte("1280")))
+	d.AddChild(ctx, "tcp_dsack", p.newStubProcFSFile(ctx, msrc, []byte("0")))
+	d.AddChild(ctx, "tcp_early_retrans", p.newStubProcFSFile(ctx, msrc, []byte("0")))
+	d.AddChild(ctx, "tcp_fack", p.newStubProcFSFile(ctx, msrc, []byte("0")))
+	d.AddChild(ctx, "tcp_fastopen", p.newStubProcFSFile(ctx, msrc, []byte("0")))
+	d.AddChild(ctx, "tcp_fastopen_key", p.newStubProcFSFile(ctx, msrc, []byte("")))
+	d.AddChild(ctx, "tcp_invalid_ratelimit", p.newStubProcFSFile(ctx, msrc, []byte("0")))
+	d.AddChild(ctx, "tcp_keepalive_intvl", p.newStubProcFSFile(ctx, msrc, []byte("0")))
+	d.AddChild(ctx, "tcp_keepalive_probes", p.newStubProcFSFile(ctx, msrc, []byte("0")))
+	d.AddChild(ctx, "tcp_keepalive_time", p.newStubProcFSFile(ctx, msrc, []byte("7200")))
+	d.AddChild(ctx, "tcp_mtu_probing", p.newStubProcFSFile(ctx, msrc, []byte("0")))
+	d.AddChild(ctx, "tcp_no_metrics_save", p.newStubProcFSFile(ctx, msrc, []byte("1")))
+	d.AddChild(ctx, "tcp_probe_interval", p.newStubProcFSFile(ctx, msrc, []byte("0")))
+	d.AddChild(ctx, "tcp_probe_threshold", p.newStubProcFSFile(ctx, msrc, []byte("0")))
+	d.AddChild(ctx, "tcp_retries1", p.newStubProcFSFile(ctx, msrc, []byte("3")))
+	d.AddChild(ctx, "tcp_retries2", p.newStubProcFSFile(ctx, msrc, []byte("15")))
+	d.AddChild(ctx, "tcp_rfc1337", p.newStubProcFSFile(ctx, msrc, []byte("1")))
+	d.AddChild(ctx, "tcp_slow_start_after_idle", p.newStubProcFSFile(ctx, msrc, []byte("1")))
+	d.AddChild(ctx, "tcp_synack_retries", p.newStubProcFSFile(ctx, msrc, []byte("5")))
+	d.AddChild(ctx, "tcp_syn_retries", p.newStubProcFSFile(ctx, msrc, []byte("3")))
+	d.AddChild(ctx, "tcp_timestamps", p.newStubProcFSFile(ctx, msrc, []byte("1")))
+
+	return newFile(d, msrc, fs.SpecialDirectory, nil)
 }
 
 func (p *proc) newSysNetDir(ctx context.Context, msrc *fs.MountSource) *fs.Inode {
-	var contents map[string]*fs.Inode
+	d := &ramfs.Dir{}
+	d.InitDir(ctx, nil, fs.RootOwner, fs.FilePermsFromMode(0555))
 	if s := p.k.NetworkStack(); s != nil {
-		contents = map[string]*fs.Inode{
-			"ipv4": p.newSysNetIPv4Dir(ctx, msrc, s),
-			"core": p.newSysNetCore(ctx, msrc, s),
-		}
+		d.AddChild(ctx, "ipv4", p.newSysNetIPv4Dir(ctx, msrc, s))
+		d.AddChild(ctx, "core", p.newSysNetCore(ctx, msrc, s))
 	}
-	d := ramfs.NewDir(ctx, contents, fs.RootOwner, fs.FilePermsFromMode(0555))
-	return newProcInode(d, msrc, fs.SpecialDirectory, nil)
+	return newFile(d, msrc, fs.SpecialDirectory, nil)
 }

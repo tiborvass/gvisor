@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,11 +24,9 @@ import "fmt"
 //	__u64 args[6];
 // };
 const (
-	seccompDataOffsetNR     = 0
-	seccompDataOffsetArch   = 4
-	seccompDataOffsetIPLow  = 8
-	seccompDataOffsetIPHigh = 12
-	seccompDataOffsetArgs   = 16
+	seccompDataOffsetNR   = 0
+	seccompDataOffsetArch = 4
+	seccompDataOffsetArgs = 16
 )
 
 func seccompDataOffsetArgLow(i int) uint32 {

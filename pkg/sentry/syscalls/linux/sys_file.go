@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -92,11 +92,10 @@ func fileOpOn(t *kernel.Task, dirFD kdefs.FD, path string, resolve bool, fn func
 	root := t.FSContext().RootDirectory()
 
 	// Lookup the node.
-	remainingTraversals := uint(linux.MaxSymlinkTraversals)
 	if resolve {
-		d, err = t.MountNamespace().FindInode(t, root, rel, path, &remainingTraversals)
+		d, err = t.MountNamespace().FindInode(t, root, rel, path, linux.MaxSymlinkTraversals)
 	} else {
-		d, err = t.MountNamespace().FindLink(t, root, rel, path, &remainingTraversals)
+		d, err = t.MountNamespace().FindLink(t, root, rel, path, linux.MaxSymlinkTraversals)
 	}
 	root.DecRef()
 	if wd != nil {
@@ -116,7 +115,7 @@ func fileOpOn(t *kernel.Task, dirFD kdefs.FD, path string, resolve bool, fn func
 
 // copyInPath copies a path in.
 func copyInPath(t *kernel.Task, addr usermem.Addr, allowEmpty bool) (path string, dirPath bool, err error) {
-	path, err = t.CopyInString(addr, linux.PATH_MAX)
+	path, err = t.CopyInString(addr, syscall.PathMax)
 	if err != nil {
 		return "", false, err
 	}
@@ -170,7 +169,7 @@ func openAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, flags uint) (fd u
 			if dirPath {
 				return syserror.ENOTDIR
 			}
-			if flags&linux.O_TRUNC != 0 {
+			if fileFlags.Write && flags&linux.O_TRUNC != 0 {
 				if err := d.Inode.Truncate(t, d, 0); err != nil {
 					return err
 				}
@@ -313,8 +312,7 @@ func createAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, flags uint, mod
 		fileFlags.LargeFile = true
 
 		// Does this file exist already?
-		remainingTraversals := uint(linux.MaxSymlinkTraversals)
-		targetDirent, err := t.MountNamespace().FindInode(t, root, d, name, &remainingTraversals)
+		targetDirent, err := t.MountNamespace().FindInode(t, root, d, name, linux.MaxSymlinkTraversals)
 		var newFile *fs.File
 		switch err {
 		case nil:
@@ -999,8 +997,7 @@ func mkdirAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr, mode linux.FileM
 		}
 
 		// Does this directory exist already?
-		remainingTraversals := uint(linux.MaxSymlinkTraversals)
-		f, err := t.MountNamespace().FindInode(t, root, d, name, &remainingTraversals)
+		f, err := t.MountNamespace().FindInode(t, root, d, name, linux.MaxSymlinkTraversals)
 		switch err {
 		case nil:
 			// The directory existed.
@@ -1045,23 +1042,16 @@ func rmdirAt(t *kernel.Task, dirFD kdefs.FD, addr usermem.Addr) error {
 		return err
 	}
 
-	// Special case: removing the root always returns EBUSY.
-	if path == "/" {
-		return syserror.EBUSY
+	// Special case: rmdir rejects anything with '.' as last component.
+	// This would be handled by the busy check for the current working
+	// directory, but this is how it's done.
+	if (len(path) == 1 && path == ".") || (len(path) > 1 && path[len(path)-2:] == "/.") {
+		return syserror.EINVAL
 	}
 
 	return fileOpAt(t, dirFD, path, func(root *fs.Dirent, d *fs.Dirent, name string) error {
 		if !fs.IsDir(d.Inode.StableAttr) {
 			return syserror.ENOTDIR
-		}
-
-		// Linux returns different ernos when the path ends in single
-		// dot vs. double dots.
-		switch name {
-		case ".":
-			return syserror.EINVAL
-		case "..":
-			return syserror.ENOTEMPTY
 		}
 
 		if err := fs.MayDelete(t, root, d, name); err != nil {
@@ -1090,7 +1080,7 @@ func symlinkAt(t *kernel.Task, dirFD kdefs.FD, newAddr usermem.Addr, oldAddr use
 
 	// The oldPath is copied in verbatim. This is because the symlink
 	// will include all details, including trailing slashes.
-	oldPath, err := t.CopyInString(oldAddr, linux.PATH_MAX)
+	oldPath, err := t.CopyInString(oldAddr, syscall.PathMax)
 	if err != nil {
 		return err
 	}
@@ -1143,6 +1133,9 @@ func mayLinkAt(t *kernel.Task, target *fs.Inode) error {
 	// always enabled, and thus imposes the following restrictions on hard
 	// links.
 
+	// Technically Linux is more restrictive in 3.11.10 (requires CAP_FOWNER in
+	// root user namespace); this is from the later f2ca379642d7 "namei: permit
+	// linking with CAP_FOWNER in userns".
 	if target.CheckOwnership(t) {
 		// fs/namei.c:may_linkat: "Source inode owner (or CAP_FOWNER)
 		// can hardlink all they like."
@@ -1251,12 +1244,6 @@ func Linkat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	// AT_SYMLINK_FOLLOW can be specified in flags to cause oldpath to be
 	// dereferenced if it is a symbolic link.
 	flags := args[4].Int()
-
-	// Sanity check flags.
-	if flags&^(linux.AT_SYMLINK_FOLLOW|linux.AT_EMPTY_PATH) != 0 {
-		return 0, nil, syserror.EINVAL
-	}
-
 	resolve := flags&linux.AT_SYMLINK_FOLLOW == linux.AT_SYMLINK_FOLLOW
 	allowEmpty := flags&linux.AT_EMPTY_PATH == linux.AT_EMPTY_PATH
 
@@ -1842,25 +1829,27 @@ func renameAt(t *kernel.Task, oldDirFD kdefs.FD, oldAddr usermem.Addr, newDirFD 
 			return syserror.ENOTDIR
 		}
 
-		// Rename rejects paths that end in ".", "..", or empty (i.e.
-		// the root) with EBUSY.
-		switch oldName {
-		case "", ".", "..":
-			return syserror.EBUSY
+		// Root cannot be renamed to anything.
+		//
+		// TODO: This catches the case when the rename
+		// argument is exactly "/", but we should return EBUSY when
+		// renaming any mount point, or when the argument is not
+		// exactly "/" but still resolves to the root, like "/.." or
+		// "/bin/..".
+		if oldParent == root && oldName == "." {
+			return syscall.EBUSY
 		}
-
 		return fileOpAt(t, newDirFD, newPath, func(root *fs.Dirent, newParent *fs.Dirent, newName string) error {
 			if !fs.IsDir(newParent.Inode.StableAttr) {
 				return syserror.ENOTDIR
 			}
 
-			// Rename rejects paths that end in ".", "..", or empty
-			// (i.e.  the root) with EBUSY.
-			switch newName {
-			case "", ".", "..":
-				return syserror.EBUSY
+			// Nothing can be renamed to root.
+			//
+			// TODO: Same as above.
+			if newParent == root && newName == "." {
+				return syscall.EBUSY
 			}
-
 			return fs.Rename(t, root, oldParent, oldName, newParent, newName)
 		})
 	})

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,7 +28,6 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/bits"
 	"gvisor.googlesource.com/gvisor/pkg/eventchannel"
-	"gvisor.googlesource.com/gvisor/pkg/seccomp"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 	pb "gvisor.googlesource.com/gvisor/pkg/sentry/strace/strace_go_proto"
@@ -50,9 +49,18 @@ var EventMaximumSize uint
 
 // ItimerTypes are the possible itimer types.
 var ItimerTypes = abi.ValueSet{
-	linux.ITIMER_REAL:    "ITIMER_REAL",
-	linux.ITIMER_VIRTUAL: "ITIMER_VIRTUAL",
-	linux.ITIMER_PROF:    "ITIMER_PROF",
+	{
+		Value: linux.ITIMER_REAL,
+		Name:  "ITIMER_REAL",
+	},
+	{
+		Value: linux.ITIMER_VIRTUAL,
+		Name:  "ITIMER_VIRTUAL",
+	},
+	{
+		Value: linux.ITIMER_PROF,
+		Name:  "ITIMER_PROF",
+	},
 }
 
 func iovecs(t *kernel.Task, addr usermem.Addr, iovcnt int, printContent bool, maxBytes uint64) string {
@@ -125,7 +133,7 @@ func dump(t *kernel.Task, addr usermem.Addr, size uint, maximumBlobSize uint) st
 }
 
 func path(t *kernel.Task, addr usermem.Addr) string {
-	path, err := t.CopyInString(addr, linux.PATH_MAX)
+	path, err := t.CopyInString(addr, syscall.PathMax)
 	if err != nil {
 		return fmt.Sprintf("%#x (error decoding path: %s)", addr, err)
 	}
@@ -333,14 +341,6 @@ func (i *SyscallInfo) pre(t *kernel.Task, args arch.SyscallArguments, maximumBlo
 			output = append(output, PtraceRequestSet.Parse(args[arg].Uint64()))
 		case ItimerType:
 			output = append(output, ItimerTypes.Parse(uint64(args[arg].Int())))
-		case Signal:
-			output = append(output, signalNames.ParseDecimal(args[arg].Uint64()))
-		case SignalMaskAction:
-			output = append(output, signalMaskActions.Parse(uint64(args[arg].Int())))
-		case SigSet:
-			output = append(output, sigSet(t, args[arg].Pointer()))
-		case SigAction:
-			output = append(output, sigAction(t, args[arg].Pointer()))
 		case Oct:
 			output = append(output, "0o"+strconv.FormatUint(args[arg].Uint64(), 8))
 		case Hex:
@@ -399,10 +399,6 @@ func (i *SyscallInfo) post(t *kernel.Task, args arch.SyscallArguments, rval uint
 			output[arg] = timeval(t, args[arg].Pointer())
 		case Rusage:
 			output[arg] = rusage(t, args[arg].Pointer())
-		case PostSigSet:
-			output[arg] = sigSet(t, args[arg].Pointer())
-		case PostSigAction:
-			output[arg] = sigAction(t, args[arg].Pointer())
 		}
 	}
 }
@@ -571,10 +567,8 @@ func (s SyscallMap) SyscallExit(context interface{}, t *kernel.Task, sysno, rval
 	}
 }
 
-// ConvertToSysnoMap converts the names to a map keyed on the syscall number
-// and value set to true.
-//
-// The map is in a convenient format to pass to SyscallFlagsTable.Enable().
+// ConvertToSysnoMap converts the names to a map keyed on the syscall number and value set to true.
+// The map is in a convenient format to call SyscallFlagsTable.Enable().
 func (s SyscallMap) ConvertToSysnoMap(syscalls []string) (map[uintptr]bool, error) {
 	if syscalls == nil {
 		// Sentinel: no list.
@@ -703,15 +697,5 @@ func EnableAll(sinks SinkType) {
 		}
 
 		table.FeatureEnable.EnableAll(flags)
-	}
-}
-
-func init() {
-	t, ok := Lookup(abi.Host, arch.Host)
-	if ok {
-		// Provide the native table as the lookup for seccomp
-		// debugging. This is best-effort. This is provided this way to
-		// avoid dependencies from seccomp to this package.
-		seccomp.SyscallName = t.Name
 	}
 }

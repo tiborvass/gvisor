@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -57,7 +57,8 @@ func Install(opt Options) error {
 		return fmt.Errorf("unknown platform type %T", p)
 	}
 
-	return seccomp.Install(s)
+	// TODO: Set kill=true when SECCOMP_RET_KILL_PROCESS is supported.
+	return seccomp.Install(s, false)
 }
 
 // Report writes a warning message to the log.

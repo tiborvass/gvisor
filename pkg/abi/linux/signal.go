@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -165,16 +165,15 @@ const (
 
 // Signal action flags for rt_sigaction(2), from uapi/asm-generic/signal.h
 const (
-	SA_NOCLDSTOP = 0x00000001
-	SA_NOCLDWAIT = 0x00000002
-	SA_SIGINFO   = 0x00000004
-	SA_RESTORER  = 0x04000000
-	SA_ONSTACK   = 0x08000000
-	SA_RESTART   = 0x10000000
-	SA_NODEFER   = 0x40000000
-	SA_RESETHAND = 0x80000000
-	SA_NOMASK    = SA_NODEFER
-	SA_ONESHOT   = SA_RESETHAND
+	SA_NOCLDSTOP   = 0x00000001
+	SA_NOCLDWAIT   = 0x00000002
+	SA_SIGINFO     = 0x00000004
+	SA_ONSTACK     = 0x08000000
+	SA_RESTART     = 0x10000000
+	SA_NODEFER     = 0x40000000
+	SA_RESTARTHAND = 0x80000000
+	SA_NOMASK      = SA_NODEFER
+	SA_ONESHOT     = SA_RESTARTHAND
 )
 
 // Signal info types.

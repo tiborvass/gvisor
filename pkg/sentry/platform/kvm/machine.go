@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -120,9 +120,6 @@ type vCPU struct {
 
 	// vCPUArchState is the architecture-specific state.
 	vCPUArchState
-
-	// dieMessage is thrown from die.
-	dieMessage string
 }
 
 // newVCPU creates a returns a new vCPU.
@@ -142,7 +139,9 @@ func (m *machine) newVCPU() *vCPU {
 		fd:      int(fd),
 		machine: m,
 	}
-	c.CPU.Init(&m.kernel, c)
+	c.CPU.Init(&m.kernel)
+	c.CPU.KernelSyscall = bluepillSyscall
+	c.CPU.KernelException = bluepillException
 	m.vCPUsByID[c.id] = c
 
 	// Ensure the signal mask is correct.

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@
 //
 // - For fs.Inodes that require a page cache to be memory mapped, see
 //   inode_cache.go.
+//
+// - For fs.Files that implement fs.HandleOps, see handle.go.
 //
 // - For anon fs.Inodes, see anon.go.
 package fsutil

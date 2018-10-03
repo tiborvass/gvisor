@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,12 +24,12 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/waiter"
 )
 
-// FileNoopRelease implements fs.FileOperations.Release for files that have no
+// NoopRelease implements FileOperations.Release for files that have no
 // resources to release.
-type FileNoopRelease struct{}
+type NoopRelease struct{}
 
 // Release is a no-op.
-func (FileNoopRelease) Release() {}
+func (NoopRelease) Release() {}
 
 // SeekWithDirCursor is used to implement fs.FileOperations.Seek.  If dirCursor
 // is not nil and the seek was on a directory, the cursor will be updated.
@@ -127,81 +127,71 @@ func SeekWithDirCursor(ctx context.Context, file *fs.File, whence fs.SeekWhence,
 	return current, syserror.EINVAL
 }
 
-// FileGenericSeek implements fs.FileOperations.Seek for files that use a
-// generic seek implementation.
-type FileGenericSeek struct{}
+// GenericSeek implements FileOperations.Seek for files that use a generic
+// seek implementation.
+type GenericSeek struct{}
 
 // Seek implements fs.FileOperations.Seek.
-func (FileGenericSeek) Seek(ctx context.Context, file *fs.File, whence fs.SeekWhence, offset int64) (int64, error) {
+func (GenericSeek) Seek(ctx context.Context, file *fs.File, whence fs.SeekWhence, offset int64) (int64, error) {
 	return SeekWithDirCursor(ctx, file, whence, offset, nil)
 }
 
-// FileZeroSeek implements fs.FileOperations.Seek for files that maintain a
-// constant zero-value offset and require a no-op Seek.
-type FileZeroSeek struct{}
+// ZeroSeek implements FileOperations.Seek for files that maintain a constant
+// zero-value offset and require a no-op Seek.
+type ZeroSeek struct{}
 
-// Seek implements fs.FileOperations.Seek.
-func (FileZeroSeek) Seek(context.Context, *fs.File, fs.SeekWhence, int64) (int64, error) {
+// Seek implements FileOperations.Seek.
+func (ZeroSeek) Seek(context.Context, *fs.File, fs.SeekWhence, int64) (int64, error) {
 	return 0, nil
 }
 
-// FileNoSeek implements fs.FileOperations.Seek to return EINVAL.
-type FileNoSeek struct{}
+// PipeSeek implements FileOperations.Seek and can be used for files that behave
+// like pipes (seeking is not supported).
+type PipeSeek struct{}
 
-// Seek implements fs.FileOperations.Seek.
-func (FileNoSeek) Seek(context.Context, *fs.File, fs.SeekWhence, int64) (int64, error) {
-	return 0, syserror.EINVAL
-}
-
-// FilePipeSeek implements fs.FileOperations.Seek and can be used for files
-// that behave like pipes (seeking is not supported).
-type FilePipeSeek struct{}
-
-// Seek implements fs.FileOperations.Seek.
-func (FilePipeSeek) Seek(context.Context, *fs.File, fs.SeekWhence, int64) (int64, error) {
+// Seek implements FileOperations.Seek.
+func (PipeSeek) Seek(context.Context, *fs.File, fs.SeekWhence, int64) (int64, error) {
 	return 0, syserror.ESPIPE
 }
 
-// FileNotDirReaddir implements fs.FileOperations.Readdir for non-directories.
-type FileNotDirReaddir struct{}
+// NotDirReaddir implements FileOperations.Readdir for non-directories.
+type NotDirReaddir struct{}
 
-// Readdir implements fs.FileOperations.FileNotDirReaddir.
-func (FileNotDirReaddir) Readdir(context.Context, *fs.File, fs.DentrySerializer) (int64, error) {
+// Readdir implements FileOperations.NotDirReaddir.
+func (NotDirReaddir) Readdir(context.Context, *fs.File, fs.DentrySerializer) (int64, error) {
 	return 0, syserror.ENOTDIR
 }
 
-// FileNoFsync implements fs.FileOperations.Fsync for files that don't support
-// syncing.
-type FileNoFsync struct{}
+// NoFsync implements FileOperations.Fsync for files that don't support syncing.
+type NoFsync struct{}
 
-// Fsync implements fs.FileOperations.Fsync.
-func (FileNoFsync) Fsync(context.Context, *fs.File, int64, int64, fs.SyncType) error {
+// Fsync implements FileOperations.Fsync.
+func (NoFsync) Fsync(context.Context, *fs.File, int64, int64, fs.SyncType) error {
 	return syserror.EINVAL
 }
 
-// FileNoopFsync implements fs.FileOperations.Fsync for files that don't need
-// to synced.
-type FileNoopFsync struct{}
+// NoopFsync implements FileOperations.Fsync for files that don't need to synced.
+type NoopFsync struct{}
 
-// Fsync implements fs.FileOperations.Fsync.
-func (FileNoopFsync) Fsync(context.Context, *fs.File, int64, int64, fs.SyncType) error {
+// Fsync implements FileOperations.Fsync.
+func (NoopFsync) Fsync(context.Context, *fs.File, int64, int64, fs.SyncType) error {
 	return nil
 }
 
-// FileNoopFlush implements fs.FileOperations.Flush as a no-op.
-type FileNoopFlush struct{}
+// NoopFlush implements FileOperations.Flush as a no-op.
+type NoopFlush struct{}
 
-// Flush implements fs.FileOperations.Flush.
-func (FileNoopFlush) Flush(context.Context, *fs.File) error {
+// Flush implements FileOperations.Flush.
+func (NoopFlush) Flush(context.Context, *fs.File) error {
 	return nil
 }
 
-// FileNoMMap implements fs.FileOperations.Mappable for files that cannot
+// NoMMap implements fs.FileOperations.Mappable for files that cannot
 // be memory mapped.
-type FileNoMMap struct{}
+type NoMMap struct{}
 
 // ConfigureMMap implements fs.FileOperations.ConfigureMMap.
-func (FileNoMMap) ConfigureMMap(context.Context, *fs.File, *memmap.MMapOpts) error {
+func (NoMMap) ConfigureMMap(context.Context, *fs.File, *memmap.MMapOpts) error {
 	return syserror.ENODEV
 }
 
@@ -214,43 +204,26 @@ func GenericConfigureMMap(file *fs.File, m memmap.Mappable, opts *memmap.MMapOpt
 	return nil
 }
 
-// FileNoIoctl implements fs.FileOperations.Ioctl for files that don't
-// implement the ioctl syscall.
-type FileNoIoctl struct{}
+// NoIoctl implements fs.FileOperations.Ioctl for files that don't implement
+// the ioctl syscall.
+type NoIoctl struct{}
 
 // Ioctl implements fs.FileOperations.Ioctl.
-func (FileNoIoctl) Ioctl(ctx context.Context, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+func (NoIoctl) Ioctl(ctx context.Context, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
 	return 0, syserror.ENOTTY
 }
 
-// DirFileOperations implements most of fs.FileOperations for directories,
-// except for Readdir which the embedding type must implement.
-type DirFileOperations struct {
-	waiter.AlwaysReady
-	FileGenericSeek
-	FileNoIoctl
-	FileNoMMap
-	FileNoopFlush
-	FileNoopFsync
-	FileNoopRelease
-}
-
-// Read implements fs.FileOperations.Read
-func (*DirFileOperations) Read(context.Context, *fs.File, usermem.IOSequence, int64) (int64, error) {
-	return 0, syserror.EISDIR
-}
-
-// Write implements fs.FileOperations.Write.
-func (*DirFileOperations) Write(context.Context, *fs.File, usermem.IOSequence, int64) (int64, error) {
-	return 0, syserror.EISDIR
-}
-
-// StaticDirFileOperations implements fs.FileOperations for directories with
-// static children.
+// DirFileOperations implements FileOperations for directories.
 //
 // +stateify savable
-type StaticDirFileOperations struct {
-	DirFileOperations
+type DirFileOperations struct {
+	waiter.AlwaysReady `state:"nosave"`
+	NoopRelease        `state:"nosave"`
+	GenericSeek        `state:"nosave"`
+	NoFsync            `state:"nosave"`
+	NoopFlush          `state:"nosave"`
+	NoMMap             `state:"nosave"`
+	NoIoctl            `state:"nosave"`
 
 	// dentryMap is a SortedDentryMap used to implement Readdir.
 	dentryMap *fs.SortedDentryMap
@@ -260,106 +233,37 @@ type StaticDirFileOperations struct {
 	dirCursor string
 }
 
-// NewStaticDirFileOperations returns a new StaticDirFileOperations that will
-// iterate the given denty map.
-func NewStaticDirFileOperations(dentries *fs.SortedDentryMap) *StaticDirFileOperations {
-	return &StaticDirFileOperations{
+// NewDirFileOperations returns a new DirFileOperations that will iterate the
+// given denty map.
+func NewDirFileOperations(dentries *fs.SortedDentryMap) *DirFileOperations {
+	return &DirFileOperations{
 		dentryMap: dentries,
 	}
 }
 
 // IterateDir implements DirIterator.IterateDir.
-func (sdfo *StaticDirFileOperations) IterateDir(ctx context.Context, dirCtx *fs.DirCtx, offset int) (int, error) {
-	n, err := fs.GenericReaddir(dirCtx, sdfo.dentryMap)
+func (dfo *DirFileOperations) IterateDir(ctx context.Context, dirCtx *fs.DirCtx, offset int) (int, error) {
+	n, err := fs.GenericReaddir(dirCtx, dfo.dentryMap)
 	return offset + n, err
 }
 
-// Readdir implements fs.FileOperations.Readdir.
-func (sdfo *StaticDirFileOperations) Readdir(ctx context.Context, file *fs.File, serializer fs.DentrySerializer) (int64, error) {
+// Readdir implements FileOperations.Readdir.
+func (dfo *DirFileOperations) Readdir(ctx context.Context, file *fs.File, serializer fs.DentrySerializer) (int64, error) {
 	root := fs.RootFromContext(ctx)
 	defer root.DecRef()
 	dirCtx := &fs.DirCtx{
 		Serializer: serializer,
-		DirCursor:  &sdfo.dirCursor,
+		DirCursor:  &dfo.dirCursor,
 	}
-	return fs.DirentReaddir(ctx, file.Dirent, sdfo, root, dirCtx, file.Offset())
+	return fs.DirentReaddir(ctx, file.Dirent, dfo, root, dirCtx, file.Offset())
 }
 
-// NoReadWriteFile is a file that does not support reading or writing.
-//
-// +stateify savable
-type NoReadWriteFile struct {
-	waiter.AlwaysReady `state:"nosave"`
-	FileGenericSeek    `state:"nosave"`
-	FileNoIoctl        `state:"nosave"`
-	FileNoMMap         `state:"nosave"`
-	FileNoopFsync      `state:"nosave"`
-	FileNoopFlush      `state:"nosave"`
-	FileNoopRelease    `state:"nosave"`
-	FileNoRead         `state:"nosave"`
-	FileNoWrite        `state:"nosave"`
-	FileNotDirReaddir  `state:"nosave"`
+// Read implements FileOperations.Read
+func (*DirFileOperations) Read(context.Context, *fs.File, usermem.IOSequence, int64) (int64, error) {
+	return 0, syserror.EISDIR
 }
 
-var _ fs.FileOperations = (*NoReadWriteFile)(nil)
-
-// FileStaticContentReader is a helper to implement fs.FileOperations.Read with
-// static content.
-//
-// +stateify savable
-type FileStaticContentReader struct {
-	// content is immutable.
-	content []byte
-}
-
-// NewFileStaticContentReader initializes a FileStaticContentReader with the
-// given content.
-func NewFileStaticContentReader(b []byte) FileStaticContentReader {
-	return FileStaticContentReader{
-		content: b,
-	}
-}
-
-// Read implements fs.FileOperations.Read.
-func (scr *FileStaticContentReader) Read(ctx context.Context, _ *fs.File, dst usermem.IOSequence, offset int64) (int64, error) {
-	if offset < 0 {
-		return 0, syserror.EINVAL
-	}
-	if offset >= int64(len(scr.content)) {
-		return 0, nil
-	}
-	n, err := dst.CopyOut(ctx, scr.content[offset:])
-	return int64(n), err
-}
-
-// FileNoopWrite implements fs.FileOperations.Write as a noop.
-type FileNoopWrite struct{}
-
-// Write implements fs.FileOperations.Write.
-func (FileNoopWrite) Write(_ context.Context, _ *fs.File, src usermem.IOSequence, _ int64) (int64, error) {
-	return src.NumBytes(), nil
-}
-
-// FileNoRead implements fs.FileOperations.Read to return EINVAL.
-type FileNoRead struct{}
-
-// Read implements fs.FileOperations.Read.
-func (FileNoRead) Read(context.Context, *fs.File, usermem.IOSequence, int64) (int64, error) {
-	return 0, syserror.EINVAL
-}
-
-// FileNoWrite implements fs.FileOperations.Write to return EINVAL.
-type FileNoWrite struct{}
-
-// Write implements fs.FileOperations.Write.
-func (FileNoWrite) Write(context.Context, *fs.File, usermem.IOSequence, int64) (int64, error) {
-	return 0, syserror.EINVAL
-}
-
-// FileNoopRead implement fs.FileOperations.Read as a noop.
-type FileNoopRead struct{}
-
-// Read implements fs.FileOperations.Read.
-func (FileNoopRead) Read(context.Context, *fs.File, usermem.IOSequence, int64) (int64, error) {
-	return 0, nil
+// Write implements FileOperations.Write.
+func (*DirFileOperations) Write(context.Context, *fs.File, usermem.IOSequence, int64) (int64, error) {
+	return 0, syserror.EISDIR
 }

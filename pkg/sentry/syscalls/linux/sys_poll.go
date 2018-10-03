@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -82,7 +82,7 @@ func doPoll(t *kernel.Task, pfdAddr usermem.Addr, nfds uint, timeout time.Durati
 }
 
 func doSelect(t *kernel.Task, nfds int, readFDs, writeFDs, exceptFDs usermem.Addr, timeout time.Duration) (uintptr, error) {
-	if nfds < 0 || nfds > fileCap {
+	if nfds < 0 || uint64(nfds) > t.ThreadGroup().Limits().GetCapped(limits.NumberOfFiles, fileCap) {
 		return 0, syserror.EINVAL
 	}
 
@@ -90,7 +90,6 @@ func doSelect(t *kernel.Task, nfds int, readFDs, writeFDs, exceptFDs usermem.Add
 	//
 	// N.B. This only works on little-endian architectures.
 	byteCount := (nfds + 7) / 8
-
 	bitsInLastPartialByte := uint(nfds % 8)
 	r := make([]byte, byteCount)
 	w := make([]byte, byteCount)

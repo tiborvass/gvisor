@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -57,46 +57,6 @@ func unmapRunData(r *runData) error {
 	return nil
 }
 
-// setUserRegisters sets user registers in the vCPU.
-func (c *vCPU) setUserRegisters(uregs *userRegs) error {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
-		uintptr(c.fd),
-		_KVM_SET_REGS,
-		uintptr(unsafe.Pointer(uregs))); errno != 0 {
-		return fmt.Errorf("error setting user registers: %v", errno)
-	}
-	return nil
-}
-
-// getUserRegisters reloads user registers in the vCPU.
-//
-// This is safe to call from a nosplit context.
-//
-//go:nosplit
-func (c *vCPU) getUserRegisters(uregs *userRegs) syscall.Errno {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
-		uintptr(c.fd),
-		_KVM_GET_REGS,
-		uintptr(unsafe.Pointer(uregs))); errno != 0 {
-		return errno
-	}
-	return 0
-}
-
-// setSystemRegisters sets system registers.
-func (c *vCPU) setSystemRegisters(sregs *systemRegs) error {
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
-		uintptr(c.fd),
-		_KVM_SET_SREGS,
-		uintptr(unsafe.Pointer(sregs))); errno != 0 {
-		return fmt.Errorf("error setting system registers: %v", errno)
-	}
-	return nil
-}
-
 // atomicAddressSpace is an atomic address space pointer.
 type atomicAddressSpace struct {
 	pointer unsafe.Pointer
@@ -128,7 +88,7 @@ func (c *vCPU) notify() {
 	_, _, errno := syscall.RawSyscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(&c.state)),
-		linux.FUTEX_WAKE|linux.FUTEX_PRIVATE_FLAG,
+		linux.FUTEX_WAKE,
 		^uintptr(0), // Number of waiters.
 		0, 0, 0)
 	if errno != 0 {
@@ -146,7 +106,7 @@ func (c *vCPU) waitUntilNot(state uint32) {
 	_, _, errno := syscall.Syscall6(
 		syscall.SYS_FUTEX,
 		uintptr(unsafe.Pointer(&c.state)),
-		linux.FUTEX_WAIT|linux.FUTEX_PRIVATE_FLAG,
+		linux.FUTEX_WAIT,
 		uintptr(state),
 		0, 0, 0)
 	if errno != 0 && errno != syscall.EINTR && errno != syscall.EAGAIN {

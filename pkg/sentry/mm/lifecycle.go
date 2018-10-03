@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/limits"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/memmap"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 )
@@ -59,17 +58,13 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 	mm.mappingMu.RLock()
 	defer mm.mappingMu.RUnlock()
 	mm2 := &MemoryManager{
-		p:           mm.p,
-		haveASIO:    mm.haveASIO,
-		layout:      mm.layout,
-		privateRefs: mm.privateRefs,
-		users:       1,
-		brk:         mm.brk,
-		usageAS:     mm.usageAS,
-		// "The child does not inherit its parent's memory locks (mlock(2),
-		// mlockall(2))." - fork(2). So lockedAS is 0 and defMLockMode is
-		// MLockNone, both of which are zero values. vma.mlockMode is reset
-		// when copied below.
+		p:                    mm.p,
+		haveASIO:             mm.haveASIO,
+		layout:               mm.layout,
+		privateRefs:          mm.privateRefs,
+		users:                1,
+		usageAS:              mm.usageAS,
+		brk:                  mm.brk,
 		captureInvalidations: true,
 		argv:                 mm.argv,
 		envv:                 mm.envv,
@@ -82,11 +77,11 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 	// Copy vmas.
 	dstvgap := mm2.vmas.FirstGap()
 	for srcvseg := mm.vmas.FirstSegment(); srcvseg.Ok(); srcvseg = srcvseg.NextSegment() {
-		vma := srcvseg.Value() // makes a copy of the vma
+		vma := srcvseg.ValuePtr()
 		vmaAR := srcvseg.Range()
 		// Inform the Mappable, if any, of the new mapping.
 		if vma.mappable != nil {
-			if err := vma.mappable.AddMapping(ctx, mm2, vmaAR, vma.off, vma.canWriteMappableLocked()); err != nil {
+			if err := vma.mappable.AddMapping(ctx, mm2, vmaAR, vma.off); err != nil {
 				mm2.removeVMAsLocked(ctx, mm2.applicationAddrRange())
 				return nil, err
 			}
@@ -94,8 +89,7 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 		if vma.id != nil {
 			vma.id.IncRef()
 		}
-		vma.mlockMode = memmap.MLockNone
-		dstvgap = mm2.vmas.Insert(dstvgap, vmaAR, vma).NextGap()
+		dstvgap = mm2.vmas.Insert(dstvgap, vmaAR, *vma).NextGap()
 		// We don't need to update mm2.usageAS since we copied it from mm
 		// above.
 	}

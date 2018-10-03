@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,7 +36,6 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/control"
 	"gvisor.googlesource.com/gvisor/runsc/boot"
-	"gvisor.googlesource.com/gvisor/runsc/cgroup"
 	"gvisor.googlesource.com/gvisor/runsc/sandbox"
 	"gvisor.googlesource.com/gvisor/runsc/specutils"
 )
@@ -119,12 +118,6 @@ type Container struct {
 	// be 0 if the gofer has been killed.
 	GoferPid int `json:"goferPid"`
 
-	// goferIsChild is set if a gofer process is a child of the current process.
-	//
-	// This field isn't saved to json, because only a creator of a gofer
-	// process will have it as a child process.
-	goferIsChild bool
-
 	// Sandbox is the sandbox this container is running in. It's set when the
 	// container is created and reset when the sandbox is destroyed.
 	Sandbox *sandbox.Sandbox `json:"sandbox"`
@@ -137,7 +130,7 @@ type Container struct {
 func Load(rootDir, id string) (*Container, error) {
 	log.Debugf("Load container %q %q", rootDir, id)
 	if err := validateID(id); err != nil {
-		return nil, fmt.Errorf("validating id: %v", err)
+		return nil, fmt.Errorf("error validating id: %v", err)
 	}
 
 	cRoot, err := findContainerRoot(rootDir, id)
@@ -162,11 +155,11 @@ func Load(rootDir, id string) (*Container, error) {
 			// Preserve error so that callers can distinguish 'not found' errors.
 			return nil, err
 		}
-		return nil, fmt.Errorf("reading container metadata file %q: %v", metaFile, err)
+		return nil, fmt.Errorf("error reading container metadata file %q: %v", metaFile, err)
 	}
 	var c Container
 	if err := json.Unmarshal(metaBytes, &c); err != nil {
-		return nil, fmt.Errorf("unmarshaling container metadata from %q: %v", metaFile, err)
+		return nil, fmt.Errorf("error unmarshaling container metadata from %q: %v", metaFile, err)
 	}
 
 	// If the status is "Running" or "Created", check that the sandbox
@@ -181,7 +174,7 @@ func Load(rootDir, id string) (*Container, error) {
 		} else if c.Status == Running {
 			// Container state should reflect the actual state of the application, so
 			// we don't consider gofer process here.
-			if err := c.SignalContainer(syscall.Signal(0), false); err != nil {
+			if err := c.Signal(syscall.Signal(0), false); err != nil {
 				c.changeStatus(Stopped)
 			}
 		}
@@ -225,7 +218,7 @@ func List(rootDir string) ([]string, error) {
 	log.Debugf("List containers %q", rootDir)
 	fs, err := ioutil.ReadDir(rootDir)
 	if err != nil {
-		return nil, fmt.Errorf("reading dir %q: %v", rootDir, err)
+		return nil, fmt.Errorf("ReadDir(%s) failed: %v", rootDir, err)
 	}
 	var out []string
 	for _, f := range fs {
@@ -237,7 +230,7 @@ func List(rootDir string) ([]string, error) {
 // Create creates the container in a new Sandbox process, unless the metadata
 // indicates that an existing Sandbox should be used. The caller must call
 // Destroy() on the container.
-func Create(id string, spec *specs.Spec, conf *boot.Config, bundleDir, consoleSocket, pidFile, userLog string) (*Container, error) {
+func Create(id string, spec *specs.Spec, conf *boot.Config, bundleDir, consoleSocket, pidFile string) (*Container, error) {
 	log.Debugf("Create container %q in root dir: %s", id, conf.RootDir)
 	if err := validateID(id); err != nil {
 		return nil, err
@@ -257,7 +250,7 @@ func Create(id string, spec *specs.Spec, conf *boot.Config, bundleDir, consoleSo
 	if _, err := os.Stat(filepath.Join(containerRoot, metadataFilename)); err == nil {
 		return nil, fmt.Errorf("container with id %q already exists", id)
 	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("looking for existing container in %q: %v", containerRoot, err)
+		return nil, fmt.Errorf("error looking for existing container in %q: %v", containerRoot, err)
 	}
 
 	c := &Container{
@@ -269,10 +262,6 @@ func Create(id string, spec *specs.Spec, conf *boot.Config, bundleDir, consoleSo
 		Status:        Creating,
 		Owner:         os.Getenv("USER"),
 	}
-	// The Cleanup object cleans up partially created containers when an error occurs.
-	// Any errors occuring during cleanup itself are ignored.
-	cu := specutils.MakeCleanup(func() { _ = c.Destroy() })
-	defer cu.Clean()
 
 	// If the metadata annotations indicate that this container should be
 	// started in an existing sandbox, we must do so. The metadata will
@@ -280,41 +269,19 @@ func Create(id string, spec *specs.Spec, conf *boot.Config, bundleDir, consoleSo
 	// init container in the sandbox.
 	if specutils.ShouldCreateSandbox(spec) {
 		log.Debugf("Creating new sandbox for container %q", id)
-
-		// Setup rootfs and mounts. It returns a new mount list with destination
-		// paths resolved. Since the spec for the root container is read from disk,
-		// Write the new spec to a new file that will be used by the sandbox.
-		cleanMounts, err := setupFS(spec, conf, bundleDir)
+		ioFiles, err := c.createGoferProcess(spec, conf, bundleDir)
 		if err != nil {
-			return nil, fmt.Errorf("setup mounts: %v", err)
-		}
-		spec.Mounts = cleanMounts
-		if err := specutils.WriteCleanSpec(bundleDir, spec); err != nil {
-			return nil, fmt.Errorf("writing clean spec: %v", err)
-		}
-
-		// Create and join cgroup before processes are created to ensure they are
-		// part of the cgroup from the start (and all tneir children processes).
-		cg := cgroup.New(spec)
-		if cg != nil {
-			// If there is cgroup config, install it before creating sandbox process.
-			if err := cg.Install(spec.Linux.Resources); err != nil {
-				return nil, fmt.Errorf("configuring cgroup: %v", err)
-			}
-		}
-		if err := runInCgroup(cg, func() error {
-			ioFiles, err := c.createGoferProcess(spec, conf, bundleDir)
-			if err != nil {
-				return err
-			}
-
-			// Start a new sandbox for this container. Any errors after this point
-			// must destroy the container.
-			c.Sandbox, err = sandbox.New(id, spec, conf, bundleDir, consoleSocket, userLog, ioFiles, cg)
-			return err
-		}); err != nil {
 			return nil, err
 		}
+
+		// Start a new sandbox for this container. Any errors after this point
+		// must destroy the container.
+		s, err := sandbox.Create(id, spec, conf, bundleDir, consoleSocket, ioFiles)
+		if err != nil {
+			c.Destroy()
+			return nil, err
+		}
+		c.Sandbox = s
 	} else {
 		// This is sort of confusing. For a sandbox with a root
 		// container and a child container in it, runsc sees:
@@ -333,29 +300,28 @@ func Create(id string, spec *specs.Spec, conf *boot.Config, bundleDir, consoleSo
 		// Find the sandbox associated with this ID.
 		sb, err := Load(conf.RootDir, sbid)
 		if err != nil {
+			c.Destroy()
 			return nil, err
 		}
 		c.Sandbox = sb.Sandbox
-		if err := c.Sandbox.CreateContainer(c.ID); err != nil {
-			return nil, err
-		}
 	}
 	c.changeStatus(Created)
 
 	// Save the metadata file.
 	if err := c.save(); err != nil {
+		c.Destroy()
 		return nil, err
 	}
 
 	// Write the PID file. Containerd considers the create complete after
 	// this file is created, so it must be the last thing we do.
 	if pidFile != "" {
-		if err := ioutil.WriteFile(pidFile, []byte(strconv.Itoa(c.SandboxPid())), 0644); err != nil {
+		if err := ioutil.WriteFile(pidFile, []byte(strconv.Itoa(c.Pid())), 0644); err != nil {
+			c.Destroy()
 			return nil, fmt.Errorf("error writing PID file: %v", err)
 		}
 	}
 
-	cu.Release()
 	return c, nil
 }
 
@@ -384,28 +350,12 @@ func (c *Container) Start(conf *boot.Config) error {
 			return err
 		}
 	} else {
-		// Setup rootfs and mounts. It returns a new mount list with destination
-		// paths resolved. Replace the original spec with new mount list and start
-		// container.
-		cleanMounts, err := setupFS(c.Spec, conf, c.BundleDir)
+		// Create the gofer process.
+		ioFiles, err := c.createGoferProcess(c.Spec, conf, c.BundleDir)
 		if err != nil {
-			return fmt.Errorf("setup mounts: %v", err)
+			return err
 		}
-		c.Spec.Mounts = cleanMounts
-		if err := specutils.WriteCleanSpec(c.BundleDir, c.Spec); err != nil {
-			return fmt.Errorf("writing clean spec: %v", err)
-		}
-
-		// Join cgroup to strt gofer process to ensure it's part of the cgroup from
-		// the start (and all tneir children processes).
-		if err := runInCgroup(c.Sandbox.Cgroup, func() error {
-			// Create the gofer process.
-			ioFiles, err := c.createGoferProcess(c.Spec, conf, c.BundleDir)
-			if err != nil {
-				return err
-			}
-			return c.Sandbox.StartContainer(c.Spec, conf, c.ID, ioFiles)
-		}); err != nil {
+		if err := c.Sandbox.Start(c.Spec, conf, c.ID, ioFiles); err != nil {
 			return err
 		}
 	}
@@ -442,18 +392,16 @@ func (c *Container) Restore(spec *specs.Spec, conf *boot.Config, restoreFile str
 }
 
 // Run is a helper that calls Create + Start + Wait.
-func Run(id string, spec *specs.Spec, conf *boot.Config, bundleDir, consoleSocket, pidFile, userLog string) (syscall.WaitStatus, error) {
+func Run(id string, spec *specs.Spec, conf *boot.Config, bundleDir, consoleSocket, pidFile string) (syscall.WaitStatus, error) {
 	log.Debugf("Run container %q in root dir: %s", id, conf.RootDir)
-	c, err := Create(id, spec, conf, bundleDir, consoleSocket, pidFile, userLog)
+	c, err := Create(id, spec, conf, bundleDir, consoleSocket, pidFile)
 	if err != nil {
-		return 0, fmt.Errorf("creating container: %v", err)
+		return 0, fmt.Errorf("error creating container: %v", err)
 	}
-	// Clean up partially created container if an error ocurrs.
-	// Any errors returned by Destroy() itself are ignored.
 	defer c.Destroy()
 
 	if err := c.Start(conf); err != nil {
-		return 0, fmt.Errorf("starting container: %v", err)
+		return 0, fmt.Errorf("error starting container: %v", err)
 	}
 	return c.Wait()
 }
@@ -478,9 +426,9 @@ func (c *Container) Event() (*boot.Event, error) {
 	return c.Sandbox.Event(c.ID)
 }
 
-// SandboxPid returns the Pid of the sandbox the container is running in, or -1 if the
+// Pid returns the Pid of the sandbox the container is running in, or -1 if the
 // container is not running.
-func (c *Container) SandboxPid() int {
+func (c *Container) Pid() int {
 	if err := c.requireStatus("get PID", Created, Running, Paused); err != nil {
 		return -1
 	}
@@ -492,6 +440,9 @@ func (c *Container) SandboxPid() int {
 // and wait returns immediately.
 func (c *Container) Wait() (syscall.WaitStatus, error) {
 	log.Debugf("Wait on container %q", c.ID)
+	if !c.isSandboxRunning() {
+		return 0, fmt.Errorf("container is not running")
+	}
 	return c.Sandbox.Wait(c.ID)
 }
 
@@ -500,7 +451,7 @@ func (c *Container) Wait() (syscall.WaitStatus, error) {
 func (c *Container) WaitRootPID(pid int32, clearStatus bool) (syscall.WaitStatus, error) {
 	log.Debugf("Wait on PID %d in sandbox %q", pid, c.Sandbox.ID)
 	if !c.isSandboxRunning() {
-		return 0, fmt.Errorf("sandbox is not running")
+		return 0, fmt.Errorf("container is not running")
 	}
 	return c.Sandbox.WaitPID(c.Sandbox.ID, pid, clearStatus)
 }
@@ -510,16 +461,16 @@ func (c *Container) WaitRootPID(pid int32, clearStatus bool) (syscall.WaitStatus
 func (c *Container) WaitPID(pid int32, clearStatus bool) (syscall.WaitStatus, error) {
 	log.Debugf("Wait on PID %d in container %q", pid, c.ID)
 	if !c.isSandboxRunning() {
-		return 0, fmt.Errorf("sandbox is not running")
+		return 0, fmt.Errorf("container is not running")
 	}
 	return c.Sandbox.WaitPID(c.ID, pid, clearStatus)
 }
 
-// SignalContainer sends the signal to the container. If all is true and signal
-// is SIGKILL, then waits for all processes to exit before returning.
-// SignalContainer returns an error if the container is already stopped.
+// Signal sends the signal to the container. If all is true and signal is
+// SIGKILL, then waits for all processes to exit before returning.
+// Signal returns an error if the container is already stopped.
 // TODO: Distinguish different error types.
-func (c *Container) SignalContainer(sig syscall.Signal, all bool) error {
+func (c *Container) Signal(sig syscall.Signal, all bool) error {
 	log.Debugf("Signal container %q: %v", c.ID, sig)
 	// Signaling container in Stopped state is allowed. When all=false,
 	// an error will be returned anyway; when all=true, this allows
@@ -530,21 +481,9 @@ func (c *Container) SignalContainer(sig syscall.Signal, all bool) error {
 		return err
 	}
 	if !c.isSandboxRunning() {
-		return fmt.Errorf("sandbox is not running")
+		return fmt.Errorf("container is not running")
 	}
 	return c.Sandbox.SignalContainer(c.ID, sig, all)
-}
-
-// SignalProcess sends sig to a specific process in the container.
-func (c *Container) SignalProcess(sig syscall.Signal, pid int32) error {
-	log.Debugf("Signal process %d in container %q: %v", pid, c.ID, sig)
-	if err := c.requireStatus("signal a process inside", Running); err != nil {
-		return err
-	}
-	if !c.isSandboxRunning() {
-		return fmt.Errorf("sandbox is not running")
-	}
-	return c.Sandbox.SignalProcess(c.ID, int32(pid), sig, false)
 }
 
 // ForwardSignals forwards all signals received by the current process to the
@@ -595,7 +534,7 @@ func (c *Container) Pause() error {
 	}
 
 	if err := c.Sandbox.Pause(c.ID); err != nil {
-		return fmt.Errorf("pausing container: %v", err)
+		return fmt.Errorf("error pausing container: %v", err)
 	}
 	c.changeStatus(Paused)
 	return c.save()
@@ -615,7 +554,7 @@ func (c *Container) Resume() error {
 		return fmt.Errorf("cannot resume container %q in state %v", c.ID, c.Status)
 	}
 	if err := c.Sandbox.Resume(c.ID); err != nil {
-		return fmt.Errorf("resuming container: %v", err)
+		return fmt.Errorf("error resuming container: %v", err)
 	}
 	c.changeStatus(Running)
 	return c.save()
@@ -627,7 +566,7 @@ func (c *Container) State() specs.State {
 		Version: specs.Version,
 		ID:      c.ID,
 		Status:  c.Status.String(),
-		Pid:     c.SandboxPid(),
+		Pid:     c.Pid(),
 		Bundle:  c.BundleDir,
 	}
 }
@@ -642,39 +581,21 @@ func (c *Container) Processes() ([]*control.Process, error) {
 }
 
 // Destroy stops all processes and frees all resources associated with the
-// container.
+// container. It fails fast and is idempotent.
 func (c *Container) Destroy() error {
 	log.Debugf("Destroy container %q", c.ID)
 
-	// We must perform the following cleanup steps:
-	// * stop the container and gofer processes,
-	// * remove the container filesystem on the host, and
-	// * delete the container metadata directory.
-	//
-	// It's possible for one or more of these steps to fail, but we should
-	// do our best to perform all of the cleanups. Hence, we keep a slice
-	// of errors return their concatenation.
-	var errs []string
-
 	if err := c.stop(); err != nil {
-		err = fmt.Errorf("stopping container: %v", err)
-		log.Warningf("%v", err)
-		errs = append(errs, err.Error())
+		return fmt.Errorf("error stopping container: %v", err)
 	}
 
 	if err := destroyFS(c.Spec); err != nil {
-		err = fmt.Errorf("destroying container fs: %v", err)
-		log.Warningf("%v", err)
-		errs = append(errs, err.Error())
+		return fmt.Errorf("error destroying container fs: %v", err)
 	}
 
 	if err := os.RemoveAll(c.Root); err != nil && !os.IsNotExist(err) {
-		err = fmt.Errorf("deleting container root directory %q: %v", c.Root, err)
-		log.Warningf("%v", err)
-		errs = append(errs, err.Error())
+		return fmt.Errorf("error deleting container root directory %q: %v", c.Root, err)
 	}
-
-	c.changeStatus(Stopped)
 
 	// "If any poststop hook fails, the runtime MUST log a warning, but the
 	// remaining hooks and lifecycle continue as if the hook had succeeded" -OCI spec.
@@ -688,10 +609,8 @@ func (c *Container) Destroy() error {
 		executeHooksBestEffort(c.Spec.Hooks.Poststop, c.State())
 	}
 
-	if len(errs) == 0 {
-		return nil
-	}
-	return fmt.Errorf(strings.Join(errs, "\n"))
+	c.changeStatus(Stopped)
+	return nil
 }
 
 // save saves the container metadata to a file.
@@ -702,10 +621,10 @@ func (c *Container) save() error {
 	metaFile := filepath.Join(c.Root, metadataFilename)
 	meta, err := json.Marshal(c)
 	if err != nil {
-		return fmt.Errorf("invalid container metadata: %v", err)
+		return fmt.Errorf("error marshaling container metadata: %v", err)
 	}
 	if err := ioutil.WriteFile(metaFile, meta, 0640); err != nil {
-		return fmt.Errorf("writing container metadata: %v", err)
+		return fmt.Errorf("error writing container metadata: %v", err)
 	}
 	return nil
 }
@@ -714,16 +633,10 @@ func (c *Container) save() error {
 // root containers), and waits for the container or sandbox and the gofer
 // to stop. If any of them doesn't stop before timeout, an error is returned.
 func (c *Container) stop() error {
-	var cgroup *cgroup.Cgroup
-
 	if c.Sandbox != nil {
 		log.Debugf("Destroying container %q", c.ID)
 		if err := c.Sandbox.DestroyContainer(c.ID); err != nil {
-			return fmt.Errorf("destroying container %q: %v", c.ID, err)
-		}
-		// Only uninstall cgroup for sandbox stop.
-		if c.Sandbox.IsRootContainer(c.ID) {
-			cgroup = c.Sandbox.Cgroup
+			return fmt.Errorf("error destroying container %q: %v", c.ID, err)
 		}
 		// Only set sandbox to nil after it has been told to destroy the container.
 		c.Sandbox = nil
@@ -737,54 +650,35 @@ func (c *Container) stop() error {
 			log.Warningf("Error sending signal %d to gofer %d: %v", syscall.SIGKILL, c.GoferPid, err)
 		}
 	}
-
-	if err := c.waitForStopped(); err != nil {
-		return err
-	}
-
-	// Gofer is running in cgroups, so Cgroup.Uninstall has to be called after it.
-	if cgroup != nil {
-		if err := cgroup.Uninstall(); err != nil {
-			return err
-		}
-	}
-	return nil
+	return c.waitForStopped()
 }
 
 func (c *Container) waitForStopped() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 	b := backoff.WithContext(backoff.NewConstantBackOff(100*time.Millisecond), ctx)
 	op := func() error {
 		if c.isSandboxRunning() {
-			if err := c.SignalContainer(syscall.Signal(0), false); err == nil {
+			if err := c.Signal(syscall.Signal(0), false); err == nil {
 				return fmt.Errorf("container is still running")
 			}
 		}
-		if c.GoferPid == 0 {
-			return nil
-		}
-		if c.goferIsChild {
-			// The gofer process is a child of the current process,
-			// so we can wait it and collect its zombie.
-			wpid, err := syscall.Wait4(int(c.GoferPid), nil, syscall.WNOHANG, nil)
-			if err != nil {
-				return fmt.Errorf("error waiting the gofer process: %v", err)
-			}
-			if wpid == 0 {
+		if c.GoferPid != 0 {
+			if err := syscall.Kill(c.GoferPid, 0); err == nil {
 				return fmt.Errorf("gofer is still running")
 			}
-
-		} else if err := syscall.Kill(c.GoferPid, 0); err == nil {
-			return fmt.Errorf("gofer is still running")
+			c.GoferPid = 0
 		}
-		c.GoferPid = 0
 		return nil
 	}
 	return backoff.Retry(op, b)
 }
 
 func (c *Container) createGoferProcess(spec *specs.Spec, conf *boot.Config, bundleDir string) ([]*os.File, error) {
+	if err := setupFS(spec, conf, bundleDir); err != nil {
+		return nil, fmt.Errorf("failed to setup mounts: %v", err)
+	}
+
 	// Start with the general config flags.
 	args := conf.ToFlags()
 	args = append(args, "gofer", "--bundle", bundleDir)
@@ -821,26 +715,18 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *boot.Config, bund
 		args = append(args, fmt.Sprintf("--io-fds=%d", nextFD))
 	}
 
-	binPath := specutils.ExePath
+	binPath, err := specutils.BinPath()
+	if err != nil {
+		return nil, err
+	}
 	cmd := exec.Command(binPath, args...)
 	cmd.ExtraFiles = goferEnds
-	cmd.Args[0] = "runsc-gofer"
-
-	// Enter new namespaces to isolate from the rest of the system. Don't unshare
-	// cgroup because gofer is added to a cgroup in the caller's namespace.
-	nss := []specs.LinuxNamespace{
-		{Type: specs.IPCNamespace},
-		{Type: specs.MountNamespace},
-		{Type: specs.NetworkNamespace},
-		{Type: specs.PIDNamespace},
-		{Type: specs.UTSNamespace},
-	}
 
 	// Setup any uid/gid mappings, and create or join the configured user
 	// namespace so the gofer's view of the filesystem aligns with the
 	// users in the sandbox.
-	nss = append(nss, specutils.FilterNS([]specs.LinuxNamespaceType{specs.UserNamespace}, spec)...)
 	specutils.SetUIDGIDMappings(cmd, spec)
+	nss := specutils.FilterNS([]specs.LinuxNamespaceType{specs.UserNamespace}, spec)
 
 	// Start the gofer in the given namespace.
 	log.Debugf("Starting gofer: %s %v", binPath, args)
@@ -849,7 +735,6 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *boot.Config, bund
 	}
 	log.Infof("Gofer started, PID: %d", cmd.Process.Pid)
 	c.GoferPid = cmd.Process.Pid
-	c.goferIsChild = true
 	return sandEnds, nil
 }
 
@@ -886,7 +771,7 @@ func (c *Container) changeStatus(s Status) {
 		}
 
 	case Stopped:
-		if c.Status != Creating && c.Status != Created && c.Status != Running && c.Status != Stopped {
+		if c.Status != Created && c.Status != Running && c.Status != Stopped {
 			panic(fmt.Sprintf("invalid state transition: %v => %v", c.Status, s))
 		}
 
@@ -918,26 +803,12 @@ func (c *Container) lock() (func() error, error) {
 // given container root directory.
 func lockContainerMetadata(containerRootDir string) (func() error, error) {
 	if err := os.MkdirAll(containerRootDir, 0711); err != nil {
-		return nil, fmt.Errorf("creating container root directory %q: %v", containerRootDir, err)
+		return nil, fmt.Errorf("error creating container root directory %q: %v", containerRootDir, err)
 	}
 	f := filepath.Join(containerRootDir, metadataLockFilename)
 	l := flock.NewFlock(f)
 	if err := l.Lock(); err != nil {
-		return nil, fmt.Errorf("acquiring lock on container lock file %q: %v", f, err)
+		return nil, fmt.Errorf("error acquiring lock on container lock file %q: %v", f, err)
 	}
 	return l.Unlock, nil
-}
-
-// runInCgroup executes fn inside the specified cgroup. If cg is nil, execute
-// it in the current context.
-func runInCgroup(cg *cgroup.Cgroup, fn func() error) error {
-	if cg == nil {
-		return fn()
-	}
-	restore, err := cg.Join()
-	defer restore()
-	if err != nil {
-		return err
-	}
-	return fn()
 }

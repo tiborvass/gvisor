@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ import (
 //
 // +stateify savable
 type slaveInodeOperations struct {
-	fsutil.SimpleFileInode
+	inodeOperations
 
 	// d is the containing dir.
 	d *dirInodeOperations
@@ -46,9 +46,16 @@ var _ fs.InodeOperations = (*slaveInodeOperations)(nil)
 // newSlaveInode takes ownership of t.
 func newSlaveInode(ctx context.Context, d *dirInodeOperations, t *Terminal, owner fs.FileOwner, p fs.FilePermissions) *fs.Inode {
 	iops := &slaveInodeOperations{
-		SimpleFileInode: *fsutil.NewSimpleFileInode(ctx, owner, p, linux.DEVPTS_SUPER_MAGIC),
-		d:               d,
-		t:               t,
+		inodeOperations: inodeOperations{
+			uattr: fs.WithCurrentTime(ctx, fs.UnstableAttr{
+				Owner: owner,
+				Perms: p,
+				Links: 1,
+				// Size and Blocks are always 0.
+			}),
+		},
+		d: d,
+		t: t,
 	}
 
 	return fs.NewInode(iops, d.msrc, fs.StableAttr{
@@ -84,11 +91,11 @@ func (si *slaveInodeOperations) GetFile(ctx context.Context, d *fs.Dirent, flags
 //
 // +stateify savable
 type slaveFileOperations struct {
-	fsutil.FilePipeSeek      `state:"nosave"`
-	fsutil.FileNotDirReaddir `state:"nosave"`
-	fsutil.FileNoFsync       `state:"nosave"`
-	fsutil.FileNoopFlush     `state:"nosave"`
-	fsutil.FileNoMMap        `state:"nosave"`
+	fsutil.PipeSeek      `state:"nosave"`
+	fsutil.NotDirReaddir `state:"nosave"`
+	fsutil.NoFsync       `state:"nosave"`
+	fsutil.NoopFlush     `state:"nosave"`
+	fsutil.NoMMap        `state:"nosave"`
 
 	// si is the inode operations.
 	si *slaveInodeOperations
@@ -127,7 +134,7 @@ func (sf *slaveFileOperations) Write(ctx context.Context, _ *fs.File, src userme
 
 // Ioctl implements fs.FileOperations.Ioctl.
 func (sf *slaveFileOperations) Ioctl(ctx context.Context, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
-	switch cmd := args[1].Uint(); cmd {
+	switch args[1].Uint() {
 	case linux.FIONREAD: // linux.FIONREAD == linux.TIOCINQ
 		// Get the number of bytes in the input queue read buffer.
 		return 0, sf.si.t.ld.inputQueueReadSize(ctx, io, args)
@@ -147,14 +154,7 @@ func (sf *slaveFileOperations) Ioctl(ctx context.Context, io usermem.IO, args ar
 		return 0, sf.si.t.ld.windowSize(ctx, io, args)
 	case linux.TIOCSWINSZ:
 		return 0, sf.si.t.ld.setWindowSize(ctx, io, args)
-	case linux.TIOCSCTTY:
-		// Make the given terminal the controlling terminal of the
-		// calling process.
-		// TODO: Implement once we have support for job
-		// control.
-		return 0, nil
 	default:
-		maybeEmitUnimplementedEvent(ctx, cmd)
 		return 0, syserror.ENOTTY
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,12 +31,12 @@ import (
 	ktime "gvisor.googlesource.com/gvisor/pkg/sentry/kernel/time"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/socket"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/netlink/port"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
+	sunix "gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserr"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 	"gvisor.googlesource.com/gvisor/pkg/waiter"
 )
 
@@ -65,12 +65,12 @@ var netlinkSocketDevice = device.NewAnonDevice()
 //
 // +stateify savable
 type Socket struct {
-	fsutil.FilePipeSeek      `state:"nosave"`
-	fsutil.FileNotDirReaddir `state:"nosave"`
-	fsutil.FileNoFsync       `state:"nosave"`
-	fsutil.FileNoopFlush     `state:"nosave"`
-	fsutil.FileNoMMap        `state:"nosave"`
-	socket.SendReceiveTimeout
+	socket.ReceiveTimeout
+	fsutil.PipeSeek      `state:"nosave"`
+	fsutil.NotDirReaddir `state:"nosave"`
+	fsutil.NoFsync       `state:"nosave"`
+	fsutil.NoopFlush     `state:"nosave"`
+	fsutil.NoMMap        `state:"nosave"`
 
 	// ports provides netlink port allocation.
 	ports *port.Manager
@@ -80,11 +80,11 @@ type Socket struct {
 
 	// ep is a datagram unix endpoint used to buffer messages sent from the
 	// kernel to userspace. RecvMsg reads messages from this endpoint.
-	ep transport.Endpoint
+	ep unix.Endpoint
 
 	// connection is the kernel's connection to ep, used to write messages
 	// sent to userspace.
-	connection transport.ConnectedEndpoint
+	connection unix.ConnectedEndpoint
 
 	// mu protects the fields below.
 	mu sync.Mutex `state:"nosave"`
@@ -105,20 +105,20 @@ var _ socket.Socket = (*Socket)(nil)
 // NewSocket creates a new Socket.
 func NewSocket(t *kernel.Task, protocol Protocol) (*Socket, *syserr.Error) {
 	// Datagram endpoint used to buffer kernel -> user messages.
-	ep := transport.NewConnectionless()
+	ep := unix.NewConnectionless()
 
 	// Bind the endpoint for good measure so we can connect to it. The
 	// bound address will never be exposed.
-	if err := ep.Bind(tcpip.FullAddress{Addr: "dummy"}, nil); err != nil {
+	if terr := ep.Bind(tcpip.FullAddress{Addr: "dummy"}, nil); terr != nil {
 		ep.Close()
-		return nil, err
+		return nil, syserr.TranslateNetstackError(terr)
 	}
 
 	// Create a connection from which the kernel can write messages.
-	connection, err := ep.(transport.BoundEndpoint).UnidirectionalConnect()
-	if err != nil {
+	connection, terr := ep.(unix.BoundEndpoint).UnidirectionalConnect()
+	if terr != nil {
 		ep.Close()
-		return nil, err
+		return nil, syserr.TranslateNetstackError(terr)
 	}
 
 	return &Socket{
@@ -298,22 +298,7 @@ func (s *Socket) GetSockOpt(t *kernel.Task, level int, name int, outLen int) (in
 				return nil, syserr.ErrInvalidArgument
 			}
 			// We don't have limit on receiving size.
-			return int32(math.MaxInt32), nil
-
-		default:
-			socket.GetSockOptEmitUnimplementedEvent(t, name)
-		}
-	case linux.SOL_NETLINK:
-		switch name {
-		case linux.NETLINK_BROADCAST_ERROR,
-			linux.NETLINK_CAP_ACK,
-			linux.NETLINK_DUMP_STRICT_CHK,
-			linux.NETLINK_EXT_ACK,
-			linux.NETLINK_LIST_MEMBERSHIPS,
-			linux.NETLINK_NO_ENOBUFS,
-			linux.NETLINK_PKTINFO:
-
-			t.Kernel().EmitUnimplementedEvent(t)
+			return math.MaxInt32, nil
 		}
 	}
 	// TODO: other sockopts are not supported.
@@ -344,25 +329,7 @@ func (s *Socket) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *sy
 			// We don't have limit on receiving size. So just accept anything as
 			// valid for compatibility.
 			return nil
-		default:
-			socket.SetSockOptEmitUnimplementedEvent(t, name)
 		}
-
-	case linux.SOL_NETLINK:
-		switch name {
-		case linux.NETLINK_ADD_MEMBERSHIP,
-			linux.NETLINK_BROADCAST_ERROR,
-			linux.NETLINK_CAP_ACK,
-			linux.NETLINK_DROP_MEMBERSHIP,
-			linux.NETLINK_DUMP_STRICT_CHK,
-			linux.NETLINK_EXT_ACK,
-			linux.NETLINK_LISTEN_ALL_NSID,
-			linux.NETLINK_NO_ENOBUFS,
-			linux.NETLINK_PKTINFO:
-
-			t.Kernel().EmitUnimplementedEvent(t)
-		}
-
 	}
 	// TODO: other sockopts are not supported.
 	return syserr.ErrProtocolNotAvailable
@@ -401,7 +368,7 @@ func (s *Socket) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, have
 
 	trunc := flags&linux.MSG_TRUNC != 0
 
-	r := unix.EndpointReader{
+	r := sunix.EndpointReader{
 		Endpoint: s.ep,
 		Peek:     flags&linux.MSG_PEEK != 0,
 	}
@@ -441,7 +408,7 @@ func (s *Socket) Read(ctx context.Context, _ *fs.File, dst usermem.IOSequence, _
 	if dst.NumBytes() == 0 {
 		return 0, nil
 	}
-	return dst.CopyOutFrom(ctx, &unix.EndpointReader{
+	return dst.CopyOutFrom(ctx, &sunix.EndpointReader{
 		Endpoint: s.ep,
 	})
 }
@@ -457,11 +424,11 @@ func (s *Socket) sendResponse(ctx context.Context, ms *MessageSet) *syserr.Error
 	if len(bufs) > 0 {
 		// RecvMsg never receives the address, so we don't need to send
 		// one.
-		_, notify, err := s.connection.Send(bufs, transport.ControlMessages{}, tcpip.FullAddress{})
+		_, notify, terr := s.connection.Send(bufs, unix.ControlMessages{}, tcpip.FullAddress{})
 		// If the buffer is full, we simply drop messages, just like
 		// Linux.
-		if err != nil && err != syserr.ErrWouldBlock {
-			return err
+		if terr != nil && terr != tcpip.ErrWouldBlock {
+			return syserr.TranslateNetstackError(terr)
 		}
 		if notify {
 			s.connection.SendNotify()
@@ -481,9 +448,9 @@ func (s *Socket) sendResponse(ctx context.Context, ms *MessageSet) *syserr.Error
 			PortID: uint32(ms.PortID),
 		})
 
-		_, notify, err := s.connection.Send([][]byte{m.Finalize()}, transport.ControlMessages{}, tcpip.FullAddress{})
-		if err != nil && err != syserr.ErrWouldBlock {
-			return err
+		_, notify, terr := s.connection.Send([][]byte{m.Finalize()}, unix.ControlMessages{}, tcpip.FullAddress{})
+		if terr != nil && terr != tcpip.ErrWouldBlock {
+			return syserr.TranslateNetstackError(terr)
 		}
 		if notify {
 			s.connection.SendNotify()
@@ -593,7 +560,7 @@ func (s *Socket) sendMsg(ctx context.Context, src usermem.IOSequence, to []byte,
 }
 
 // SendMsg implements socket.Socket.SendMsg.
-func (s *Socket) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, haveDeadline bool, deadline ktime.Time, controlMessages socket.ControlMessages) (int, *syserr.Error) {
+func (s *Socket) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, controlMessages socket.ControlMessages) (int, *syserr.Error) {
 	return s.sendMsg(t, src, to, flags, controlMessages)
 }
 

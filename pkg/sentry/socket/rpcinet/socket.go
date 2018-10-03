@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ package rpcinet
 import (
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/binary"
@@ -32,25 +31,24 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/rpcinet/conn"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/rpcinet/notifier"
 	pb "gvisor.googlesource.com/gvisor/pkg/sentry/socket/rpcinet/syscall_rpc_go_proto"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/unimpl"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserr"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip/buffer"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 	"gvisor.googlesource.com/gvisor/pkg/waiter"
 )
 
 // socketOperations implements fs.FileOperations and socket.Socket for a socket
 // implemented using a host socket.
 type socketOperations struct {
-	fsutil.FilePipeSeek      `state:"nosave"`
-	fsutil.FileNotDirReaddir `state:"nosave"`
-	fsutil.FileNoFsync       `state:"nosave"`
-	fsutil.FileNoopFlush     `state:"nosave"`
-	fsutil.FileNoMMap        `state:"nosave"`
-	socket.SendReceiveTimeout
+	socket.ReceiveTimeout
+	fsutil.PipeSeek      `state:"nosave"`
+	fsutil.NotDirReaddir `state:"nosave"`
+	fsutil.NoFsync       `state:"nosave"`
+	fsutil.NoopFlush     `state:"nosave"`
+	fsutil.NoMMap        `state:"nosave"`
 
 	fd       uint32 // must be O_NONBLOCK
 	wq       *waiter.Queue
@@ -213,11 +211,6 @@ func (s *socketOperations) Write(ctx context.Context, _ *fs.File, src usermem.IO
 	}
 
 	n, err := rpcWrite(t, &pb.SyscallRequest_Write{&pb.WriteRequest{Fd: s.fd, Data: v}})
-	if n > 0 && n < uint32(src.NumBytes()) {
-		// The FileOperations.Write interface expects us to return ErrWouldBlock in
-		// the event of a partial write.
-		return int64(n), syserror.ErrWouldBlock
-	}
 	return int64(n), err.ToError()
 }
 
@@ -285,10 +278,7 @@ func (s *socketOperations) Accept(t *kernel.Task, peerRequested bool, flags int,
 	if blocking && se == syserr.ErrTryAgain {
 		// Register for notifications.
 		e, ch := waiter.NewChannelEntry(nil)
-		// FIXME: This waiter.EventHUp is a partial
-		// measure, need to figure out how to translate linux events to
-		// internal events.
-		s.EventRegister(&e, waiter.EventIn|waiter.EventHUp)
+		s.EventRegister(&e, waiter.EventIn)
 		defer s.EventUnregister(&e)
 
 		// Try to accept the connection again; if it fails, then wait until we
@@ -363,13 +353,6 @@ func (s *socketOperations) Listen(t *kernel.Task, backlog int) *syserr.Error {
 
 // Shutdown implements socket.Socket.Shutdown.
 func (s *socketOperations) Shutdown(t *kernel.Task, how int) *syserr.Error {
-	// We save the shutdown state because of strange differences on linux
-	// related to recvs on blocking vs. non-blocking sockets after a SHUT_RD.
-	// We need to emulate that behavior on the blocking side.
-	// TODO: There is a possible race that can exist with loopback,
-	// where data could possibly be lost.
-	s.setShutdownFlags(how)
-
 	stack := t.NetworkContext().(*Stack)
 	id, c := stack.rpcConn.NewRequest(pb.SyscallRequest{Args: &pb.SyscallRequest_Shutdown{&pb.ShutdownRequest{Fd: s.fd, How: int64(how)}}}, false /* ignoreResult */)
 	<-c
@@ -378,26 +361,22 @@ func (s *socketOperations) Shutdown(t *kernel.Task, how int) *syserr.Error {
 		return syserr.FromHost(syscall.Errno(e))
 	}
 
+	// We save the shutdown state because of strange differences on linux
+	// related to recvs on blocking vs. non-blocking sockets after a SHUT_RD.
+	// We need to emulate that behavior on the blocking side.
+	s.setShutdownFlags(how)
 	return nil
 }
 
 // GetSockOpt implements socket.Socket.GetSockOpt.
 func (s *socketOperations) GetSockOpt(t *kernel.Task, level int, name int, outLen int) (interface{}, *syserr.Error) {
-	// SO_RCVTIMEO and SO_SNDTIMEO are special because blocking is performed
-	// within the sentry.
+	// SO_RCVTIMEO is special because blocking is performed within the sentry.
 	if level == linux.SOL_SOCKET && name == linux.SO_RCVTIMEO {
 		if outLen < linux.SizeOfTimeval {
 			return nil, syserr.ErrInvalidArgument
 		}
 
 		return linux.NsecToTimeval(s.RecvTimeout()), nil
-	}
-	if level == linux.SOL_SOCKET && name == linux.SO_SNDTIMEO {
-		if outLen < linux.SizeOfTimeval {
-			return nil, syserr.ErrInvalidArgument
-		}
-
-		return linux.NsecToTimeval(s.SendTimeout()), nil
 	}
 
 	stack := t.NetworkContext().(*Stack)
@@ -415,9 +394,8 @@ func (s *socketOperations) GetSockOpt(t *kernel.Task, level int, name int, outLe
 // SetSockOpt implements socket.Socket.SetSockOpt.
 func (s *socketOperations) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *syserr.Error {
 	// Because blocking actually happens within the sentry we need to inspect
-	// this socket option to determine if it's a SO_RCVTIMEO or SO_SNDTIMEO,
-	// and if so, we will save it and use it as the deadline for recv(2)
-	// or send(2) related syscalls.
+	// this socket option to determine if it's a SO_RCVTIMEO, and if so, we will
+	// save it and use it as the deadline for recv(2) related syscalls.
 	if level == linux.SOL_SOCKET && name == linux.SO_RCVTIMEO {
 		if len(opt) < linux.SizeOfTimeval {
 			return syserr.ErrInvalidArgument
@@ -425,23 +403,7 @@ func (s *socketOperations) SetSockOpt(t *kernel.Task, level int, name int, opt [
 
 		var v linux.Timeval
 		binary.Unmarshal(opt[:linux.SizeOfTimeval], usermem.ByteOrder, &v)
-		if v.Usec < 0 || v.Usec >= int64(time.Second/time.Microsecond) {
-			return syserr.ErrDomain
-		}
 		s.SetRecvTimeout(v.ToNsecCapped())
-		return nil
-	}
-	if level == linux.SOL_SOCKET && name == linux.SO_SNDTIMEO {
-		if len(opt) < linux.SizeOfTimeval {
-			return syserr.ErrInvalidArgument
-		}
-
-		var v linux.Timeval
-		binary.Unmarshal(opt[:linux.SizeOfTimeval], usermem.ByteOrder, &v)
-		if v.Usec < 0 || v.Usec >= int64(time.Second/time.Microsecond) {
-			return syserr.ErrDomain
-		}
-		s.SetSendTimeout(v.ToNsecCapped())
 		return nil
 	}
 
@@ -593,10 +555,6 @@ func (s *socketOperations) Ioctl(ctx context.Context, io usermem.IO, args arch.S
 		})
 
 		return 0, err
-
-	case linux.SIOCGIFMEM, linux.SIOCGIFPFLAGS, linux.SIOCGMIIPHY, linux.SIOCGMIIREG:
-		unimpl.EmitUnimplementedEvent(ctx)
-
 	default:
 		return 0, syserror.ENOTTY
 	}
@@ -749,7 +707,7 @@ func rpcSendMsg(t *kernel.Task, req *pb.SyscallRequest_Sendmsg) (uint32, *syserr
 }
 
 // SendMsg implements socket.Socket.SendMsg.
-func (s *socketOperations) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, haveDeadline bool, deadline ktime.Time, controlMessages socket.ControlMessages) (int, *syserr.Error) {
+func (s *socketOperations) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, controlMessages socket.ControlMessages) (int, *syserr.Error) {
 	// Whitelist flags.
 	if flags&^(syscall.MSG_DONTWAIT|syscall.MSG_EOR|syscall.MSG_FASTOPEN|syscall.MSG_MORE|syscall.MSG_NOSIGNAL) != 0 {
 		return 0, syserr.ErrInvalidArgument
@@ -769,22 +727,17 @@ func (s *socketOperations) SendMsg(t *kernel.Task, src usermem.IOSequence, to []
 
 	// TODO: this needs to change to map directly to a SendMsg syscall
 	// in the RPC.
-	totalWritten := 0
-	n, err := rpcSendMsg(t, &pb.SyscallRequest_Sendmsg{&pb.SendmsgRequest{
+	req := &pb.SyscallRequest_Sendmsg{&pb.SendmsgRequest{
 		Fd:          uint32(s.fd),
 		Data:        v,
 		Address:     to,
 		More:        flags&linux.MSG_MORE != 0,
 		EndOfRecord: flags&linux.MSG_EOR != 0,
-	}})
+	}}
 
+	n, err := rpcSendMsg(t, req)
 	if err != syserr.ErrWouldBlock && err != syserr.ErrTryAgain || flags&linux.MSG_DONTWAIT != 0 {
 		return int(n), err
-	}
-
-	if n > 0 {
-		totalWritten += int(n)
-		v.TrimFront(int(n))
 	}
 
 	// We'll have to block. Register for notification and keep trying to
@@ -794,33 +747,13 @@ func (s *socketOperations) SendMsg(t *kernel.Task, src usermem.IOSequence, to []
 	defer s.EventUnregister(&e)
 
 	for {
-		n, err := rpcSendMsg(t, &pb.SyscallRequest_Sendmsg{&pb.SendmsgRequest{
-			Fd:          uint32(s.fd),
-			Data:        v,
-			Address:     to,
-			More:        flags&linux.MSG_MORE != 0,
-			EndOfRecord: flags&linux.MSG_EOR != 0,
-		}})
-
-		if n > 0 {
-			totalWritten += int(n)
-			v.TrimFront(int(n))
-
-			if err == nil && totalWritten < int(src.NumBytes()) {
-				continue
-			}
-		}
-
+		n, err := rpcSendMsg(t, req)
 		if err != syserr.ErrWouldBlock && err != syserr.ErrTryAgain {
-			// We eat the error in this situation.
-			return int(totalWritten), nil
+			return int(n), err
 		}
 
-		if err := t.BlockWithDeadline(ch, haveDeadline, deadline); err != nil {
-			if err == syserror.ETIMEDOUT {
-				return int(totalWritten), syserr.ErrTryAgain
-			}
-			return int(totalWritten), syserr.FromError(err)
+		if err := t.Block(ch); err != nil {
+			return 0, syserr.FromError(err)
 		}
 	}
 }
@@ -830,7 +763,7 @@ type socketProvider struct {
 }
 
 // Socket implements socket.Provider.Socket.
-func (p *socketProvider) Socket(t *kernel.Task, stypeflags transport.SockType, protocol int) (*fs.File, *syserr.Error) {
+func (p *socketProvider) Socket(t *kernel.Task, stypeflags unix.SockType, protocol int) (*fs.File, *syserr.Error) {
 	// Check that we are using the RPC network stack.
 	stack := t.NetworkContext()
 	if stack == nil {
@@ -870,7 +803,7 @@ func (p *socketProvider) Socket(t *kernel.Task, stypeflags transport.SockType, p
 }
 
 // Pair implements socket.Provider.Pair.
-func (p *socketProvider) Pair(t *kernel.Task, stype transport.SockType, protocol int) (*fs.File, *fs.File, *syserr.Error) {
+func (p *socketProvider) Pair(t *kernel.Task, stype unix.SockType, protocol int) (*fs.File, *fs.File, *syserr.Error) {
 	// Not supported by AF_INET/AF_INET6.
 	return nil, nil, nil
 }

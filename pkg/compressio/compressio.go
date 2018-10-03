@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,14 +46,14 @@ package compressio
 import (
 	"bytes"
 	"compress/flate"
-	"crypto/hmac"
-	"crypto/sha256"
 	"errors"
 	"hash"
 	"io"
 	"runtime"
 	"sync"
 
+	"crypto/hmac"
+	"crypto/sha256"
 	"gvisor.googlesource.com/gvisor/pkg/binary"
 )
 
@@ -323,10 +323,10 @@ func (p *pool) schedule(c *chunk, callback func(*chunk) error) error {
 			inputChan  chan *chunk
 			outputChan chan result
 		)
-		if c != nil && len(p.workers) != 0 {
+		if c != nil {
 			inputChan = p.workers[(p.nextInput+1)%len(p.workers)].input
 		}
-		if callback != nil && p.nextOutput != p.nextInput && len(p.workers) != 0 {
+		if callback != nil && p.nextOutput != p.nextInput {
 			outputChan = p.workers[(p.nextOutput+1)%len(p.workers)].output
 		}
 		if inputChan == nil && outputChan == nil {

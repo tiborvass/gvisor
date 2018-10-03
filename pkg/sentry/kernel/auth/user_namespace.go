@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -49,7 +49,10 @@ type UserNamespace struct {
 	gidMapFromParent idMapSet
 	gidMapToParent   idMapSet
 
-	// TODO: Support disabling setgroups(2).
+	// TODO: Consider supporting disabling setgroups(2), which "was
+	// added in Linux 3.19, but was backported to many earlier stable kernel
+	// series, because it addresses a security issue" - user_namespaces(7). (It
+	// was not backported to 3.11.10, which we are currently imitating.)
 }
 
 // NewRootUserNamespace returns a UserNamespace that is appropriate for a

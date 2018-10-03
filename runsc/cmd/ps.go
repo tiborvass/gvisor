@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -62,11 +62,11 @@ func (ps *PS) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{})
 
 	c, err := container.Load(conf.RootDir, id)
 	if err != nil {
-		Fatalf("loading sandbox: %v", err)
+		Fatalf("error loading sandbox: %v", err)
 	}
 	pList, err := c.Processes()
 	if err != nil {
-		Fatalf("getting processes for container: %v", err)
+		Fatalf("error getting processes for container: %v", err)
 	}
 
 	switch ps.format {
@@ -75,11 +75,11 @@ func (ps *PS) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{})
 	case "json":
 		o, err := control.PrintPIDsJSON(pList)
 		if err != nil {
-			Fatalf("generating JSON: %v", err)
+			Fatalf("error generating JSON: %v", err)
 		}
 		fmt.Println(o)
 	default:
-		Fatalf("unsupported format: %s", ps.format)
+		Fatalf("Unsupported format: %s", ps.format)
 	}
 
 	return subcommands.ExitSuccess

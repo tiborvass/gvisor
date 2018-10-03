@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@
 //
 // Kernel.extMu
 //   ThreadGroup.timerMu
-//     ktime.Timer.mu (for kernelCPUClockTicker and IntervalTimer)
+//     ktime.Timer.mu (for IntervalTimer)
 //       TaskSet.mu
 //         SignalHandlers.mu
 //           Task.mu
@@ -31,7 +31,6 @@
 package kernel
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -41,7 +40,6 @@ import (
 
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/cpuid"
-	"gvisor.googlesource.com/gvisor/pkg/eventchannel"
 	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
@@ -51,7 +49,6 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/inet"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/epoll"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/sched"
 	ktime "gvisor.googlesource.com/gvisor/pkg/sentry/kernel/time"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/limits"
@@ -60,8 +57,6 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/netlink/port"
 	sentrytime "gvisor.googlesource.com/gvisor/pkg/sentry/time"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/unimpl"
-	uspb "gvisor.googlesource.com/gvisor/pkg/sentry/unimpl/unimplemented_syscall_go_proto"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/uniqueid"
 	"gvisor.googlesource.com/gvisor/pkg/state"
 	"gvisor.googlesource.com/gvisor/pkg/tcpip"
@@ -112,11 +107,6 @@ type Kernel struct {
 	// nil, and must be set by calling Kernel.SetRootMountNamespace before
 	// Kernel.CreateProcess can succeed.
 	mounts *fs.MountNamespace
-
-	// futexes is the "root" futex.Manager, from which all others are forked.
-	// This is necessary to ensure that shared futexes are coherent across all
-	// tasks, including those created by CreateProcess.
-	futexes *futex.Manager
 
 	// globalInit is the thread group whose leader has ID 1 in the root PID
 	// namespace. globalInit is stored separately so that it is accessible even
@@ -264,7 +254,6 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.vdso = args.Vdso
 	k.realtimeClock = &timekeeperClock{tk: args.Timekeeper, c: sentrytime.Realtime}
 	k.monotonicClock = &timekeeperClock{tk: args.Timekeeper, c: sentrytime.Monotonic}
-	k.futexes = futex.NewManager()
 	k.netlinkPorts = port.New()
 
 	return nil
@@ -595,12 +584,8 @@ func (ctx *createProcessContext) Value(key interface{}) interface{} {
 		return ctx.k
 	case uniqueid.CtxGlobalUniqueID:
 		return ctx.k.UniqueID()
-	case uniqueid.CtxGlobalUniqueIDProvider:
-		return ctx.k
 	case uniqueid.CtxInotifyCookie:
 		return ctx.k.GenerateInotifyCookie()
-	case unimpl.CtxEvents:
-		return ctx.k
 	default:
 		return nil
 	}
@@ -623,7 +608,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		return nil, 0, fmt.Errorf("no kernel MountNamespace")
 	}
 
-	tg := k.newThreadGroup(k.tasks.Root, NewSignalHandlers(), linux.SIGCHLD, args.Limits, k.monotonicClock)
+	tg := NewThreadGroup(k.tasks.Root, NewSignalHandlers(), linux.SIGCHLD, args.Limits, k.monotonicClock)
 	ctx := args.NewContext(k)
 
 	// Grab the root directory.
@@ -635,11 +620,10 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	args.Root = nil
 
 	// Grab the working directory.
-	remainingTraversals := uint(args.MaxSymlinkTraversals)
 	wd := root // Default.
 	if args.WorkingDirectory != "" {
 		var err error
-		wd, err = k.mounts.FindInode(ctx, root, nil, args.WorkingDirectory, &remainingTraversals)
+		wd, err = k.mounts.FindInode(ctx, root, nil, args.WorkingDirectory, args.MaxSymlinkTraversals)
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to find initial working directory %q: %v", args.WorkingDirectory, err)
 		}
@@ -658,10 +642,9 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	}
 
 	// Create a fresh task context.
-	remainingTraversals = uint(args.MaxSymlinkTraversals)
-	tc, se := k.LoadTaskImage(ctx, k.mounts, root, wd, &remainingTraversals, args.Filename, args.Argv, args.Envv, k.featureSet)
-	if se != nil {
-		return nil, 0, errors.New(se.String())
+	tc, err := k.LoadTaskImage(ctx, k.mounts, root, wd, args.MaxSymlinkTraversals, args.Filename, args.Argv, args.Envv, k.featureSet)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	// Take a reference on the FDMap, which will be transferred to
@@ -713,7 +696,7 @@ func (k *Kernel) Start() error {
 	}
 
 	k.started = true
-	k.cpuClockTicker = ktime.NewTimer(k.monotonicClock, newKernelCPUClockTicker(k))
+	k.cpuClockTicker = ktime.NewTimer(k.monotonicClock, kernelCPUClockListener{k})
 	k.cpuClockTicker.Swap(ktime.Setting{
 		Enabled: true,
 		Period:  linux.ClockTick,
@@ -749,13 +732,14 @@ func (k *Kernel) pauseTimeLocked() {
 	// mutex, while holding the Timer mutex.)
 	for t := range k.tasks.Root.tids {
 		if t == t.tg.leader {
-			t.tg.itimerRealTimer.Pause()
-			for _, it := range t.tg.timers {
-				it.PauseTimer()
-			}
+			t.tg.tm.pause()
 		}
-		// This means we'll iterate FDMaps shared by multiple tasks repeatedly,
-		// but ktime.Timer.Pause is idempotent so this is harmless.
+		// This means we'll iterate ThreadGroups and FDMaps shared by multiple
+		// tasks repeatedly, but ktime.Timer.Pause is idempotent so this is
+		// harmless.
+		for _, it := range t.tg.timers {
+			it.PauseTimer()
+		}
 		if fdm := t.fds; fdm != nil {
 			for _, desc := range fdm.files {
 				if tfd, ok := desc.file.FileOperations.(*timerfd.TimerOperations); ok {
@@ -781,10 +765,10 @@ func (k *Kernel) resumeTimeLocked() {
 	k.timekeeper.ResumeUpdates()
 	for t := range k.tasks.Root.tids {
 		if t == t.tg.leader {
-			t.tg.itimerRealTimer.Resume()
-			for _, it := range t.tg.timers {
-				it.ResumeTimer()
-			}
+			t.tg.tm.resume()
+		}
+		for _, it := range t.tg.timers {
+			it.ResumeTimer()
 		}
 		if fdm := t.fds; fdm != nil {
 			for _, desc := range fdm.files {
@@ -846,40 +830,17 @@ func (k *Kernel) SendContainerSignal(cid string, info *arch.SignalInfo) error {
 	k.tasks.mu.RLock()
 	defer k.tasks.mu.RUnlock()
 
-	var lastErr error
 	for t := range k.tasks.Root.tids {
 		if t == t.tg.leader && t.ContainerID() == cid {
 			t.tg.signalHandlers.mu.Lock()
 			defer t.tg.signalHandlers.mu.Unlock()
 			infoCopy := *info
 			if err := t.sendSignalLocked(&infoCopy, true /*group*/); err != nil {
-				lastErr = err
+				return err
 			}
 		}
 	}
-	return lastErr
-}
-
-// SendProcessGroupSignal sends a signal to all processes inside the process
-// group. It is analagous to kernel/signal.c:kill_pgrp.
-func (k *Kernel) SendProcessGroupSignal(pg *ProcessGroup, info *arch.SignalInfo) error {
-	k.extMu.Lock()
-	defer k.extMu.Unlock()
-	k.tasks.mu.RLock()
-	defer k.tasks.mu.RUnlock()
-
-	var lastErr error
-	for t := range k.tasks.Root.tids {
-		if t == t.tg.leader && t.tg.ProcessGroup() == pg {
-			t.tg.signalHandlers.mu.Lock()
-			defer t.tg.signalHandlers.mu.Unlock()
-			infoCopy := *info
-			if err := t.sendSignalLocked(&infoCopy, true /*group*/); err != nil {
-				lastErr = err
-			}
-		}
-	}
-	return lastErr
+	return nil
 }
 
 // FeatureSet returns the FeatureSet.
@@ -1041,16 +1002,6 @@ func (k *Kernel) SupervisorContext() context.Context {
 	}
 }
 
-// EmitUnimplementedEvent emits an UnimplementedSyscall event via the event
-// channel.
-func (k *Kernel) EmitUnimplementedEvent(ctx context.Context) {
-	t := TaskFromContext(ctx)
-	eventchannel.Emit(&uspb.UnimplementedSyscall{
-		Tid:       int32(t.ThreadID()),
-		Registers: t.Arch().StateData().Proto(),
-	})
-}
-
 type supervisorContext struct {
 	context.NoopSleeper
 	log.Logger
@@ -1087,13 +1038,28 @@ func (ctx supervisorContext) Value(key interface{}) interface{} {
 		return ctx.k
 	case uniqueid.CtxGlobalUniqueID:
 		return ctx.k.UniqueID()
-	case uniqueid.CtxGlobalUniqueIDProvider:
-		return ctx.k
 	case uniqueid.CtxInotifyCookie:
 		return ctx.k.GenerateInotifyCookie()
-	case unimpl.CtxEvents:
-		return ctx.k
 	default:
 		return nil
 	}
+}
+
+type kernelCPUClockListener struct {
+	k *Kernel
+}
+
+// Notify implements ktime.TimerListener.Notify.
+func (l kernelCPUClockListener) Notify(exp uint64) {
+	// Only increment cpuClock by 1 regardless of the number of expirations.
+	// This approximately compensates for cases where thread throttling or bad
+	// Go runtime scheduling prevents the cpuClockTicker goroutine, and
+	// presumably task goroutines as well, from executing for a long period of
+	// time. It's also necessary to prevent CPU clocks from seeing large
+	// discontinuous jumps.
+	atomic.AddUint64(&l.k.cpuClock, 1)
+}
+
+// Destroy implements ktime.TimerListener.Destroy.
+func (l kernelCPUClockListener) Destroy() {
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -170,24 +170,6 @@ const (
 
 	// ItimerType is an itimer type (ITIMER_REAL, etc).
 	ItimerType
-
-	// Signal is a signal number.
-	Signal
-
-	// SignalMaskAction is a signal mask action passed to rt_sigprocmask(2).
-	SignalMaskAction
-
-	// SigSet is a signal set.
-	SigSet
-
-	// PostSigSet is a signal set, formatted after syscall execution.
-	PostSigSet
-
-	// SigAction is a struct sigaction.
-	SigAction
-
-	// PostSigAction is a struct sigaction, formatted after syscall execution.
-	PostSigAction
 )
 
 // defaultFormat is the syscall argument format to use if the actual format is

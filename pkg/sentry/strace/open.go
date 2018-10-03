@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,9 +22,18 @@ import (
 
 // OpenMode represents the mode to open(2) a file.
 var OpenMode = abi.ValueSet{
-	syscall.O_RDWR:   "O_RDWR",
-	syscall.O_WRONLY: "O_WRONLY",
-	syscall.O_RDONLY: "O_RDONLY",
+	{
+		Value: syscall.O_RDWR,
+		Name:  "O_RDWR",
+	},
+	{
+		Value: syscall.O_WRONLY,
+		Name:  "O_WRONLY",
+	},
+	{
+		Value: syscall.O_RDONLY,
+		Name:  "O_RDONLY",
+	},
 }
 
 // OpenFlagSet is the set of open(2) flags.

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,18 +14,7 @@
 
 package fs
 
-// beforeSave is invoked by stateify.
-func (f *File) beforeSave() {
-	f.saving = true
-	if f.flags.Async && f.async != nil {
-		f.async.Unregister(f)
-	}
-}
-
 // afterLoad is invoked by stateify.
 func (f *File) afterLoad() {
 	f.mu.Init()
-	if f.flags.Async && f.async != nil {
-		f.async.Register(f)
-	}
 }

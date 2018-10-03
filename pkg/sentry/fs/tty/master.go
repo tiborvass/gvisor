@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/fsutil"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/unimpl"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 	"gvisor.googlesource.com/gvisor/pkg/waiter"
@@ -31,7 +30,7 @@ import (
 //
 // +stateify savable
 type masterInodeOperations struct {
-	fsutil.SimpleFileInode
+	inodeOperations
 
 	// d is the containing dir.
 	d *dirInodeOperations
@@ -42,8 +41,15 @@ var _ fs.InodeOperations = (*masterInodeOperations)(nil)
 // newMasterInode creates an Inode for the master end of a terminal.
 func newMasterInode(ctx context.Context, d *dirInodeOperations, owner fs.FileOwner, p fs.FilePermissions) *fs.Inode {
 	iops := &masterInodeOperations{
-		SimpleFileInode: *fsutil.NewSimpleFileInode(ctx, owner, p, linux.DEVPTS_SUPER_MAGIC),
-		d:               d,
+		inodeOperations: inodeOperations{
+			uattr: fs.WithCurrentTime(ctx, fs.UnstableAttr{
+				Owner: owner,
+				Perms: p,
+				Links: 1,
+				// Size and Blocks are always 0.
+			}),
+		},
+		d: d,
 	}
 
 	return fs.NewInode(iops, d.msrc, fs.StableAttr{
@@ -95,11 +101,11 @@ func (mi *masterInodeOperations) GetFile(ctx context.Context, d *fs.Dirent, flag
 //
 // +stateify savable
 type masterFileOperations struct {
-	fsutil.FilePipeSeek      `state:"nosave"`
-	fsutil.FileNotDirReaddir `state:"nosave"`
-	fsutil.FileNoFsync       `state:"nosave"`
-	fsutil.FileNoopFlush     `state:"nosave"`
-	fsutil.FileNoMMap        `state:"nosave"`
+	fsutil.PipeSeek      `state:"nosave"`
+	fsutil.NotDirReaddir `state:"nosave"`
+	fsutil.NoFsync       `state:"nosave"`
+	fsutil.NoopFlush     `state:"nosave"`
+	fsutil.NoMMap        `state:"nosave"`
 
 	// d is the containing dir.
 	d *dirInodeOperations
@@ -143,7 +149,7 @@ func (mf *masterFileOperations) Write(ctx context.Context, _ *fs.File, src userm
 
 // Ioctl implements fs.FileOperations.Ioctl.
 func (mf *masterFileOperations) Ioctl(ctx context.Context, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
-	switch cmd := args[1].Uint(); cmd {
+	switch args[1].Uint() {
 	case linux.FIONREAD: // linux.FIONREAD == linux.TIOCINQ
 		// Get the number of bytes in the output queue read buffer.
 		return 0, mf.t.ld.outputQueueReadSize(ctx, io, args)
@@ -171,48 +177,6 @@ func (mf *masterFileOperations) Ioctl(ctx context.Context, io usermem.IO, args a
 	case linux.TIOCSWINSZ:
 		return 0, mf.t.ld.setWindowSize(ctx, io, args)
 	default:
-		maybeEmitUnimplementedEvent(ctx, cmd)
 		return 0, syserror.ENOTTY
-	}
-}
-
-// maybeEmitUnimplementedEvent emits unimplemented event if cmd is valid.
-func maybeEmitUnimplementedEvent(ctx context.Context, cmd uint32) {
-	switch cmd {
-	case linux.TCGETS,
-		linux.TCSETS,
-		linux.TCSETSW,
-		linux.TCSETSF,
-		linux.TIOCGPGRP,
-		linux.TIOCSPGRP,
-		linux.TIOCGWINSZ,
-		linux.TIOCSWINSZ,
-		linux.TIOCSETD,
-		linux.TIOCSBRK,
-		linux.TIOCCBRK,
-		linux.TCSBRK,
-		linux.TCSBRKP,
-		linux.TIOCSTI,
-		linux.TIOCCONS,
-		linux.FIONBIO,
-		linux.TIOCEXCL,
-		linux.TIOCNXCL,
-		linux.TIOCGEXCL,
-		linux.TIOCNOTTY,
-		linux.TIOCSCTTY,
-		linux.TIOCGSID,
-		linux.TIOCGETD,
-		linux.TIOCVHANGUP,
-		linux.TIOCGDEV,
-		linux.TIOCMGET,
-		linux.TIOCMSET,
-		linux.TIOCMBIC,
-		linux.TIOCMBIS,
-		linux.TIOCGICOUNT,
-		linux.TCFLSH,
-		linux.TIOCSSERIAL,
-		linux.TIOCGPTPEER:
-
-		unimpl.EmitUnimplementedEvent(ctx)
 	}
 }

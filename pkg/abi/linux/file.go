@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -150,14 +150,6 @@ const (
 	PermissionsMask = 0777
 )
 
-// Values for preadv2/pwritev2.
-const (
-	RWF_HIPRI = 0x00000001
-	RWF_DSYNC = 0x00000002
-	RWF_SYNC  = 0x00000004
-	RWF_VALID = RWF_HIPRI | RWF_DSYNC | RWF_SYNC
-)
-
 // Stat represents struct stat.
 type Stat struct {
 	Dev      uint64
@@ -224,11 +216,32 @@ var modeExtraBits = abi.FlagSet{
 }
 
 var fileType = abi.ValueSet{
-	ModeSocket:          "S_IFSOCK",
-	ModeSymlink:         "S_IFLINK",
-	ModeRegular:         "S_IFREG",
-	ModeBlockDevice:     "S_IFBLK",
-	ModeDirectory:       "S_IFDIR",
-	ModeCharacterDevice: "S_IFCHR",
-	ModeNamedPipe:       "S_IFIFO",
+	{
+		Value: ModeSocket,
+		Name:  "S_IFSOCK",
+	},
+	{
+		Value: ModeSymlink,
+		Name:  "S_IFLINK",
+	},
+	{
+		Value: ModeRegular,
+		Name:  "S_IFREG",
+	},
+	{
+		Value: ModeBlockDevice,
+		Name:  "S_IFBLK",
+	},
+	{
+		Value: ModeDirectory,
+		Name:  "S_IFDIR",
+	},
+	{
+		Value: ModeCharacterDevice,
+		Name:  "S_IFCHR",
+	},
+	{
+		Value: ModeNamedPipe,
+		Name:  "S_IFIFO",
+	},
 }

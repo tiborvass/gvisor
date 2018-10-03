@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -43,16 +43,8 @@ func LogSpec(spec *specs.Spec) {
 	log.Debugf("Spec: %+v", spec)
 	log.Debugf("Spec.Hooks: %+v", spec.Hooks)
 	log.Debugf("Spec.Linux: %+v", spec.Linux)
-	if spec.Linux != nil && spec.Linux.Resources != nil {
-		res := spec.Linux.Resources
-		log.Debugf("Spec.Linux.Resources.Memory: %+v", res.Memory)
-		log.Debugf("Spec.Linux.Resources.CPU: %+v", res.CPU)
-		log.Debugf("Spec.Linux.Resources.BlockIO: %+v", res.BlockIO)
-		log.Debugf("Spec.Linux.Resources.Network: %+v", res.Network)
-	}
 	log.Debugf("Spec.Process: %+v", spec.Process)
 	log.Debugf("Spec.Root: %+v", spec.Root)
-	log.Debugf("Spec.Mounts: %+v", spec.Mounts)
 }
 
 // ValidateSpec validates that the spec is compatible with runsc.
@@ -171,29 +163,6 @@ func ReadSpecFromFile(bundleDir string, specFile *os.File) (*specs.Spec, error) 
 	return &spec, nil
 }
 
-// OpenCleanSpec opens spec file that has destination mount paths resolved to
-// their absolute location.
-func OpenCleanSpec(bundleDir string) (*os.File, error) {
-	f, err := os.Open(filepath.Join(bundleDir, "config.clean.json"))
-	if err != nil {
-		return nil, err
-	}
-	if _, err := f.Seek(0, os.SEEK_SET); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("error seeking to beginning of file %q: %v", f.Name(), err)
-	}
-	return f, nil
-}
-
-// WriteCleanSpec writes a spec file that has destination mount paths resolved.
-func WriteCleanSpec(bundleDir string, spec *specs.Spec) error {
-	bytes, err := json.Marshal(spec)
-	if err != nil {
-		return err
-	}
-	return ioutil.WriteFile(filepath.Join(bundleDir, "config.clean.json"), bytes, 0755)
-}
-
 // Capabilities takes in spec and returns a TaskCapabilities corresponding to
 // the spec.
 func Capabilities(specCaps *specs.LinuxCapabilities) (*auth.TaskCapabilities, error) {
@@ -215,21 +184,6 @@ func Capabilities(specCaps *specs.LinuxCapabilities) (*auth.TaskCapabilities, er
 		// TODO: Support ambient capabilities.
 	}
 	return &caps, nil
-}
-
-// AllCapabilities returns a LinuxCapabilities struct with all capabilities.
-func AllCapabilities() *specs.LinuxCapabilities {
-	var names []string
-	for n := range capFromName {
-		names = append(names, n)
-	}
-	return &specs.LinuxCapabilities{
-		Bounding:    names,
-		Effective:   names,
-		Inheritable: names,
-		Permitted:   names,
-		Ambient:     names,
-	}
 }
 
 var capFromName = map[string]linux.Capability{
@@ -315,6 +269,16 @@ func IsSupportedDevMount(m specs.Mount) bool {
 	return true
 }
 
+// BinPath returns the real path to self, resolving symbolink links. This is done
+// to make the process name appears as 'runsc', instead of 'exe'.
+func BinPath() (string, error) {
+	binPath, err := filepath.EvalSymlinks(ExePath)
+	if err != nil {
+		return "", fmt.Errorf(`error resolving %q symlink: %v`, ExePath, err)
+	}
+	return binPath, nil
+}
+
 const (
 	// ContainerdContainerTypeAnnotation is the OCI annotation set by
 	// containerd to indicate whether the container to create should have
@@ -380,25 +344,12 @@ func WaitForReady(pid int, timeout time.Duration, ready func() (bool, error)) er
 	return backoff.Retry(op, b)
 }
 
-// DebugLogFile opens a log file using 'logPattern' as location. If 'logPattern'
-// ends with '/', it's used as a directory with default file name.
-// 'logPattern' can contain variables that are substitued:
-//   - %TIMESTAMP%: is replaced with a timestamp using the following format:
-//			<yyyymmdd-hhmmss.uuuuuu>
-//	 - %COMMAND%: is replaced with 'command'
-func DebugLogFile(logPattern, command string) (*os.File, error) {
-	if strings.HasSuffix(logPattern, "/") {
-		// Default format: <debug-log>/runsc.log.<yyyymmdd-hhmmss.uuuuuu>.<command>
-		logPattern += "runsc.log.%TIMESTAMP%.%COMMAND%"
-	}
-	logPattern = strings.Replace(logPattern, "%TIMESTAMP%", time.Now().Format("20060102-150405.000000"), -1)
-	logPattern = strings.Replace(logPattern, "%COMMAND%", command, -1)
-
-	dir := filepath.Dir(logPattern)
-	if err := os.MkdirAll(dir, 0775); err != nil {
-		return nil, fmt.Errorf("error creating dir %q: %v", dir, err)
-	}
-	return os.OpenFile(logPattern, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0664)
+// DebugLogFile opens a file in logDir based on the timestamp and subcommand
+// for writing.
+func DebugLogFile(logDir, subcommand string) (*os.File, error) {
+	// Format: <debug-log-dir>/runsc.log.<yyyymmdd-hhmmss.uuuuuu>.<command>
+	filename := fmt.Sprintf("runsc.log.%s.%s", time.Now().Format("20060102-150405.000000"), subcommand)
+	return os.OpenFile(filepath.Join(logDir, filename), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0664)
 }
 
 // Mount creates the mount point and calls Mount with the given flags.
@@ -450,34 +401,4 @@ func ContainsStr(strs []string, str string) bool {
 		}
 	}
 	return false
-}
-
-// Cleanup allows defers to be aborted when cleanup needs to happen
-// conditionally. Usage:
-// c := MakeCleanup(func() { f.Close() })
-// defer c.Clean() // any failure before release is called will close the file.
-// ...
-// c.Release() // on success, aborts closing the file and return it.
-// return f
-type Cleanup struct {
-	clean func()
-}
-
-// MakeCleanup creates a new Cleanup object.
-func MakeCleanup(f func()) Cleanup {
-	return Cleanup{clean: f}
-}
-
-// Clean calls the cleanup function.
-func (c *Cleanup) Clean() {
-	if c.clean != nil {
-		c.clean()
-		c.clean = nil
-	}
-}
-
-// Release releases the cleanup from its duties, i.e. cleanup function is not
-// called after this point.
-func (c *Cleanup) Release() {
-	c.clean = nil
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -82,13 +82,8 @@ type overlayFileOperations struct {
 	upper *File
 	lower *File
 
-	// dirCursor is a directory cursor for a directory in an overlay. It is
-	// protected by File.mu of the owning file, which is held during
-	// Readdir and Seek calls.
+	// dirCursor is a directory cursor for a directory in an overlay.
 	dirCursor string
-
-	// dirCacheMu protects dirCache.
-	dirCacheMu sync.RWMutex `state:"nosave"`
 
 	// dirCache is cache of DentAttrs from upper and lower Inodes.
 	dirCache *SortedDentryMap
@@ -185,38 +180,21 @@ func (f *overlayFileOperations) Readdir(ctx context.Context, file *File, seriali
 	// Otherwise proceed with usual overlay readdir.
 	o := file.Dirent.Inode.overlay
 
-	// readdirEntries holds o.copyUpMu to ensure that copy-up does not
-	// occur while calculating the readir results.
-	//
-	// However, it is possible for a copy-up to occur after the call to
-	// readdirEntries, but before setting f.dirCache. This is OK, since
-	// copy-up only does not change the children in a way that would affect
-	// the children returned in dirCache. Copy-up only moves
-	// files/directories between layers in the overlay.
-	//
-	// It is also possible for Readdir to race with a Create operation
-	// (which may trigger a copy-up during it's execution). Depending on
-	// whether the Create happens before or after the readdirEntries call,
-	// the newly created file may or may not appear in the readdir results.
-	// But this can only be caused by a real race between readdir and
-	// create syscalls, so it's also OK.
-	dirCache, err := readdirEntries(ctx, o)
+	o.copyMu.RLock()
+	defer o.copyMu.RUnlock()
+
+	var err error
+	f.dirCache, err = readdirEntries(ctx, o)
 	if err != nil {
 		return file.Offset(), err
 	}
-
-	f.dirCacheMu.Lock()
-	f.dirCache = dirCache
-	f.dirCacheMu.Unlock()
 
 	return DirentReaddir(ctx, file.Dirent, f, root, dirCtx, file.Offset())
 }
 
 // IterateDir implements DirIterator.IterateDir.
 func (f *overlayFileOperations) IterateDir(ctx context.Context, dirCtx *DirCtx, offset int) (int, error) {
-	f.dirCacheMu.RLock()
 	n, err := GenericReaddir(dirCtx, f.dirCache)
-	f.dirCacheMu.RUnlock()
 	return offset + n, err
 }
 
@@ -345,9 +323,6 @@ func (*overlayFileOperations) Ioctl(ctx context.Context, io usermem.IO, args arc
 // readdirEntries returns a sorted map of directory entries from the
 // upper and/or lower filesystem.
 func readdirEntries(ctx context.Context, o *overlayEntry) (*SortedDentryMap, error) {
-	o.copyMu.RLock()
-	defer o.copyMu.RUnlock()
-
 	// Assert that there is at least one upper or lower entry.
 	if o.upper == nil && o.lower == nil {
 		panic("invalid overlayEntry, needs at least one Inode")

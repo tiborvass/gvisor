@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@
 //
 // func blockingPoll(fds *pollEvent, nfds int, timeout int64) (n int, err syscall.Errno)
 TEXT ·blockingPoll(SB),NOSPLIT,$0-40
-	CALL	·callEntersyscallblock(SB)
+	CALL	runtime·entersyscallblock(SB)
 	MOVQ	fds+0(FP), DI
 	MOVQ	nfds+8(FP), SI
 	MOVQ	timeout+16(FP), DX
@@ -31,10 +31,10 @@ TEXT ·blockingPoll(SB),NOSPLIT,$0-40
 	MOVQ	$-1, n+24(FP)
 	NEGQ	AX
 	MOVQ	AX, err+32(FP)
-	CALL	·callExitsyscall(SB)
+	CALL	runtime·exitsyscall(SB)
 	RET
 ok:
 	MOVQ	AX, n+24(FP)
 	MOVQ	$0, err+32(FP)
-	CALL	·callExitsyscall(SB)
+	CALL	runtime·exitsyscall(SB)
 	RET

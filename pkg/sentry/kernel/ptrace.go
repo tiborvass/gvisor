@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -921,13 +921,7 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		if err != nil {
 			return err
 		}
-
-		// Update iovecs to represent the range of the written register set.
-		end, ok := ar.Start.AddLength(uint64(n))
-		if !ok {
-			panic(fmt.Sprintf("%#x + %#x overflows. Invalid reg size > %#x", ar.Start, n, ar.Length()))
-		}
-		ar.End = end
+		ar.End -= usermem.Addr(n)
 		return t.CopyOutIovecs(data, usermem.AddrRangeSeqOf(ar))
 
 	case linux.PTRACE_SETREGS:

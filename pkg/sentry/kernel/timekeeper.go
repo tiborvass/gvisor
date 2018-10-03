@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 package kernel
 
 import (
-	"fmt"
 	"sync"
 	"time"
 
@@ -277,29 +276,4 @@ func (t *Timekeeper) GetTime(c sentrytime.ClockID) (int64, error) {
 // BootTime returns the system boot real time.
 func (t *Timekeeper) BootTime() ktime.Time {
 	return t.bootTime
-}
-
-// timekeeperClock is a ktime.Clock that reads time from a
-// kernel.Timekeeper-managed clock.
-//
-// +stateify savable
-type timekeeperClock struct {
-	tk *Timekeeper
-	c  sentrytime.ClockID
-
-	// Implements ktime.Clock.WallTimeUntil.
-	ktime.WallRateClock `state:"nosave"`
-
-	// Implements waiter.Waitable. (We have no ability to detect
-	// discontinuities from external changes to CLOCK_REALTIME).
-	ktime.NoClockEvents `state:"nosave"`
-}
-
-// Now implements ktime.Clock.Now.
-func (tc *timekeeperClock) Now() ktime.Time {
-	now, err := tc.tk.GetTime(tc.c)
-	if err != nil {
-		panic(fmt.Sprintf("timekeeperClock(ClockID=%v)).Now: %v", tc.c, err))
-	}
-	return ktime.FromNanoseconds(now)
 }

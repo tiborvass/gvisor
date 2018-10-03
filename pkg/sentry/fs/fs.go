@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -44,7 +44,7 @@
 //         DirentCache.mu
 //         Locks in InodeOperations implementations or overlayEntry
 //         Inode.Watches.mu (see `Inotify` for other lock ordering)
-//         MountSource.mu
+//	   MountSource.mu
 //
 // If multiple Dirent or MountSource locks must be taken, locks in the parent must be
 // taken before locks in their children.
@@ -60,11 +60,10 @@ import (
 )
 
 var (
-	// workMu is used to synchronize pending asynchronous work. Async work
-	// runs with the lock held for reading. AsyncBarrier will take the lock
-	// for writing, thus ensuring that all Async work completes before
-	// AsyncBarrier returns.
-	workMu sync.RWMutex
+	// work is a sync.WaitGroup that can be used to queue asynchronous
+	// operations via Do. Callers can use Barrier to ensure no operations
+	// are outstanding.
+	work sync.WaitGroup
 
 	// asyncError is used to store up to one asynchronous execution error.
 	asyncError = make(chan error, 1)
@@ -72,17 +71,14 @@ var (
 
 // AsyncBarrier waits for all outstanding asynchronous work to complete.
 func AsyncBarrier() {
-	workMu.Lock()
-	workMu.Unlock()
+	work.Wait()
 }
 
 // Async executes a function asynchronously.
-//
-// Async must not be called recursively.
 func Async(f func()) {
-	workMu.RLock()
-	go func() { // S/R-SAFE: AsyncBarrier must be called.
-		defer workMu.RUnlock() // Ensure RUnlock in case of panic.
+	work.Add(1)
+	go func() { // S/R-SAFE: Barrier must be called.
+		defer work.Done() // Ensure Done in case of panic.
 		f()
 	}()
 }
@@ -93,7 +89,7 @@ func Async(f func()) {
 func AsyncErrorBarrier() error {
 	wait := make(chan struct{}, 1)
 	go func() { // S/R-SAFE: Does not touch persistent state.
-		AsyncBarrier()
+		work.Wait()
 		wait <- struct{}{}
 	}()
 	select {

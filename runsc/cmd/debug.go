@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,9 @@
 package cmd
 
 import (
-	"context"
 	"syscall"
 
+	"context"
 	"flag"
 	"github.com/google/subcommands"
 	"gvisor.googlesource.com/gvisor/pkg/log"
@@ -68,7 +68,7 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 		var err error
 		c, err = container.Load(conf.RootDir, f.Arg(0))
 		if err != nil {
-			Fatalf("loading container %q: %v", f.Arg(0), err)
+			Fatalf("error loading container %q: %v", f.Arg(0), err)
 		}
 	} else {
 		if f.NArg() != 0 {
@@ -78,14 +78,14 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 		// Go over all sandboxes and find the one that matches PID.
 		ids, err := container.List(conf.RootDir)
 		if err != nil {
-			Fatalf("listing containers: %v", err)
+			Fatalf("error listing containers: %v", err)
 		}
 		for _, id := range ids {
 			candidate, err := container.Load(conf.RootDir, id)
 			if err != nil {
-				Fatalf("loading container %q: %v", id, err)
+				Fatalf("error loading container %q: %v", id, err)
 			}
-			if candidate.SandboxPid() == d.pid {
+			if candidate.Pid() == d.pid {
 				c = candidate
 				break
 			}
@@ -110,7 +110,7 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 		log.Infof("Retrieving sandbox stacks")
 		stacks, err := c.Sandbox.Stacks()
 		if err != nil {
-			Fatalf("retrieving stacks: %v", err)
+			Fatalf("error retrieving stacks: %v", err)
 		}
 		log.Infof("     *** Stack dump ***\n%s", stacks)
 	}

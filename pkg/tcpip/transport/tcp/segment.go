@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,7 +46,7 @@ type segment struct {
 	data   buffer.VectorisedView     `state:".(buffer.VectorisedView)"`
 	// views is used as buffer for data when its length is large
 	// enough to store a VectorisedView.
-	views [8]buffer.View `state:"nosave"`
+	views [8]buffer.View
 	// viewToDeliver keeps track of the next View that should be
 	// delivered by the Read endpoint.
 	viewToDeliver  int

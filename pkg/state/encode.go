@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -119,10 +119,9 @@ func (es *encodeState) register(obj reflect.Value) uint64 {
 		if size := typ.Size(); size > 0 {
 			r := addrRange{addr, addr + size}
 			if !es.values.IsEmptyRange(r) {
-				old := es.values.LowerBoundSegment(addr).Value().Interface().(recoverable)
-				panic(fmt.Errorf("overlapping objects: [new object] %#v [existing object path] %s", obj.Interface(), old.path()))
+				panic(fmt.Errorf("overlapping objects: [new object] %#v [existing object] %#v", obj.Interface(), es.values.FindSegment(addr).Value().Elem().Interface()))
 			}
-			es.values.Add(r, reflect.ValueOf(es.recoverable.copy()))
+			es.values.Add(r, obj)
 		}
 	} else {
 		// Push back the map itself; when maps are encoded from the

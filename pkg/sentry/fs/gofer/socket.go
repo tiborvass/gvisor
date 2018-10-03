@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,13 +19,13 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/p9"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/host"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
-	"gvisor.googlesource.com/gvisor/pkg/syserr"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 	"gvisor.googlesource.com/gvisor/pkg/waiter"
 )
 
-// BoundEndpoint returns a gofer-backed transport.BoundEndpoint.
-func (i *inodeOperations) BoundEndpoint(inode *fs.Inode, path string) transport.BoundEndpoint {
+// BoundEndpoint returns a gofer-backed unix.BoundEndpoint.
+func (i *inodeOperations) BoundEndpoint(inode *fs.Inode, path string) unix.BoundEndpoint {
 	if !fs.IsSocket(i.fileState.sattr) {
 		return nil
 	}
@@ -45,7 +45,7 @@ func (i *inodeOperations) BoundEndpoint(inode *fs.Inode, path string) transport.
 	return &endpoint{inode, i.fileState.file.file, path}
 }
 
-// endpoint is a Gofer-backed transport.BoundEndpoint.
+// endpoint is a Gofer-backed unix.BoundEndpoint.
 //
 // An endpoint's lifetime is the time between when InodeOperations.BoundEndpoint()
 // is called and either BoundEndpoint.BidirectionalConnect or
@@ -61,23 +61,23 @@ type endpoint struct {
 	path string
 }
 
-func unixSockToP9(t transport.SockType) (p9.ConnectFlags, bool) {
+func unixSockToP9(t unix.SockType) (p9.ConnectFlags, bool) {
 	switch t {
-	case transport.SockStream:
+	case unix.SockStream:
 		return p9.StreamSocket, true
-	case transport.SockSeqpacket:
+	case unix.SockSeqpacket:
 		return p9.SeqpacketSocket, true
-	case transport.SockDgram:
+	case unix.SockDgram:
 		return p9.DgramSocket, true
 	}
 	return 0, false
 }
 
 // BidirectionalConnect implements ConnectableEndpoint.BidirectionalConnect.
-func (e *endpoint) BidirectionalConnect(ce transport.ConnectingEndpoint, returnConnect func(transport.Receiver, transport.ConnectedEndpoint)) *syserr.Error {
+func (e *endpoint) BidirectionalConnect(ce unix.ConnectingEndpoint, returnConnect func(unix.Receiver, unix.ConnectedEndpoint)) *tcpip.Error {
 	cf, ok := unixSockToP9(ce.Type())
 	if !ok {
-		return syserr.ErrConnectionRefused
+		return tcpip.ErrConnectionRefused
 	}
 
 	// No lock ordering required as only the ConnectingEndpoint has a mutex.
@@ -86,24 +86,24 @@ func (e *endpoint) BidirectionalConnect(ce transport.ConnectingEndpoint, returnC
 	// Check connecting state.
 	if ce.Connected() {
 		ce.Unlock()
-		return syserr.ErrAlreadyConnected
+		return tcpip.ErrAlreadyConnected
 	}
 	if ce.Listening() {
 		ce.Unlock()
-		return syserr.ErrInvalidEndpointState
+		return tcpip.ErrInvalidEndpointState
 	}
 
 	hostFile, err := e.file.Connect(cf)
 	if err != nil {
 		ce.Unlock()
-		return syserr.ErrConnectionRefused
+		return tcpip.ErrConnectionRefused
 	}
 
-	c, serr := host.NewConnectedEndpoint(hostFile, ce.WaiterQueue(), e.path)
-	if serr != nil {
+	c, terr := host.NewConnectedEndpoint(hostFile, ce.WaiterQueue(), e.path)
+	if terr != nil {
 		ce.Unlock()
-		log.Warningf("Gofer returned invalid host socket for BidirectionalConnect; file %+v flags %+v: %v", e.file, cf, serr)
-		return serr
+		log.Warningf("Gofer returned invalid host socket for BidirectionalConnect; file %+v flags %+v: %v", e.file, cf, terr)
+		return terr
 	}
 
 	returnConnect(c, c)
@@ -113,18 +113,17 @@ func (e *endpoint) BidirectionalConnect(ce transport.ConnectingEndpoint, returnC
 	return nil
 }
 
-// UnidirectionalConnect implements
-// transport.BoundEndpoint.UnidirectionalConnect.
-func (e *endpoint) UnidirectionalConnect() (transport.ConnectedEndpoint, *syserr.Error) {
+// UnidirectionalConnect implements unix.BoundEndpoint.UnidirectionalConnect.
+func (e *endpoint) UnidirectionalConnect() (unix.ConnectedEndpoint, *tcpip.Error) {
 	hostFile, err := e.file.Connect(p9.DgramSocket)
 	if err != nil {
-		return nil, syserr.ErrConnectionRefused
+		return nil, tcpip.ErrConnectionRefused
 	}
 
-	c, serr := host.NewConnectedEndpoint(hostFile, &waiter.Queue{}, e.path)
-	if serr != nil {
-		log.Warningf("Gofer returned invalid host socket for UnidirectionalConnect; file %+v: %v", e.file, serr)
-		return nil, serr
+	c, terr := host.NewConnectedEndpoint(hostFile, &waiter.Queue{}, e.path)
+	if terr != nil {
+		log.Warningf("Gofer returned invalid host socket for UnidirectionalConnect; file %+v: %v", e.file, terr)
+		return nil, terr
 	}
 	c.Init()
 
@@ -135,7 +134,7 @@ func (e *endpoint) UnidirectionalConnect() (transport.ConnectedEndpoint, *syserr
 	return c, nil
 }
 
-// Release implements transport.BoundEndpoint.Release.
+// Release implements unix.BoundEndpoint.Release.
 func (e *endpoint) Release() {
 	e.inode.DecRef()
 }

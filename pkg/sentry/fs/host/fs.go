@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -57,8 +57,6 @@ type Filesystem struct {
 	// whitelist is a set of host paths to whitelist.
 	paths []string
 }
-
-var _ fs.Filesystem = (*Filesystem)(nil)
 
 // Name is the identifier of this file system.
 func (*Filesystem) Name() string {
@@ -172,8 +170,7 @@ func installWhitelist(ctx context.Context, m *fs.MountNamespace, paths []string)
 			current := paths[i][:j]
 
 			// Lookup the given component in the tree.
-			remainingTraversals := uint(maxTraversals)
-			d, err := m.FindLink(ctx, root, nil, current, &remainingTraversals)
+			d, err := m.FindLink(ctx, root, nil, current, maxTraversals)
 			if err != nil {
 				log.Warningf("populate failed for %q: %v", current, err)
 				continue

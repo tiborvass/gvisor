@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ import (
 	"math"
 	"os"
 	"path"
-	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -35,7 +35,6 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/fd"
 	"gvisor.googlesource.com/gvisor/pkg/log"
 	"gvisor.googlesource.com/gvisor/pkg/p9"
-	"gvisor.googlesource.com/gvisor/runsc/specutils"
 )
 
 const (
@@ -79,6 +78,13 @@ type Config struct {
 
 	// PanicOnWrite panics on attempts to write to RO mounts.
 	PanicOnWrite bool
+
+	// LazyOpenForWrite makes the underlying file to be opened in RDONLY
+	// mode initially and be reopened in case write access is desired.
+	// This is done to workaround the behavior in 'overlay2' that
+	// copies the entire file up eagerly when it's opened in write mode
+	// even if the file is never actually written to.
+	LazyOpenForWrite bool
 }
 
 type attachPoint struct {
@@ -101,28 +107,24 @@ type attachPoint struct {
 }
 
 // NewAttachPoint creates a new attacher that gives local file
-// access to all files under 'prefix'. 'prefix' must be an absolute path.
-func NewAttachPoint(prefix string, c Config) (p9.Attacher, error) {
-	// Sanity check the prefix.
-	if !filepath.IsAbs(prefix) {
-		return nil, fmt.Errorf("attach point prefix must be absolute %q", prefix)
-	}
+// access to all files under 'prefix'.
+func NewAttachPoint(prefix string, c Config) p9.Attacher {
 	return &attachPoint{
 		prefix:  prefix,
 		conf:    c,
 		devices: make(map[uint64]uint8),
-	}, nil
+	}
 }
 
 // Attach implements p9.Attacher.
 func (a *attachPoint) Attach() (p9.File, error) {
-	// dirFD (1st argument) is ignored because 'prefix' is always absolute.
-	stat, err := statAt(-1, a.prefix)
+	// Sanity check the prefix.
+	fi, err := os.Stat(a.prefix)
 	if err != nil {
-		return nil, fmt.Errorf("stat file %q, err: %v", a.prefix, err)
+		return nil, err
 	}
 	mode := os.O_RDWR
-	if a.conf.ROMount || stat.Mode&syscall.S_IFDIR != 0 {
+	if a.conf.ROMount || fi.IsDir() {
 		mode = os.O_RDONLY
 	}
 
@@ -130,6 +132,11 @@ func (a *attachPoint) Attach() (p9.File, error) {
 	f, err := os.OpenFile(a.prefix, mode|openFlags, 0)
 	if err != nil {
 		return nil, fmt.Errorf("unable to open file %q, err: %v", a.prefix, err)
+	}
+	stat, err := stat(int(f.Fd()))
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("failed to stat file %q, err: %v", a.prefix, err)
 	}
 
 	a.attachedMu.Lock()
@@ -174,12 +181,23 @@ func (a *attachPoint) makeQID(stat syscall.Stat_t) p9.QID {
 	}
 }
 
+func isNameValid(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		log.Warningf("Invalid name: %s", name)
+		return false
+	}
+	if strings.IndexByte(name, '/') >= 0 {
+		log.Warningf("Invalid name: %s", name)
+		return false
+	}
+	return true
+}
+
 // localFile implements p9.File wrapping a local file. The underlying file
 // is opened during Walk() and stored in 'controlFile' to be used with other
-// operations. The control file is opened as readonly, unless it's a symlink
-// which requires O_PATH. 'controlFile' is dup'ed when Walk(nil) is called
-// to clone the file. This reduces the number of walks that need to be done by
-// the host file system when files are reused.
+// operations. The mode in which the file is opened varies depending on the
+// configuration (see below). 'controlFile' is dup'ed when Walk(nil) is called
+// to clone the file.
 //
 // 'openedFile' is assigned when Open() is called. If requested open mode is
 // a subset of controlFile's mode, it's possible to use the same file. If mode
@@ -188,17 +206,33 @@ func (a *attachPoint) makeQID(stat syscall.Stat_t) p9.QID {
 // operations. Before the file is opened and after it's closed, 'mode' is set to
 // an invalid value to prevent an unopened file from being used.
 //
-// The reason that the control file is never opened as read-write is for better
-// performance with 'overlay2' storage driver. overlay2 eagerly copies the
-// entire file up when it's opened in write mode, and would perform badly when
-// multiple files are being opened for read-only (esp. startup).
+// localFile has 2 modes of operation based on the configuration:
+//
+// ** conf.lazyRWOpen == false **
+// This is the preferred mode. 'controlFile' is opened in RW mode in Walk()
+// and used across all functions. The file is never reopened as the mode will
+// always be a super set of the requested open mode. This reduces the number of
+// syscalls required per operation and makes it resilient to renames anywhere
+// in the path to the file.
+//
+// ** conf.lazyRWOpen == true **
+// This mode is used for better performance with 'overlay2' storage driver.
+// overlay2 eagerly copies the entire file up when it's opened in write mode
+// which makes the mode above perform badly when serveral of files are opened
+// for read (esp. startup). In this mode, 'controlFile' is opened as readonly
+// (or O_PATH for symlinks). Reopening the file is required if write mode
+// is requested in Open().
 type localFile struct {
 	p9.DefaultWalkGetAttr
 
 	// attachPoint is the attachPoint that serves this localFile.
 	attachPoint *attachPoint
 
-	// hostPath will be safely updated by the Renamed hook.
+	// mu protects 'hostPath' when file is renamed.
+	mu sync.Mutex
+
+	// TODO: hostPath is not safe to use as path needs to be walked
+	// everytime (and can change underneath us). Remove all usages.
 	hostPath string
 
 	// controlFile is opened when localFile is created and it's never nil.
@@ -212,7 +246,6 @@ type localFile struct {
 	// if localFile isn't opened.
 	mode p9.OpenFlags
 
-	// ft is the fileType for this file.
 	ft fileType
 
 	// readDirMu protects against concurrent Readdir calls.
@@ -221,14 +254,23 @@ type localFile struct {
 
 func openAnyFile(parent *localFile, name string) (*os.File, string, error) {
 	// Attempt to open file in the following mode in order:
-	//   1. RDONLY: for all files, works for directories and ro mounts too
-	//   2. PATH: for symlinks
-	modes := []int{syscall.O_RDONLY, unix.O_PATH}
+	//   1. RDWR: for files with rw mounts and LazyOpenForWrite disabled
+	//   2. RDONLY: for directories, ro mounts or LazyOpenForWrite enabled
+	//   3. PATH: for symlinks
+	modes := []int{syscall.O_RDWR, syscall.O_RDONLY, unix.O_PATH}
+	symlinkIdx := len(modes) - 1
+
+	startIdx := 0
+	conf := parent.attachPoint.conf
+	if conf.ROMount || conf.LazyOpenForWrite {
+		// Skip attempt to open in RDWR based on configuration.
+		startIdx = 1
+	}
 
 	var err error
 	var fd int
-	for i, mode := range modes {
-		fd, err = syscall.Openat(parent.controlFD(), name, openFlags|mode, 0)
+	for i := startIdx; i < len(modes); i++ {
+		fd, err = syscall.Openat(parent.controlFD(), name, openFlags|modes[i], 0)
 		if err == nil {
 			// openat succeeded, we're done.
 			break
@@ -237,10 +279,16 @@ func openAnyFile(parent *localFile, name string) (*os.File, string, error) {
 		case syscall.ENOENT:
 			// File doesn't exist, no point in retrying.
 			return nil, "", e
+		case syscall.ELOOP:
+			if i < symlinkIdx {
+				// File was opened with O_NOFOLLOW, so this error can only happen when
+				// trying ot open a symlink. Jump straight to flags compatible with symlink.
+				i = symlinkIdx - 1
+			}
 		}
-		// openat failed. Try again with next mode, preserving 'err' in case this
-		// was the last attempt.
-		log.Debugf("Attempt %d to open file failed, mode: %#x, path: %s/%s, err: %v", i, openFlags|mode, parent.controlFile.Name(), name, err)
+		// openat failed. Try again with next mode, preserving 'err' in
+		// case this was the last attempt.
+		log.Debugf("Attempt %d to open file failed, mode: %#x, path: %s/%s, err: %v", i, openFlags|modes[i], parent.controlFile.Name(), name, err)
 	}
 	if err != nil {
 		// All attempts to open file have failed, return the last error.
@@ -248,7 +296,10 @@ func openAnyFile(parent *localFile, name string) (*os.File, string, error) {
 		return nil, "", extractErrno(err)
 	}
 
+	parent.mu.Lock()
+	defer parent.mu.Unlock()
 	newPath := path.Join(parent.hostPath, name)
+
 	return os.NewFile(uintptr(fd), newPath), newPath, nil
 }
 
@@ -321,20 +372,23 @@ func (l *localFile) Open(mode p9.OpenFlags) (*fd.FD, p9.QID, uint32, error) {
 
 	// Check if control file can be used or if a new open must be created.
 	var newFile *os.File
-	if mode == p9.ReadOnly {
+	if mode == p9.ReadOnly || !l.attachPoint.conf.LazyOpenForWrite {
 		log.Debugf("Open reusing control file, mode: %v, %q", mode, l.controlFile.Name())
 		newFile = l.controlFile
 	} else {
-		// Ideally reopen would call name_to_handle_at (with empty name) and
-		// open_by_handle_at to reopen the file without using 'hostPath'. However,
-		// name_to_handle_at and open_by_handle_at aren't supported by overlay2.
+		// Ideally reopen would call name_to_handle_at (with empty name) and open_by_handle_at
+		// to reopen the file without using 'hostPath'. However, name_to_handle_at and
+		// open_by_handle_at aren't supported by overlay2.
 		log.Debugf("Open reopening file, mode: %v, %q", mode, l.controlFile.Name())
 		var err error
 
+		l.mu.Lock()
 		newFile, err = os.OpenFile(l.hostPath, openFlags|mode.OSFlags(), 0)
 		if err != nil {
+			l.mu.Unlock()
 			return nil, p9.QID{}, 0, extractErrno(err)
 		}
+		l.mu.Unlock()
 	}
 
 	stat, err := stat(int(newFile.Fd()))
@@ -364,11 +418,13 @@ func (l *localFile) Create(name string, mode p9.OpenFlags, perm p9.FileMode, uid
 		}
 		return nil, nil, p9.QID{}, 0, syscall.EBADF
 	}
+	if !isNameValid(name) {
+		return nil, nil, p9.QID{}, 0, syscall.EINVAL
+	}
 
-	// Use a single file for both 'controlFile' and 'openedFile'. Mode must
-	// include read for control and whichever else was requested by caller. Note
-	// that resulting file might have a wider mode than needed for each particular
-	// case.
+	// Use a single file for both 'controlFile' and 'openedFile'. Mode must include read for control
+	// and whichever else was requested by caller. Note that resulting file might have a wider mode
+	// than needed for each particular case.
 	flags := openFlags | syscall.O_CREAT | syscall.O_EXCL
 	if mode == p9.WriteOnly {
 		flags |= syscall.O_RDWR
@@ -380,22 +436,24 @@ func (l *localFile) Create(name string, mode p9.OpenFlags, perm p9.FileMode, uid
 	if err != nil {
 		return nil, nil, p9.QID{}, 0, extractErrno(err)
 	}
-	cu := specutils.MakeCleanup(func() {
-		syscall.Close(fd)
-		// Best effort attempt to remove the file in case of failure.
-		if err := syscall.Unlinkat(l.controlFD(), name); err != nil {
-			log.Warningf("error unlinking file %q after failure: %v", path.Join(l.hostPath, name), err)
-		}
-	})
-	defer cu.Clean()
-
 	if err := fchown(fd, uid, gid); err != nil {
+		syscall.Close(fd)
+		if e := syscall.Unlinkat(l.controlFD(), name); e != nil {
+			log.Warningf("error unlinking file %q after failed chown: %v", name, e)
+		}
 		return nil, nil, p9.QID{}, 0, extractErrno(err)
 	}
 	stat, err := stat(fd)
 	if err != nil {
+		syscall.Close(fd)
+		if e := syscall.Unlinkat(l.controlFD(), name); e != nil {
+			log.Warningf("error unlinking file %q after failed stat: %v", name, e)
+		}
 		return nil, nil, p9.QID{}, 0, extractErrno(err)
 	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	cPath := path.Join(l.hostPath, name)
 	f := os.NewFile(uintptr(fd), cPath)
@@ -406,8 +464,6 @@ func (l *localFile) Create(name string, mode p9.OpenFlags, perm p9.FileMode, uid
 		openedFile:  f,
 		mode:        mode,
 	}
-
-	cu.Release()
 	return newFDMaybe(c.openedFile), c, l.attachPoint.makeQID(stat), 0, nil
 }
 
@@ -421,16 +477,13 @@ func (l *localFile) Mkdir(name string, perm p9.FileMode, uid p9.UID, gid p9.GID)
 		return p9.QID{}, syscall.EBADF
 	}
 
+	if !isNameValid(name) {
+		return p9.QID{}, syscall.EINVAL
+	}
+
 	if err := syscall.Mkdirat(l.controlFD(), name, uint32(perm.Permissions())); err != nil {
 		return p9.QID{}, extractErrno(err)
 	}
-	cu := specutils.MakeCleanup(func() {
-		// Best effort attempt to remove the dir in case of failure.
-		if err := unix.Unlinkat(l.controlFD(), name, unix.AT_REMOVEDIR); err != nil {
-			log.Warningf("error unlinking dir %q after failure: %v", path.Join(l.hostPath, name), err)
-		}
-	})
-	defer cu.Clean()
 
 	// Open directory to change ownership and stat it.
 	flags := syscall.O_DIRECTORY | syscall.O_RDONLY | openFlags
@@ -447,8 +500,6 @@ func (l *localFile) Mkdir(name string, perm p9.FileMode, uid p9.UID, gid p9.GID)
 	if err != nil {
 		return p9.QID{}, extractErrno(err)
 	}
-
-	cu.Release()
 	return l.attachPoint.makeQID(stat), nil
 }
 
@@ -466,6 +517,9 @@ func (l *localFile) Walk(names []string) ([]p9.QID, p9.File, error) {
 			return nil, nil, extractErrno(err)
 		}
 
+		l.mu.Lock()
+		defer l.mu.Unlock()
+
 		c := &localFile{
 			attachPoint: l.attachPoint,
 			hostPath:    l.hostPath,
@@ -478,6 +532,10 @@ func (l *localFile) Walk(names []string) ([]p9.QID, p9.File, error) {
 	var qids []p9.QID
 	last := l
 	for _, name := range names {
+		if !isNameValid(name) {
+			return nil, nil, syscall.EINVAL
+		}
+
 		f, path, err := openAnyFile(last, name)
 		if err != nil {
 			return nil, nil, extractErrno(err)
@@ -603,9 +661,9 @@ func (l *localFile) SetAttr(valid p9.SetAttrMask, attr p9.SetAttr) error {
 	}
 
 	fd := l.controlFD()
-	if l.ft == regular {
-		// Regular files are opened in RO mode, thus it needs to be reopened here
-		// for write.
+	if conf.LazyOpenForWrite && l.ft == regular {
+		// Regular files are opened in RO mode when lazy open is set.
+		// Thus it needs to be reopened here for write.
 		f, err := os.OpenFile(l.hostPath, openFlags|os.O_WRONLY, 0)
 		if err != nil {
 			return extractErrno(err)
@@ -703,13 +761,15 @@ func (l *localFile) SetAttr(valid p9.SetAttrMask, attr p9.SetAttr) error {
 	return err
 }
 
-// Rename implements p9.File; this should never be called.
-func (l *localFile) Rename(p9.File, string) error {
-	panic("rename called directly")
+// Remove implements p9.File.
+//
+// This is deprecated in favor of UnlinkAt.
+func (*localFile) Remove() error {
+	return syscall.ENOSYS
 }
 
-// RenameAt implements p9.File.RenameAt.
-func (l *localFile) RenameAt(oldName string, directory p9.File, newName string) error {
+// Rename implements p9.File.
+func (l *localFile) Rename(directory p9.File, name string) error {
 	conf := l.attachPoint.conf
 	if conf.ROMount {
 		if conf.PanicOnWrite {
@@ -717,12 +777,32 @@ func (l *localFile) RenameAt(oldName string, directory p9.File, newName string) 
 		}
 		return syscall.EBADF
 	}
+	if !isNameValid(name) {
+		return syscall.EINVAL
+	}
 
-	newParent := directory.(*localFile)
-	if err := renameat(l.controlFD(), oldName, newParent.controlFD(), newName); err != nil {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// TODO: change to renameat(2)
+	parent := directory.(*localFile)
+	newPath := path.Join(parent.hostPath, name)
+	if err := syscall.Rename(l.hostPath, newPath); err != nil {
 		return extractErrno(err)
 	}
+
+	// Update path on success.
+	// TODO: this doesn't cover cases where any of the
+	// parents have been renamed.
+	l.hostPath = newPath
 	return nil
+}
+
+// RenameAt implements p9.File.RenameAt.
+//
+// Code still uses [deprecated] Rename().
+func (*localFile) RenameAt(_ string, _ p9.File, _ string) error {
+	return syscall.ENOSYS
 }
 
 // ReadAt implements p9.File.
@@ -768,17 +848,13 @@ func (l *localFile) Symlink(target, newName string, uid p9.UID, gid p9.GID) (p9.
 		}
 		return p9.QID{}, syscall.EBADF
 	}
+	if !isNameValid(newName) {
+		return p9.QID{}, syscall.EINVAL
+	}
 
 	if err := unix.Symlinkat(target, l.controlFD(), newName); err != nil {
 		return p9.QID{}, extractErrno(err)
 	}
-	cu := specutils.MakeCleanup(func() {
-		// Best effort attempt to remove the symlink in case of failure.
-		if err := syscall.Unlinkat(l.controlFD(), newName); err != nil {
-			log.Warningf("error unlinking file %q after failure: %v", path.Join(l.hostPath, newName), err)
-		}
-	})
-	defer cu.Clean()
 
 	// Open symlink to change ownership and stat it.
 	fd, err := syscall.Openat(l.controlFD(), newName, unix.O_PATH|openFlags, 0)
@@ -794,8 +870,6 @@ func (l *localFile) Symlink(target, newName string, uid p9.UID, gid p9.GID) (p9.
 	if err != nil {
 		return p9.QID{}, extractErrno(err)
 	}
-
-	cu.Release()
 	return l.attachPoint.makeQID(stat), nil
 }
 
@@ -807,6 +881,9 @@ func (l *localFile) Link(target p9.File, newName string) error {
 			panic("attempt to write to RO mount")
 		}
 		return syscall.EBADF
+	}
+	if !isNameValid(newName) {
+		return syscall.EINVAL
 	}
 
 	targetFile := target.(*localFile)
@@ -832,7 +909,9 @@ func (l *localFile) UnlinkAt(name string, flags uint32) error {
 		}
 		return syscall.EBADF
 	}
-
+	if !isNameValid(name) {
+		return syscall.EINVAL
+	}
 	if err := unix.Unlinkat(l.controlFD(), name, int(flags)); err != nil {
 		return extractErrno(err)
 	}
@@ -849,8 +928,7 @@ func (l *localFile) Readdir(offset uint64, count uint32) ([]p9.Dirent, error) {
 	}
 
 	// Readdirnames is a cursor over directories, so seek back to 0 to ensure it's
-	// reading all directory contents. Take a lock because this operation is
-	// stateful.
+	// reading all directory contents. Take a lock because this operation is stateful.
 	l.readDirMu.Lock()
 	if _, err := l.openedFile.Seek(0, 0); err != nil {
 		l.readDirMu.Unlock()
@@ -922,16 +1000,11 @@ func (l *localFile) Close() error {
 	return err
 }
 
-// Renamed implements p9.Renamed.
-func (l *localFile) Renamed(newDir p9.File, newName string) {
-	l.hostPath = path.Join(newDir.(*localFile).hostPath, newName)
-}
-
 // extractErrno tries to determine the errno.
 func extractErrno(err error) syscall.Errno {
 	if err == nil {
 		// This should never happen. The likely result will be that
-		// some user gets the frustrating "error: SUCCESS" message.
+		// some user gets the frustration "error: SUCCESS" message.
 		log.Warningf("extractErrno called with nil error!")
 		return 0
 	}

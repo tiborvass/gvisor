@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -120,6 +120,11 @@ var allowedSyscalls = seccomp.SyscallRules{
 			seccomp.AllowAny{},
 			seccomp.AllowValue(syscall.SOL_SOCKET),
 			seccomp.AllowValue(syscall.SO_SNDBUF),
+		},
+		{
+			seccomp.AllowAny{},
+			seccomp.AllowValue(syscall.SOL_SOCKET),
+			seccomp.AllowValue(syscall.SO_RCVBUF),
 		},
 		{
 			seccomp.AllowAny{},
@@ -302,11 +307,6 @@ func hostInetFilters() seccomp.SyscallRules {
 			{
 				seccomp.AllowAny{},
 				seccomp.AllowValue(syscall.SOL_SOCKET),
-				seccomp.AllowValue(syscall.SO_RCVBUF),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_SOCKET),
 				seccomp.AllowValue(syscall.SO_REUSEADDR),
 			},
 			{
@@ -334,10 +334,6 @@ func hostInetFilters() seccomp.SyscallRules {
 			{
 				seccomp.AllowAny{},
 				seccomp.AllowValue(syscall.TIOCOUTQ),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.TIOCINQ),
 			},
 		},
 		syscall.SYS_LISTEN:   {},
@@ -438,6 +434,7 @@ func ptraceFilters() seccomp.SyscallRules {
 func kvmFilters() seccomp.SyscallRules {
 	return seccomp.SyscallRules{
 		syscall.SYS_ARCH_PRCTL:      {},
+		syscall.SYS_FUTEX:           {},
 		syscall.SYS_IOCTL:           {},
 		syscall.SYS_MMAP:            {},
 		syscall.SYS_RT_SIGSUSPEND:   {},

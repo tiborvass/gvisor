@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,41 +26,31 @@ func (k *Kernel) Init(opts KernelOpts) {
 // Halt halts execution.
 func Halt()
 
-// defaultHooks implements hooks.
-type defaultHooks struct{}
+// Current returns the current CPU.
+//
+// Its use is only legal in the KernelSyscall and KernelException contexts,
+// which must all be guarded go:nosplit.
+func Current() *CPU
 
-// KernelSyscall implements Hooks.KernelSyscall.
+// defaultSyscall is the default syscall hook.
 //
 //go:nosplit
-func (defaultHooks) KernelSyscall() { Halt() }
+func defaultSyscall() { Halt() }
 
-// KernelException implements Hooks.KernelException.
+// defaultException is the default exception hook.
 //
 //go:nosplit
-func (defaultHooks) KernelException(Vector) { Halt() }
-
-// kernelSyscall is a trampoline.
-//
-//go:nosplit
-func kernelSyscall(c *CPU) { c.hooks.KernelSyscall() }
-
-// kernelException is a trampoline.
-//
-//go:nosplit
-func kernelException(c *CPU, vector Vector) { c.hooks.KernelException(vector) }
+func defaultException(Vector) { Halt() }
 
 // Init initializes a new CPU.
 //
 // Init allows embedding in other objects.
-func (c *CPU) Init(k *Kernel, hooks Hooks) {
+func (c *CPU) Init(k *Kernel) {
 	c.self = c   // Set self reference.
 	c.kernel = k // Set kernel reference.
 	c.init()     // Perform architectural init.
 
-	// Require hooks.
-	if hooks != nil {
-		c.hooks = hooks
-	} else {
-		c.hooks = defaultHooks{}
-	}
+	// Defaults.
+	c.KernelSyscall = defaultSyscall
+	c.KernelException = defaultException
 }

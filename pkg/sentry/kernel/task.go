@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,7 +30,6 @@ import (
 	ktime "gvisor.googlesource.com/gvisor/pkg/sentry/kernel/time"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/limits"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/unimpl"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/uniqueid"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usage"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usermem"
@@ -392,7 +391,7 @@ type Task struct {
 
 	// syscallFilters is all seccomp-bpf syscall filters applicable to the
 	// task, in the order in which they were installed. The type of the atomic
-	// is []bpf.Program. Writing needs to be protected by the signal mutex.
+	// is []bpf.Program. Writing needs to be protected by mu.
 	//
 	// syscallFilters is owned by the task goroutine.
 	syscallFilters atomic.Value `state:".([]bpf.Program)"`
@@ -591,12 +590,8 @@ func (t *Task) Value(key interface{}) interface{} {
 		return t.k
 	case uniqueid.CtxGlobalUniqueID:
 		return t.k.UniqueID()
-	case uniqueid.CtxGlobalUniqueIDProvider:
-		return t.k
 	case uniqueid.CtxInotifyCookie:
 		return t.k.GenerateInotifyCookie()
-	case unimpl.CtxEvents:
-		return t.k
 	default:
 		return nil
 	}

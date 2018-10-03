@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ type Event struct {
 
 // Stats is the runc specific stats structure for stability when encoding and
 // decoding stats.
+// TODO: Many fields aren't obtainable due to a lack of cgroups.
 type Stats struct {
 	Memory Memory `json:"memory"`
 	Pids   Pids   `json:"pids"`

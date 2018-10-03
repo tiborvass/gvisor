@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -204,7 +204,7 @@ func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
 func start(c *CPU) {
 	// Save per-cpu & FS segment.
 	WriteGS(kernelAddr(c))
-	WriteFS(uintptr(c.registers.Fs_base))
+	WriteFS(uintptr(c.Registers().Fs_base))
 
 	// Initialize floating point.
 	//

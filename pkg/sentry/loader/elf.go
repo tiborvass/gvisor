@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import (
 	"debug/elf"
 	"fmt"
 	"io"
+	"syscall"
 
 	"gvisor.googlesource.com/gvisor/pkg/abi"
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
@@ -408,7 +409,7 @@ func loadParsedELF(ctx context.Context, m *mm.MemoryManager, f *fs.File, info el
 				ctx.Infof("PT_INTERP path too small: %v", phdr.Filesz)
 				return loadedELF{}, syserror.ENOEXEC
 			}
-			if phdr.Filesz > linux.PATH_MAX {
+			if phdr.Filesz > syscall.PathMax {
 				ctx.Infof("PT_INTERP path too big: %v", phdr.Filesz)
 				return loadedELF{}, syserror.ENOEXEC
 			}
@@ -610,7 +611,7 @@ func loadInterpreterELF(ctx context.Context, m *mm.MemoryManager, f *fs.File, in
 //
 // Preconditions:
 //  * f is an ELF file
-func loadELF(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, root, wd *fs.Dirent, maxTraversals *uint, fs *cpuid.FeatureSet, f *fs.File) (loadedELF, arch.Context, error) {
+func loadELF(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, root, wd *fs.Dirent, maxTraversals uint, fs *cpuid.FeatureSet, f *fs.File) (loadedELF, arch.Context, error) {
 	bin, ac, err := loadInitialELF(ctx, m, fs, f)
 	if err != nil {
 		ctx.Infof("Error loading binary: %v", err)

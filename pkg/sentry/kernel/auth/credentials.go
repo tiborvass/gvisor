@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -119,24 +119,19 @@ func NewUserCredentials(kuid KUID, kgid KGID, extraKGIDs []KGID, capabilities *T
 	// Set additional GIDs.
 	creds.ExtraKGIDs = append(creds.ExtraKGIDs, extraKGIDs...)
 
-	// Set capabilities.
+	// Set capabilities. If capabilities aren't specified, we default to
+	// all capabilities.
 	if capabilities != nil {
 		creds.PermittedCaps = capabilities.PermittedCaps
 		creds.EffectiveCaps = capabilities.EffectiveCaps
 		creds.BoundingCaps = capabilities.BoundingCaps
 		creds.InheritableCaps = capabilities.InheritableCaps
-		// TODO: Support ambient capabilities.
+		// // TODO: Support ambient capabilities.
 	} else {
-		// If no capabilities are specified, grant capabilities consistent with
-		// setresuid + setresgid from NewRootCredentials to the given uid and
-		// gid.
-		if kuid == RootKUID {
-			creds.PermittedCaps = AllCapabilities
-			creds.EffectiveCaps = AllCapabilities
-		} else {
-			creds.PermittedCaps = 0
-			creds.EffectiveCaps = 0
-		}
+		// If no capabilities are specified, grant the same capabilities
+		// that NewRootCredentials does.
+		creds.PermittedCaps = AllCapabilities
+		creds.EffectiveCaps = AllCapabilities
 		creds.BoundingCaps = AllCapabilities
 	}
 

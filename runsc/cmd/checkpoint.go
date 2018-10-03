@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,11 @@
 package cmd
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"syscall"
 
+	"context"
 	"flag"
 	"github.com/google/subcommands"
 	"gvisor.googlesource.com/gvisor/pkg/log"
@@ -77,7 +77,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...interfa
 
 	cont, err := container.Load(conf.RootDir, id)
 	if err != nil {
-		Fatalf("loading container: %v", err)
+		Fatalf("error loading container: %v", err)
 	}
 
 	if c.imagePath == "" {
@@ -85,7 +85,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...interfa
 	}
 
 	if err := os.MkdirAll(c.imagePath, 0755); err != nil {
-		Fatalf("making directories at path provided: %v", err)
+		Fatalf("error making directories at path provided: %v", err)
 	}
 
 	fullImagePath := filepath.Join(c.imagePath, checkpointFileName)
@@ -115,12 +115,12 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...interfa
 	// Restore into new container with same ID.
 	bundleDir := cont.BundleDir
 	if bundleDir == "" {
-		Fatalf("setting bundleDir")
+		Fatalf("error setting bundleDir")
 	}
 
 	spec, err := specutils.ReadSpec(bundleDir)
 	if err != nil {
-		Fatalf("reading spec: %v", err)
+		Fatalf("error reading spec: %v", err)
 	}
 
 	specutils.LogSpec(spec)
@@ -130,17 +130,17 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...interfa
 	}
 
 	if err := cont.Destroy(); err != nil {
-		Fatalf("destroying container: %v", err)
+		Fatalf("error destroying container: %v", err)
 	}
 
-	cont, err = container.Create(id, spec, conf, bundleDir, "", "", "")
+	cont, err = container.Create(id, spec, conf, bundleDir, "", "")
 	if err != nil {
-		Fatalf("restoring container: %v", err)
+		Fatalf("error restoring container: %v", err)
 	}
 	defer cont.Destroy()
 
 	if err := cont.Restore(spec, conf, fullImagePath); err != nil {
-		Fatalf("starting container: %v", err)
+		Fatalf("error starting container: %v", err)
 	}
 
 	ws, err := cont.Wait()

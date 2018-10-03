@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -92,8 +92,8 @@ func (e *endpoint) beforeSave() {
 		panic("endpoint still has waiters upon save")
 	}
 
-	if e.state != stateClosed && !((e.state == stateBound || e.state == stateListen) == e.isPortReserved) {
-		panic("endpoints which are not in the closed state must have a reserved port IFF they are in bound or listen state")
+	if !((e.state == stateBound || e.state == stateListen) == e.isPortReserved) {
+		panic("endpoint port must and must only be reserved in bound or listen state")
 	}
 }
 
@@ -102,21 +102,15 @@ func (e *endpoint) saveAcceptedChan() []*endpoint {
 	if e.acceptedChan == nil {
 		return nil
 	}
+	close(e.acceptedChan)
 	acceptedEndpoints := make([]*endpoint, len(e.acceptedChan), cap(e.acceptedChan))
-	for i := 0; i < len(acceptedEndpoints); i++ {
-		select {
-		case ep := <-e.acceptedChan:
-			acceptedEndpoints[i] = ep
-		default:
-			panic("endpoint acceptedChan buffer got consumed by background context")
-		}
+	i := 0
+	for ep := range e.acceptedChan {
+		acceptedEndpoints[i] = ep
+		i++
 	}
-	for i := 0; i < len(acceptedEndpoints); i++ {
-		select {
-		case e.acceptedChan <- acceptedEndpoints[i]:
-		default:
-			panic("endpoint acceptedChan buffer got populated by background context")
-		}
+	if i != len(acceptedEndpoints) {
+		panic("endpoint acceptedChan buffer got consumed by background context")
 	}
 	return acceptedEndpoints
 }
@@ -241,20 +235,7 @@ func (e *endpoint) afterLoad() {
 			bind()
 			tcpip.AsyncLoading.Done()
 		}()
-	case stateClosed:
-		if e.isPortReserved {
-			tcpip.AsyncLoading.Add(1)
-			go func() {
-				connectedLoading.Wait()
-				listenLoading.Wait()
-				connectingLoading.Wait()
-				bind()
-				e.state = stateClosed
-				tcpip.AsyncLoading.Done()
-			}()
-		}
-		fallthrough
-	case stateError:
+	case stateClosed, stateError:
 		tcpip.DeleteDanglingEndpoint(e)
 	}
 }
@@ -334,8 +315,6 @@ func loadError(s string) *tcpip.Error {
 			tcpip.ErrNoLinkAddress,
 			tcpip.ErrBadAddress,
 			tcpip.ErrNetworkUnreachable,
-			tcpip.ErrMessageTooLong,
-			tcpip.ErrNoBufferSpace,
 		}
 
 		messageToError = make(map[string]*tcpip.Error)

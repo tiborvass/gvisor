@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,8 +27,8 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/fsutil"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/memmap"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/safemem"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 	"gvisor.googlesource.com/gvisor/pkg/waiter"
 )
 
@@ -39,6 +39,7 @@ import (
 type inodeOperations struct {
 	fsutil.InodeNotVirtual           `state:"nosave"`
 	fsutil.InodeNoExtendedAttributes `state:"nosave"`
+	fsutil.DeprecatedFileOperations  `state:"nosave"`
 
 	// fileState implements fs.CachedFileObject. It exists
 	// to break a circular load dependency between inodeOperations
@@ -309,12 +310,12 @@ func (i *inodeOperations) Rename(ctx context.Context, oldParent *fs.Inode, oldNa
 }
 
 // Bind implements fs.InodeOperations.Bind.
-func (i *inodeOperations) Bind(ctx context.Context, dir *fs.Inode, name string, data transport.BoundEndpoint, perm fs.FilePermissions) (*fs.Dirent, error) {
+func (i *inodeOperations) Bind(ctx context.Context, dir *fs.Inode, name string, data unix.BoundEndpoint, perm fs.FilePermissions) (*fs.Dirent, error) {
 	return nil, syserror.EOPNOTSUPP
 }
 
 // BoundEndpoint implements fs.InodeOperations.BoundEndpoint.
-func (i *inodeOperations) BoundEndpoint(inode *fs.Inode, path string) transport.BoundEndpoint {
+func (i *inodeOperations) BoundEndpoint(inode *fs.Inode, path string) unix.BoundEndpoint {
 	return nil
 }
 

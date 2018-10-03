@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -95,10 +95,10 @@ func isXattrOverlay(name string) bool {
 // - lower must not have dynamic file/directory content.
 func NewOverlayRoot(ctx context.Context, upper *Inode, lower *Inode, flags MountSourceFlags) (*Inode, error) {
 	if !IsDir(upper.StableAttr) {
-		return nil, fmt.Errorf("upper Inode is a %v, not a directory", upper.StableAttr.Type)
+		return nil, fmt.Errorf("upper Inode is not a directory")
 	}
 	if !IsDir(lower.StableAttr) {
-		return nil, fmt.Errorf("lower Inode is a %v, not a directory", lower.StableAttr.Type)
+		return nil, fmt.Errorf("lower Inode is not a directory")
 	}
 	if upper.overlay != nil {
 		return nil, fmt.Errorf("cannot nest overlay in upper file of another overlay")
@@ -259,32 +259,32 @@ func (o *overlayEntry) isMappableLocked() bool {
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
-func (o *overlayEntry) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64, writable bool) error {
+func (o *overlayEntry) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) error {
 	o.mapsMu.Lock()
 	defer o.mapsMu.Unlock()
-	if err := o.inodeLocked().Mappable().AddMapping(ctx, ms, ar, offset, writable); err != nil {
+	if err := o.inodeLocked().Mappable().AddMapping(ctx, ms, ar, offset); err != nil {
 		return err
 	}
-	o.mappings.AddMapping(ms, ar, offset, writable)
+	o.mappings.AddMapping(ms, ar, offset)
 	return nil
 }
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
-func (o *overlayEntry) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64, writable bool) {
+func (o *overlayEntry) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar usermem.AddrRange, offset uint64) {
 	o.mapsMu.Lock()
 	defer o.mapsMu.Unlock()
-	o.inodeLocked().Mappable().RemoveMapping(ctx, ms, ar, offset, writable)
-	o.mappings.RemoveMapping(ms, ar, offset, writable)
+	o.inodeLocked().Mappable().RemoveMapping(ctx, ms, ar, offset)
+	o.mappings.RemoveMapping(ms, ar, offset)
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
-func (o *overlayEntry) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64, writable bool) error {
+func (o *overlayEntry) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64) error {
 	o.mapsMu.Lock()
 	defer o.mapsMu.Unlock()
-	if err := o.inodeLocked().Mappable().CopyMapping(ctx, ms, srcAR, dstAR, offset, writable); err != nil {
+	if err := o.inodeLocked().Mappable().CopyMapping(ctx, ms, srcAR, dstAR, offset); err != nil {
 		return err
 	}
-	o.mappings.AddMapping(ms, dstAR, offset, writable)
+	o.mappings.AddMapping(ms, dstAR, offset)
 	return nil
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,9 +26,9 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/refs"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/uniqueid"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
+	"gvisor.googlesource.com/gvisor/pkg/tcpip/transport/unix"
 )
 
 type globalDirentMap struct {
@@ -119,7 +119,7 @@ type Dirent struct {
 	parent *Dirent
 
 	// deleted may be set atomically when removed.
-	deleted int32
+	deleted int32 `state:"nosave"`
 
 	// frozen indicates this entry can't walk to unknown nodes.
 	frozen bool
@@ -458,12 +458,6 @@ func (d *Dirent) walk(ctx context.Context, root *Dirent, name string, walkMayUnl
 	if !IsDir(d.Inode.StableAttr) {
 		return nil, syscall.ENOTDIR
 	}
-
-	// The component must be less than NAME_MAX.
-	if len(name) > linux.NAME_MAX {
-		return nil, syscall.ENAMETOOLONG
-	}
-
 	if name == "" || name == "." {
 		d.IncRef()
 		return d, nil
@@ -806,7 +800,7 @@ func (d *Dirent) CreateDirectory(ctx context.Context, root *Dirent, name string,
 }
 
 // Bind satisfies the InodeOperations interface; otherwise same as GetFile.
-func (d *Dirent) Bind(ctx context.Context, root *Dirent, name string, data transport.BoundEndpoint, perms FilePermissions) (*Dirent, error) {
+func (d *Dirent) Bind(ctx context.Context, root *Dirent, name string, data unix.BoundEndpoint, perms FilePermissions) (*Dirent, error) {
 	var childDir *Dirent
 	err := d.genericCreate(ctx, root, name, func() error {
 		var e error
@@ -837,18 +831,14 @@ func (d *Dirent) CreateFifo(ctx context.Context, root *Dirent, name string, perm
 	})
 }
 
-// GetDotAttrs returns the DentAttrs corresponding to "." and ".." directories.
-func (d *Dirent) GetDotAttrs(root *Dirent) (DentAttr, DentAttr) {
+// getDotAttrs returns the DentAttrs corresponding to "." and ".." directories.
+func (d *Dirent) getDotAttrs(root *Dirent) (DentAttr, DentAttr) {
 	// Get '.'.
 	sattr := d.Inode.StableAttr
 	dot := DentAttr{
 		Type:    sattr.Type,
 		InodeID: sattr.InodeID,
 	}
-
-	// Hold d.mu while we call d.descendantOf.
-	d.mu.Lock()
-	defer d.mu.Unlock()
 
 	// Get '..'.
 	if !d.IsRoot() && d.descendantOf(root) {
@@ -870,7 +860,7 @@ func (d *Dirent) readdirFrozen(root *Dirent, offset int64, dirCtx *DirCtx) (int6
 	// Collect attrs for "." and  "..".
 	attrs := make(map[string]DentAttr)
 	names := []string{".", ".."}
-	attrs["."], attrs[".."] = d.GetDotAttrs(root)
+	attrs["."], attrs[".."] = d.getDotAttrs(root)
 
 	// Get info from all children.
 	d.mu.Lock()
@@ -965,7 +955,7 @@ func direntReaddir(ctx context.Context, d *Dirent, it DirIterator, root *Dirent,
 	}
 
 	// Collect attrs for "." and "..".
-	dot, dotdot := d.GetDotAttrs(root)
+	dot, dotdot := d.getDotAttrs(root)
 
 	// Emit "." and ".." if the offset is low enough.
 	if offset == 0 {
@@ -1037,14 +1027,11 @@ func (d *Dirent) flush() {
 	}
 }
 
-// isMountPoint returns true if the dirent is a mount point or the root.
-func (d *Dirent) isMountPoint() bool {
+// Busy indicates whether this Dirent is a mount point or root dirent.
+func (d *Dirent) Busy() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.isMountPointLocked()
-}
 
-func (d *Dirent) isMountPointLocked() bool {
 	return d.mounted || d.parent == nil
 }
 
@@ -1150,7 +1137,7 @@ func (d *Dirent) Remove(ctx context.Context, root *Dirent, name string) error {
 	}
 
 	// Remove cannot remove a mount point.
-	if child.isMountPoint() {
+	if child.Busy() {
 		return syscall.EBUSY
 	}
 
@@ -1224,7 +1211,7 @@ func (d *Dirent) RemoveDirectory(ctx context.Context, root *Dirent, name string)
 	}
 
 	// Remove cannot remove a mount point.
-	if child.isMountPoint() {
+	if child.Busy() {
 		return syscall.EBUSY
 	}
 
@@ -1461,10 +1448,6 @@ func checkSticky(ctx context.Context, dir *Dirent, victim *Dirent) error {
 //
 // Compare Linux kernel fs/namei.c:may_delete.
 func MayDelete(ctx context.Context, root, dir *Dirent, name string) error {
-	if err := dir.Inode.CheckPermission(ctx, PermMask{Write: true, Execute: true}); err != nil {
-		return err
-	}
-
 	victim, err := dir.Walk(ctx, root, name)
 	if err != nil {
 		return err
@@ -1474,20 +1457,12 @@ func MayDelete(ctx context.Context, root, dir *Dirent, name string) error {
 	return mayDelete(ctx, dir, victim)
 }
 
-// mayDelete determines whether `victim`, a child of `dir`, can be deleted or
-// renamed by `ctx`.
-//
-// Preconditions: `dir` is writable and executable by `ctx`.
-func mayDelete(ctx context.Context, dir, victim *Dirent) error {
-	if err := checkSticky(ctx, dir, victim); err != nil {
+func mayDelete(ctx context.Context, dir *Dirent, victim *Dirent) error {
+	if err := dir.Inode.CheckPermission(ctx, PermMask{Write: true, Execute: true}); err != nil {
 		return err
 	}
 
-	if victim.IsRoot() {
-		return syserror.EBUSY
-	}
-
-	return nil
+	return checkSticky(ctx, dir, victim)
 }
 
 // Rename atomically converts the child of oldParent named oldName to a
@@ -1516,35 +1491,31 @@ func Rename(ctx context.Context, root *Dirent, oldParent *Dirent, oldName string
 		return syscall.ENOENT
 	}
 
-	// Do we have general permission to remove from oldParent and
-	// create/replace in newParent?
-	if err := oldParent.Inode.CheckPermission(ctx, PermMask{Write: true, Execute: true}); err != nil {
-		return err
-	}
-	if err := newParent.Inode.CheckPermission(ctx, PermMask{Write: true, Execute: true}); err != nil {
-		return err
-	}
-
-	// renamed is the dirent that will be renamed to something else.
+	// Check constraints on the object being renamed.
 	renamed, err := oldParent.walk(ctx, root, oldName, false /* may unlock */)
 	if err != nil {
 		return err
 	}
 	defer renamed.DecRef()
 
-	// Check that the renamed dirent is deletable.
+	// Make sure we have write permissions on old and new parent.
 	if err := mayDelete(ctx, oldParent, renamed); err != nil {
 		return err
 	}
-
-	// Check that the renamed dirent is not a mount point.
-	if renamed.isMountPointLocked() {
-		return syscall.EBUSY
+	if newParent != oldParent {
+		if err := newParent.Inode.CheckPermission(ctx, PermMask{Write: true, Execute: true}); err != nil {
+			return err
+		}
 	}
 
 	// Source should not be an ancestor of the target.
-	if newParent.descendantOf(renamed) {
+	if renamed == newParent {
 		return syscall.EINVAL
+	}
+
+	// Is the thing we're trying to rename busy?
+	if renamed.Busy() {
+		return syscall.EBUSY
 	}
 
 	// Per rename(2): "... EACCES: ... or oldpath is a directory and does not
@@ -1555,39 +1526,21 @@ func Rename(ctx context.Context, root *Dirent, oldParent *Dirent, oldName string
 		}
 	}
 
-	// replaced is the dirent that is being overwritten by rename.
+	// Check constraints on the object being replaced, if any.
 	replaced, err := newParent.walk(ctx, root, newName, false /* may unlock */)
-	if err != nil {
-		if err != syserror.ENOENT {
-			return err
-		}
-
-		// newName doesn't exist; simply create it below.
-	} else {
-		// Check constraints on the dirent being replaced.
-
+	if err == nil {
 		// NOTE: We don't want to keep replaced alive
 		// across the Rename, so must call DecRef manually (no defer).
 
-		// Check that we can delete replaced.
-		if err := mayDelete(ctx, newParent, replaced); err != nil {
-			replaced.DecRef()
-			return err
-		}
-
 		// Target should not be an ancestor of source.
-		if oldParent.descendantOf(replaced) {
+		if replaced == oldParent {
 			replaced.DecRef()
-
-			// Note that Linux returns EINVAL if the source is an
-			// ancestor of target, but ENOTEMPTY if the target is
-			// an ancestor of source (unless RENAME_EXCHANGE flag
-			// is present).  See fs/namei.c:renameat2.
+			// Why is this not EINVAL? See fs/namei.c.
 			return syscall.ENOTEMPTY
 		}
 
-		// Check that replaced is not a mount point.
-		if replaced.isMountPointLocked() {
+		// Is the thing we're trying to replace busy?
+		if replaced.Busy() {
 			replaced.DecRef()
 			return syscall.EBUSY
 		}

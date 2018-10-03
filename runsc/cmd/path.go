@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import (
 func getwdOrDie() string {
 	wd, err := os.Getwd()
 	if err != nil {
-		Fatalf("getting current working directory: %v", err)
+		Fatalf("error getting current working directory: %v", err)
 	}
 	return wd
 }

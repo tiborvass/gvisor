@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -68,7 +68,12 @@ func seccomp(t *kernel.Task, mode, flags uint64, addr usermem.Addr) error {
 		return syscall.EINVAL
 	}
 
-	return t.AppendSyscallFilter(compiledFilter, tsync)
+	err = t.AppendSyscallFilter(compiledFilter)
+	if err == nil && tsync {
+		// Now we must copy this seccomp program to all other threads.
+		err = t.SyncSyscallFiltersToThreadGroup()
+	}
+	return err
 }
 
 // Seccomp implements linux syscall seccomp(2).

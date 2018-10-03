@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,30 +17,17 @@ package pipe
 import (
 	"sync"
 
-	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/amutex"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/context"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/fsutil"
 	"gvisor.googlesource.com/gvisor/pkg/syserror"
 )
 
-// inodeOperations implements fs.InodeOperations for pipes.
+// inodeOperations wraps fs.InodeOperations operations with common pipe opening semantics.
 //
 // +stateify savable
 type inodeOperations struct {
-	fsutil.InodeGenericChecker       `state:"nosave"`
-	fsutil.InodeNoExtendedAttributes `state:"nosave"`
-	fsutil.InodeNoopRelease          `state:"nosave"`
-	fsutil.InodeNoopTruncate         `state:"nosave"`
-	fsutil.InodeNoopWriteOut         `state:"nosave"`
-	fsutil.InodeNotDirectory         `state:"nosave"`
-	fsutil.InodeNotMappable          `state:"nosave"`
-	fsutil.InodeNotSocket            `state:"nosave"`
-	fsutil.InodeNotSymlink           `state:"nosave"`
-	fsutil.InodeNotVirtual           `state:"nosave"`
-
-	fsutil.InodeSimpleAttributes
+	fs.InodeOperations
 
 	// mu protects the fields below.
 	mu sync.Mutex `state:"nosave"`
@@ -59,15 +46,12 @@ type inodeOperations struct {
 	wWakeup chan struct{} `state:"nosave"`
 }
 
-var _ fs.InodeOperations = (*inodeOperations)(nil)
-
-// NewInodeOperations returns a new fs.InodeOperations for a given pipe.
-func NewInodeOperations(ctx context.Context, perms fs.FilePermissions, p *Pipe) *inodeOperations {
+// NewInodeOperations creates a new pipe fs.InodeOperations.
+func NewInodeOperations(base fs.InodeOperations, p *Pipe) fs.InodeOperations {
 	return &inodeOperations{
-		InodeSimpleAttributes: fsutil.NewInodeSimpleAttributes(ctx, fs.FileOwnerFromContext(ctx), perms, linux.PIPEFS_MAGIC),
-		p:                     p,
+		InodeOperations: base,
+		p:               p,
 	}
-
 }
 
 // GetFile implements fs.InodeOperations.GetFile. Named pipes have special blocking
@@ -178,6 +162,18 @@ func (i *inodeOperations) waitFor(wakeupChan *chan struct{}, sleeper amutex.Slee
 	default:
 		return false
 	}
+}
+
+// Truncate implements fs.InodeOperations.Truncate
+//
+// This method is required to override the default i.InodeOperations.Truncate
+// which may return ErrInvalidOperation, this allows open related
+// syscalls to set the O_TRUNC flag without returning an error by
+// calling Truncate directly during openat. The ftruncate and truncate
+// system calls will check that the file is an actual file and return
+// EINVAL because it's a PIPE, making this behavior consistent with linux.
+func (i *inodeOperations) Truncate(context.Context, *fs.Inode, int64) error {
+	return nil
 }
 
 // newHandleLocked signals a new pipe reader or writer depending on where

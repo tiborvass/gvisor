@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,9 +17,9 @@ package boot
 
 import (
 	"fmt"
-	mrand "math/rand"
+	"math/rand"
 	"os"
-	"runtime"
+	"os/signal"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -29,7 +29,6 @@ import (
 	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/cpuid"
 	"gvisor.googlesource.com/gvisor/pkg/log"
-	"gvisor.googlesource.com/gvisor/pkg/rand"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/arch"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/control"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/fs/host"
@@ -109,7 +108,7 @@ type Loader struct {
 	// mu guards processes.
 	mu sync.Mutex
 
-	// processes maps containers init process and invocation of exec. Root
+	// processes maps containers root process and invocation of exec. Root
 	// processes are keyed with container ID and pid=0, while exec invocations
 	// have the corresponding pid set.
 	//
@@ -117,7 +116,7 @@ type Loader struct {
 	processes map[execID]*execProcess
 }
 
-// execID uniquely identifies a sentry process that is executed in a container.
+// execID uniquely identifies a sentry process.
 type execID struct {
 	cid string
 	pid kernel.ThreadID
@@ -125,7 +124,6 @@ type execID struct {
 
 // execProcess contains the thread group and host TTY of a sentry process.
 type execProcess struct {
-	// tg will be nil for containers that haven't started yet.
 	tg *kernel.ThreadGroup
 
 	// tty will be nil if the process is not attached to a terminal.
@@ -134,56 +132,22 @@ type execProcess struct {
 
 func init() {
 	// Initialize the random number generator.
-	mrand.Seed(gtime.Now().UnixNano())
+	rand.Seed(gtime.Now().UnixNano())
 
 	// Register the global syscall table.
 	kernel.RegisterSyscallTable(slinux.AMD64)
 }
 
-// Args are the arguments for New().
-type Args struct {
-	// Id is the sandbox ID.
-	ID string
-	// Spec is the sandbox specification.
-	Spec *specs.Spec
-	// Conf is the system configuration.
-	Conf *Config
-	// ControllerFD is the FD to the URPC controller.
-	ControllerFD int
-	// DeviceFD is an optional argument that is passed to the platform.
-	DeviceFD int
-	// GoferFDs is an array of FDs used to connect with the Gofer.
-	GoferFDs []int
-	// StdioFDs is the stdio for the application.
-	StdioFDs []int
-	// Console is set to true if using TTY.
-	Console bool
-	// NumCPU is the number of CPUs to create inside the sandbox.
-	NumCPU int
-	// TotalMem is the initial amount of total memory to report back to the
-	// container.
-	TotalMem uint64
-	// UserLogFD is the file descriptor to write user logs to.
-	UserLogFD int
-}
-
 // New initializes a new kernel loader configured by spec.
 // New also handles setting up a kernel for restoring a container.
-func New(args Args) (*Loader, error) {
-	// We initialize the rand package now to make sure /dev/urandom is pre-opened
-	// on kernels that do not support getrandom(2).
-	if err := rand.Init(); err != nil {
-		return nil, fmt.Errorf("setting up rand: %v", err)
-	}
-
+func New(id string, spec *specs.Spec, conf *Config, controllerFD, deviceFD int, goferFDs []int, console bool) (*Loader, error) {
 	if err := usage.Init(); err != nil {
-		return nil, fmt.Errorf("setting up memory usage: %v", err)
+		return nil, fmt.Errorf("Error setting up memory usage: %v", err)
 	}
-
 	// Create kernel and platform.
-	p, err := createPlatform(args.Conf, args.DeviceFD)
+	p, err := createPlatform(conf, deviceFD)
 	if err != nil {
-		return nil, fmt.Errorf("creating platform: %v", err)
+		return nil, fmt.Errorf("error creating platform: %v", err)
 	}
 	k := &kernel.Kernel{
 		Platform: p,
@@ -194,59 +158,53 @@ func New(args Args) (*Loader, error) {
 	// Pass k as the platform since it is savable, unlike the actual platform.
 	vdso, err := loader.PrepareVDSO(k)
 	if err != nil {
-		return nil, fmt.Errorf("creating vdso: %v", err)
+		return nil, fmt.Errorf("error creating vdso: %v", err)
 	}
 
 	// Create timekeeper.
 	tk, err := kernel.NewTimekeeper(k, vdso.ParamPage.FileRange())
 	if err != nil {
-		return nil, fmt.Errorf("creating timekeeper: %v", err)
+		return nil, fmt.Errorf("error creating timekeeper: %v", err)
 	}
 	tk.SetClocks(time.NewCalibratedClocks())
 
-	if err := enableStrace(args.Conf); err != nil {
-		return nil, fmt.Errorf("enabling strace: %v", err)
+	if err := enableStrace(conf); err != nil {
+		return nil, fmt.Errorf("failed to enable strace: %v", err)
 	}
 
 	// Create an empty network stack because the network namespace may be empty at
 	// this point. Netns is configured before Run() is called. Netstack is
 	// configured using a control uRPC message. Host network is configured inside
 	// Run().
-	networkStack, err := newEmptyNetworkStack(args.Conf, k)
+	networkStack, err := newEmptyNetworkStack(conf, k)
 	if err != nil {
-		return nil, fmt.Errorf("creating network: %v", err)
+		return nil, fmt.Errorf("failed to create network: %v", err)
 	}
 
 	// Create capabilities.
-	caps, err := specutils.Capabilities(args.Spec.Process.Capabilities)
+	caps, err := specutils.Capabilities(spec.Process.Capabilities)
 	if err != nil {
-		return nil, fmt.Errorf("converting capabilities: %v", err)
+		return nil, fmt.Errorf("error creating capabilities: %v", err)
 	}
 
 	// Convert the spec's additional GIDs to KGIDs.
-	extraKGIDs := make([]auth.KGID, 0, len(args.Spec.Process.User.AdditionalGids))
-	for _, GID := range args.Spec.Process.User.AdditionalGids {
+	extraKGIDs := make([]auth.KGID, 0, len(spec.Process.User.AdditionalGids))
+	for _, GID := range spec.Process.User.AdditionalGids {
 		extraKGIDs = append(extraKGIDs, auth.KGID(GID))
 	}
 
 	// Create credentials.
 	creds := auth.NewUserCredentials(
-		auth.KUID(args.Spec.Process.User.UID),
-		auth.KGID(args.Spec.Process.User.GID),
+		auth.KUID(spec.Process.User.UID),
+		auth.KGID(spec.Process.User.GID),
 		extraKGIDs,
 		caps,
 		auth.NewRootUserNamespace())
 
-	if args.NumCPU == 0 {
-		args.NumCPU = runtime.NumCPU()
-	}
-	log.Infof("CPUs: %d", args.NumCPU)
-
-	if args.TotalMem > 0 {
-		// Adjust the total memory returned by the Sentry so that applications that
-		// use /proc/meminfo can make allocations based on this limit.
-		usage.MinimumTotalMemoryBytes = args.TotalMem
-		log.Infof("Setting total memory to %.2f GB", float64(args.TotalMem)/(2^30))
+	// Get CPU numbers from spec.
+	cpuNum, err := specutils.CalculateCPUNumber(spec)
+	if err != nil {
+		return nil, fmt.Errorf("cannot get cpus from spec: %v", err)
 	}
 
 	// Initiate the Kernel object, which is required by the Context passed
@@ -256,17 +214,17 @@ func New(args Args) (*Loader, error) {
 		Timekeeper:                  tk,
 		RootUserNamespace:           creds.UserNamespace,
 		NetworkStack:                networkStack,
-		ApplicationCores:            uint(args.NumCPU),
+		ApplicationCores:            uint(cpuNum),
 		Vdso:                        vdso,
-		RootUTSNamespace:            kernel.NewUTSNamespace(args.Spec.Hostname, args.Spec.Hostname, creds.UserNamespace),
+		RootUTSNamespace:            kernel.NewUTSNamespace(spec.Hostname, "", creds.UserNamespace),
 		RootIPCNamespace:            kernel.NewIPCNamespace(creds.UserNamespace),
 		RootAbstractSocketNamespace: kernel.NewAbstractSocketNamespace(),
 	}); err != nil {
-		return nil, fmt.Errorf("initializing kernel: %v", err)
+		return nil, fmt.Errorf("error initializing kernel: %v", err)
 	}
 
 	// Turn on packet logging if enabled.
-	if args.Conf.LogPackets {
+	if conf.LogPackets {
 		log.Infof("Packet logging enabled")
 		atomic.StoreUint32(&sniffer.LogPackets, 1)
 	} else {
@@ -275,76 +233,61 @@ func New(args Args) (*Loader, error) {
 	}
 
 	// Create a watchdog.
-	watchdog := watchdog.New(k, watchdog.DefaultTimeout, args.Conf.WatchdogAction)
-
-	procArgs, err := newProcess(args.ID, args.Spec, creds, k)
-	if err != nil {
-		return nil, fmt.Errorf("creating init process for root container: %v", err)
-	}
-
-	if err := initCompatLogs(args.UserLogFD); err != nil {
-		return nil, fmt.Errorf("initializing compat logs: %v", err)
-	}
-
-	eid := execID{cid: args.ID}
-	l := &Loader{
-		k:            k,
-		conf:         args.Conf,
-		console:      args.Console,
-		watchdog:     watchdog,
-		spec:         args.Spec,
-		goferFDs:     args.GoferFDs,
-		stdioFDs:     args.StdioFDs,
-		rootProcArgs: procArgs,
-		sandboxID:    args.ID,
-		processes:    map[execID]*execProcess{eid: &execProcess{}},
-	}
-
-	// We don't care about child signals; some platforms can generate a
-	// tremendous number of useless ones (I'm looking at you, ptrace).
-	if err := sighandling.IgnoreChildStop(); err != nil {
-		return nil, fmt.Errorf("ignore child stop signals failed: %v", err)
-	}
-
-	// Handle signals by forwarding them to the root container process
-	// (except for panic signal, which should cause a panic).
-	l.startSignalForwarding = sighandling.PrepareHandler(func(sig linux.Signal) {
-		// Panic signal should cause a panic.
-		if args.Conf.PanicSignal != -1 && sig == linux.Signal(args.Conf.PanicSignal) {
-			panic("Signal-induced panic")
-		}
-
-		// Otherwise forward to root container.
-		deliveryMode := DeliverToProcess
-		if args.Console {
-			// Since we are running with a console, we should
-			// forward the signal to the foreground process group
-			// so that job control signals like ^C can be handled
-			// properly.
-			deliveryMode = DeliverToForegroundProcessGroup
-		}
-		log.Infof("Received external signal %d, mode: %v", sig, deliveryMode)
-		if err := l.signal(args.ID, 0, int32(sig), deliveryMode); err != nil {
-			log.Warningf("error sending signal %v to container %q: %v", sig, args.ID, err)
-		}
-	})
+	watchdog := watchdog.New(k, watchdog.DefaultTimeout, conf.WatchdogAction)
 
 	// Create the control server using the provided FD.
 	//
 	// This must be done *after* we have initialized the kernel since the
 	// controller is used to configure the kernel's network stack.
-	ctrl, err := newController(args.ControllerFD, l)
+	//
+	// This should also be *before* we create the process, since a
+	// misconfigured process will cause an error, and we want the control
+	// server up before that so that we don't time out trying to connect to
+	// it.
+	ctrl, err := newController(controllerFD, k, watchdog)
 	if err != nil {
-		return nil, fmt.Errorf("creating control server: %v", err)
-	}
-	l.ctrl = ctrl
-
-	// Only start serving after Loader is set to controller and controller is set
-	// to Loader, because they are both used in the urpc methods.
-	if err := ctrl.srv.StartServing(); err != nil {
-		return nil, fmt.Errorf("starting control server: %v", err)
+		return nil, fmt.Errorf("error creating control server: %v", err)
 	}
 
+	// We don't care about child signals; some platforms can generate a
+	// tremendous number of useless ones (I'm looking at you, ptrace).
+	if err := sighandling.IgnoreChildStop(); err != nil {
+		return nil, fmt.Errorf("failed to ignore child stop signals: %v", err)
+	}
+	// Ensure that signals received are forwarded to the emulated kernel.
+	ps := syscall.Signal(conf.PanicSignal)
+	startSignalForwarding := sighandling.PrepareForwarding(k, ps)
+	if conf.PanicSignal != -1 {
+		// Panics if the sentry receives 'conf.PanicSignal'.
+		panicChan := make(chan os.Signal, 1)
+		signal.Notify(panicChan, ps)
+		go func() { // S/R-SAFE: causes sentry panic.
+			<-panicChan
+			panic("Signal-induced panic")
+		}()
+		log.Infof("Panic signal set to %v(%d)", ps, conf.PanicSignal)
+	}
+
+	procArgs, err := newProcess(id, spec, creds, k)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create root process: %v", err)
+	}
+
+	l := &Loader{
+		k:                     k,
+		ctrl:                  ctrl,
+		conf:                  conf,
+		console:               console,
+		watchdog:              watchdog,
+		stdioFDs:              []int{syscall.Stdin, syscall.Stdout, syscall.Stderr},
+		goferFDs:              goferFDs,
+		spec:                  spec,
+		startSignalForwarding: startSignalForwarding,
+		rootProcArgs:          procArgs,
+		sandboxID:             id,
+		processes:             make(map[execID]*execProcess),
+	}
+	ctrl.manager.l = l
 	return l, nil
 }
 
@@ -353,7 +296,7 @@ func newProcess(id string, spec *specs.Spec, creds *auth.Credentials, k *kernel.
 	// Create initial limits.
 	ls, err := createLimitSet(spec)
 	if err != nil {
-		return kernel.CreateProcessArgs{}, fmt.Errorf("creating limits: %v", err)
+		return kernel.CreateProcessArgs{}, fmt.Errorf("error creating limits: %v", err)
 	}
 
 	// Create the process arguments.
@@ -441,7 +384,7 @@ func (l *Loader) run() error {
 			ControllerFD: l.ctrl.srv.FD(),
 		}
 		if err := filter.Install(opts); err != nil {
-			return fmt.Errorf("installing seccomp filters: %v", err)
+			return fmt.Errorf("Failed to install seccomp filters: %v", err)
 		}
 	}
 
@@ -465,13 +408,13 @@ func (l *Loader) run() error {
 		rootCtx := l.rootProcArgs.NewContext(l.k)
 		rootMns := l.k.RootMountNamespace()
 		if err := setExecutablePath(rootCtx, rootMns, &l.rootProcArgs); err != nil {
-			return err
+			return fmt.Errorf("error setting executable path for %+v: %v", l.rootProcArgs, err)
 		}
 
 		// Create the root container init task.
 		_, _, err := l.k.CreateProcess(l.rootProcArgs)
 		if err != nil {
-			return fmt.Errorf("creating init process: %v", err)
+			return fmt.Errorf("failed to create init process: %v", err)
 		}
 
 		// CreateProcess takes a reference on FDMap if successful.
@@ -479,19 +422,9 @@ func (l *Loader) run() error {
 	}
 
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	eid := execID{cid: l.sandboxID}
-	ep := l.processes[eid]
-	if ep == nil {
-		return fmt.Errorf("trying to start deleted container %q", l.sandboxID)
-	}
-	ep.tg = l.k.GlobalInit()
-	if l.console {
-		ttyFile := l.rootProcArgs.FDMap.GetFile(0)
-		defer ttyFile.DecRef()
-		ep.tty = ttyFile.FileOperations.(*host.TTYFileOperations)
-	}
+	l.processes[eid] = &execProcess{tg: l.k.GlobalInit()}
+	l.mu.Unlock()
 
 	// Start signal forwarding only after an init process is created.
 	l.stopSignalForwarding = l.startSignalForwarding()
@@ -501,27 +434,13 @@ func (l *Loader) run() error {
 	return l.k.Start()
 }
 
-// createContainer creates a new container inside the sandbox.
-func (l *Loader) createContainer(cid string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	eid := execID{cid: cid}
-	if _, ok := l.processes[eid]; ok {
-		return fmt.Errorf("container %q already exists", cid)
-	}
-	l.processes[eid] = &execProcess{}
-	return nil
-}
-
 // startContainer starts a child container. It returns the thread group ID of
-// the newly created process. Caller owns 'files' and may close them after
-// this method returns.
+// the newly created process.
 func (l *Loader) startContainer(k *kernel.Kernel, spec *specs.Spec, conf *Config, cid string, files []*os.File) error {
 	// Create capabilities.
 	caps, err := specutils.Capabilities(spec.Process.Capabilities)
 	if err != nil {
-		return fmt.Errorf("creating capabilities: %v", err)
+		return fmt.Errorf("error creating capabilities: %v", err)
 	}
 
 	// Convert the spec's additional GIDs to KGIDs.
@@ -542,9 +461,12 @@ func (l *Loader) startContainer(k *kernel.Kernel, spec *specs.Spec, conf *Config
 		caps,
 		l.k.RootUserNamespace())
 
+	// TODO New containers should be started in new PID namespaces
+	// when indicated by the spec.
+
 	procArgs, err := newProcess(cid, spec, creds, l.k)
 	if err != nil {
-		return fmt.Errorf("creating new process: %v", err)
+		return fmt.Errorf("failed to create new process: %v", err)
 	}
 
 	// Can't take ownership away from os.File. dup them to get a new FDs.
@@ -554,6 +476,7 @@ func (l *Loader) startContainer(k *kernel.Kernel, spec *specs.Spec, conf *Config
 		if err != nil {
 			return fmt.Errorf("failed to dup file: %v", err)
 		}
+		f.Close()
 		ioFDs = append(ioFDs, fd)
 	}
 
@@ -570,54 +493,48 @@ func (l *Loader) startContainer(k *kernel.Kernel, spec *specs.Spec, conf *Config
 		procArgs.Limits,
 		k,
 		cid); err != nil {
-		return fmt.Errorf("configuring container FS: %v", err)
+		return fmt.Errorf("failed to create new process: %v", err)
 	}
 
 	// setFileSystemForProcess dup'd stdioFDs, so we can close them.
 	for i, fd := range stdioFDs {
 		if err := syscall.Close(fd); err != nil {
-			return fmt.Errorf("closing stdio FD #%d: %v", i, fd)
+			return fmt.Errorf("failed to close stdioFD #%d: %v", i, fd)
 		}
 	}
 
 	ctx := procArgs.NewContext(l.k)
 	mns := k.RootMountNamespace()
 	if err := setExecutablePath(ctx, mns, &procArgs); err != nil {
-		return fmt.Errorf("setting executable path for %+v: %v", procArgs, err)
-	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	eid := execID{cid: cid}
-	if _, ok := l.processes[eid]; !ok {
-		return fmt.Errorf("trying to start a deleted container %q", cid)
+		return fmt.Errorf("error setting executable path for %+v: %v", procArgs, err)
 	}
 
 	tg, _, err := l.k.CreateProcess(procArgs)
 	if err != nil {
-		return fmt.Errorf("creating process: %v", err)
+		return fmt.Errorf("failed to create process in sentry: %v", err)
 	}
+
 	// CreateProcess takes a reference on FDMap if successful.
 	procArgs.FDMap.DecRef()
 
-	l.processes[eid].tg = tg
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	eid := execID{cid: cid}
+	l.processes[eid] = &execProcess{tg: tg}
+
 	return nil
 }
 
 // destroyContainer stops a container if it is still running and cleans up its
 // filesystem.
 func (l *Loader) destroyContainer(cid string) error {
+	// First kill and wait for all processes in the container.
+	if err := l.signalContainer(cid, int32(linux.SIGKILL), true /*all*/); err != nil {
+		return fmt.Errorf("failed to SIGKILL all container processes: %v", err)
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	// Has the container started?
-	if _, _, err := l.threadGroupFromIDLocked(execID{cid: cid}); err == nil {
-		// If the container has started, kill and wait for all processes.
-		if err := l.signalAllProcesses(cid, int32(linux.SIGKILL)); err != nil {
-			return fmt.Errorf("sending SIGKILL to all container processes: %v", err)
-		}
-	}
 
 	// Remove all container thread groups from the map.
 	for key := range l.processes {
@@ -628,7 +545,7 @@ func (l *Loader) destroyContainer(cid string) error {
 
 	ctx := l.rootProcArgs.NewContext(l.k)
 	if err := destroyContainerFS(ctx, cid, l.k); err != nil {
-		return fmt.Errorf("destroying filesystem for container %q: %v", cid, err)
+		return fmt.Errorf("failed to destroy filesystem for container %q: %v", cid, err)
 	}
 
 	// We made it!
@@ -637,19 +554,16 @@ func (l *Loader) destroyContainer(cid string) error {
 }
 
 func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
-	// Hold the lock for the entire operation to ensure that exec'd process is
-	// added to 'processes' in case it races with destroyContainer().
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	tg, _, err := l.threadGroupFromIDLocked(execID{cid: args.ContainerID})
-	if err != nil {
-		return 0, fmt.Errorf("no such container: %q", args.ContainerID)
-	}
-
 	// Get the container Root Dirent from the Task, since we must run this
 	// process with the same Root.
-	tg.Leader().WithMuLocked(func(t *kernel.Task) {
+	l.mu.Lock()
+	rootKey := execID{cid: args.ContainerID}
+	ep, ok := l.processes[rootKey]
+	l.mu.Unlock()
+	if !ok {
+		return 0, fmt.Errorf("cannot exec in container %q: no such container", args.ContainerID)
+	}
+	ep.tg.Leader().WithMuLocked(func(t *kernel.Task) {
 		args.Root = t.FSContext().RootDirectory()
 	})
 	if args.Root != nil {
@@ -658,14 +572,18 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 
 	// Start the process.
 	proc := control.Proc{Kernel: l.k}
-	newTG, tgid, ttyFile, err := control.ExecAsync(&proc, args)
+	tg, tgid, ttyFile, err := control.ExecAsync(&proc, args)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("error executing: %+v: %v", args, err)
 	}
 
+	// Insert the process into processes so that we can wait on it
+	// later.
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	eid := execID{cid: args.ContainerID, pid: tgid}
 	l.processes[eid] = &execProcess{
-		tg:  newTG,
+		tg:  tg,
 		tty: ttyFile,
 	}
 	log.Debugf("updated processes: %v", l.processes)
@@ -673,36 +591,44 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	return tgid, nil
 }
 
-// waitContainer waits for the init process of a container to exit.
+// waitContainer waits for the root process of a container to exit.
 func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 	// Don't defer unlock, as doing so would make it impossible for
 	// multiple clients to wait on the same container.
-	tg, _, err := l.threadGroupFromID(execID{cid: cid})
-	if err != nil {
-		return fmt.Errorf("can't wait for container %q: %v", cid, err)
+	l.mu.Lock()
+	eid := execID{cid: cid}
+	ep, ok := l.processes[eid]
+	l.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("can't find process for container %q in %v", cid, l.processes)
 	}
 
 	// If the thread either has already exited or exits during waiting,
 	// consider the container exited.
-	ws := l.wait(tg)
+	ws := l.wait(ep.tg)
 	*waitStatus = ws
 	return nil
 }
 
 func (l *Loader) waitPID(tgid kernel.ThreadID, cid string, clearStatus bool, waitStatus *uint32) error {
-	if tgid <= 0 {
-		return fmt.Errorf("PID (%d) must be positive", tgid)
-	}
+	// TODO: Containers all currently share a PID namespace.
+	// When per-container PID namespaces are supported, wait should use cid
+	// to find the appropriate PID namespace.
+	/*if cid != l.sandboxID {
+		return errors.New("non-sandbox PID namespaces are not yet implemented")
+	}*/
 
-	// Try to find a process that was exec'd
+	// If the process was started via runsc exec, it will have an
+	// entry in l.processes.
+	l.mu.Lock()
 	eid := execID{cid: cid, pid: tgid}
-	execTG, _, err := l.threadGroupFromID(eid)
-	if err == nil {
-		ws := l.wait(execTG)
+	ep, ok := l.processes[eid]
+	l.mu.Unlock()
+	if ok {
+		ws := l.wait(ep.tg)
 		*waitStatus = ws
-
-		// Remove tg from the cache if caller requested it.
 		if clearStatus {
+			// Remove tg from the cache.
 			l.mu.Lock()
 			delete(l.processes, eid)
 			log.Debugf("updated processes (removal): %v", l.processes)
@@ -711,18 +637,11 @@ func (l *Loader) waitPID(tgid kernel.ThreadID, cid string, clearStatus bool, wai
 		return nil
 	}
 
-	// The caller may be waiting on a process not started directly via exec.
-	// In this case, find the process in the container's PID namespace.
-	initTG, _, err := l.threadGroupFromID(execID{cid: cid})
-	if err != nil {
-		return fmt.Errorf("waiting for PID %d: %v", tgid, err)
-	}
-	tg := initTG.PIDNamespace().ThreadGroupWithID(tgid)
+	// This process wasn't created by runsc exec or start, so just find it
+	// by PID and hope it hasn't exited yet.
+	tg := l.k.TaskSet().Root.ThreadGroupWithID(kernel.ThreadID(tgid))
 	if tg == nil {
-		return fmt.Errorf("waiting for PID %d: no such process", tgid)
-	}
-	if tg.Leader().ContainerID() != cid {
-		return fmt.Errorf("process %d is part of a different container: %q", tgid, tg.Leader().ContainerID())
+		return fmt.Errorf("no thread group with ID %d", tgid)
 	}
 	ws := l.wait(tg)
 	*waitStatus = ws
@@ -739,6 +658,12 @@ func (l *Loader) wait(tg *kernel.ThreadGroup) uint32 {
 // WaitForStartSignal waits for a start signal from the control server.
 func (l *Loader) WaitForStartSignal() {
 	<-l.ctrl.manager.startChan
+}
+
+// NotifyLoaderCreated sends a signal to the container manager that this
+// loader has been created.
+func (l *Loader) NotifyLoaderCreated() {
+	l.ctrl.manager.loaderCreatedChan <- struct{}{}
 }
 
 // WaitExit waits for the root container to exit, and returns its exit status.
@@ -758,130 +683,91 @@ func newEmptyNetworkStack(conf *Config, clock tcpip.Clock) (inet.Stack, error) {
 		// NetworkNone sets up loopback using netstack.
 		netProtos := []string{ipv4.ProtocolName, ipv6.ProtocolName, arp.ProtocolName}
 		protoNames := []string{tcp.ProtocolName, udp.ProtocolName, ping.ProtocolName4}
-		s := epsocket.Stack{stack.New(netProtos, protoNames, stack.Options{
-			Clock: clock,
-			Stats: epsocket.Metrics,
-		})}
+		s := &epsocket.Stack{stack.New(netProtos, protoNames, stack.Options{Clock: clock})}
 		if err := s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SACKEnabled(true)); err != nil {
 			return nil, fmt.Errorf("failed to enable SACK: %v", err)
 		}
-		return &s, nil
+		return s, nil
 
 	default:
 		panic(fmt.Sprintf("invalid network configuration: %v", conf.Network))
 	}
 }
 
-// signal sends a signal to one or more processes in a container. If PID is 0,
-// then the container init process is used. Depending on the SignalDeliveryMode
-// option, the signal may be sent directly to the indicated process, to all
-// processes in the container, or to the foreground process group.
-func (l *Loader) signal(cid string, pid, signo int32, mode SignalDeliveryMode) error {
-	if pid < 0 {
-		return fmt.Errorf("PID (%d) must be positive", pid)
+// signalProcess sends a signal to the process with the given PID. If
+// sendToFGProcess is true, then the signal will be sent to the foreground
+// process group in the same session that PID belongs to.
+func (l *Loader) signalProcess(cid string, pid, signo int32, sendToFGProcess bool) error {
+	si := arch.SignalInfo{Signo: signo}
+
+	if pid <= 0 {
+		return fmt.Errorf("failed to signal container %q PID %d: PID must be positive", cid, pid)
 	}
 
-	switch mode {
-	case DeliverToProcess:
-		if err := l.signalProcess(cid, kernel.ThreadID(pid), signo); err != nil {
-			return fmt.Errorf("signaling process in container %q PID %d: %v", cid, pid, err)
-		}
-		return nil
-
-	case DeliverToForegroundProcessGroup:
-		if err := l.signalForegrondProcessGroup(cid, kernel.ThreadID(pid), signo); err != nil {
-			return fmt.Errorf("signaling foreground process group in container %q PID %d: %v", cid, pid, err)
-		}
-		return nil
-
-	case DeliverToAllProcesses:
-		if pid != 0 {
-			return fmt.Errorf("PID (%d) cannot be set when signaling all processes", pid)
-		}
-		// Check that the container has actually started before signaling it.
-		_, _, err := l.threadGroupFromID(execID{cid: cid})
-		if err != nil {
-			return err
-		}
-		if err := l.signalAllProcesses(cid, signo); err != nil {
-			return fmt.Errorf("signaling all processes in container %q: %v", cid, err)
-		}
-		return nil
-
-	default:
-		panic(fmt.Sprintf("unknown signal delivery mode %v", mode))
+	eid := execID{
+		cid: cid,
+		pid: kernel.ThreadID(pid),
 	}
-}
+	l.mu.Lock()
+	ep, ok := l.processes[eid]
+	l.mu.Unlock()
 
-func (l *Loader) signalProcess(cid string, tgid kernel.ThreadID, signo int32) error {
-	execTG, _, err := l.threadGroupFromID(execID{cid: cid, pid: tgid})
-	if err == nil {
-		// Send signal directly to the identified process.
-		return execTG.SendSignal(&arch.SignalInfo{Signo: signo})
+	if !ok {
+		return fmt.Errorf("failed to signal container %q PID %d: no such PID", cid, pid)
 	}
 
-	// The caller may be signaling a process not started directly via exec.
-	// In this case, find the process in the container's PID namespace and
-	// signal it.
-	initTG, _, err := l.threadGroupFromID(execID{cid: cid})
-	if err != nil {
-		return fmt.Errorf("no thread group found: %v", err)
+	if !sendToFGProcess {
+		// Send signal directly to exec process.
+		return ep.tg.SendSignal(&si)
 	}
-	tg := initTG.PIDNamespace().ThreadGroupWithID(tgid)
-	if tg == nil {
-		return fmt.Errorf("no such process with PID %d", tgid)
-	}
-	if tg.Leader().ContainerID() != cid {
-		return fmt.Errorf("process %d is part of a different container: %q", tgid, tg.Leader().ContainerID())
-	}
-	return tg.SendSignal(&arch.SignalInfo{Signo: signo})
-}
 
-func (l *Loader) signalForegrondProcessGroup(cid string, tgid kernel.ThreadID, signo int32) error {
 	// Lookup foreground process group from the TTY for the given process,
 	// and send the signal to it.
-	tg, tty, err := l.threadGroupFromID(execID{cid: cid, pid: tgid})
-	if err != nil {
-		return fmt.Errorf("no thread group found: %v", err)
+	if ep.tty == nil {
+		return fmt.Errorf("failed to signal foreground process group in container %q PID %d: no TTY attached", cid, pid)
 	}
-	if tty == nil {
-		return fmt.Errorf("no TTY attached")
-	}
-	pg := tty.ForegroundProcessGroup()
+	pg := ep.tty.ForegroundProcessGroup()
 	if pg == nil {
 		// No foreground process group has been set. Signal the
 		// original thread group.
-		log.Warningf("No foreground process group for container %q and PID %d. Sending signal directly to PID %d.", cid, tgid, tgid)
-		return tg.SendSignal(&arch.SignalInfo{Signo: signo})
+		log.Warningf("No foreground process group for container %q and PID %d. Sending signal directly to PID %d.", cid, pid, pid)
+		return ep.tg.SendSignal(&si)
 	}
-	// Send the signal to all processes in the process group.
-	var lastErr error
-	for _, tg := range l.k.TaskSet().Root.ThreadGroups() {
-		if tg.ProcessGroup() != pg {
-			continue
-		}
-		if err := tg.SendSignal(&arch.SignalInfo{Signo: signo}); err != nil {
-			lastErr = err
-		}
-	}
-	return lastErr
+
+	// Send the signal.
+	return pg.Originator().SendSignal(&si)
 }
 
-// signalAllProcesses that belong to specified container. It's a noop if the
-// container hasn't started or has exited.
-func (l *Loader) signalAllProcesses(cid string, signo int32) error {
+// signalContainer sends a signal to the root container process, or to all
+// processes in the container if all is true.
+func (l *Loader) signalContainer(cid string, signo int32, all bool) error {
+	si := arch.SignalInfo{Signo: signo}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	eid := execID{cid: cid}
+	ep, ok := l.processes[eid]
+	if !ok {
+		return fmt.Errorf("failed to signal container %q: no such container", cid)
+	}
+
+	if !all {
+		return ep.tg.SendSignal(&si)
+	}
+
 	// Pause the kernel to prevent new processes from being created while
 	// the signal is delivered. This prevents process leaks when SIGKILL is
 	// sent to the entire container.
 	l.k.Pause()
-	if err := l.k.SendContainerSignal(cid, &arch.SignalInfo{Signo: signo}); err != nil {
+	if err := l.k.SendContainerSignal(cid, &si); err != nil {
 		l.k.Unpause()
 		return err
 	}
 	l.k.Unpause()
 
-	// If SIGKILLing all processes, wait for them to exit.
-	if linux.Signal(signo) == linux.SIGKILL {
+	// If killing all processes, wait for them to exit.
+	if all && linux.Signal(signo) == linux.SIGKILL {
 		for _, t := range l.k.TaskSet().Root.Tasks() {
 			if t.ContainerID() == cid {
 				t.ThreadGroup().WaitExited()
@@ -889,27 +775,4 @@ func (l *Loader) signalAllProcesses(cid string, signo int32) error {
 		}
 	}
 	return nil
-}
-
-// threadGroupFromID same as threadGroupFromIDLocked except that it acquires
-// mutex before calling it.
-func (l *Loader) threadGroupFromID(key execID) (*kernel.ThreadGroup, *host.TTYFileOperations, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.threadGroupFromIDLocked(key)
-}
-
-// threadGroupFromIDLocked returns the thread group and TTY for the given
-// execution ID. TTY may be nil if the process is not attached to a terminal.
-// Returns error if execution ID is invalid or if container/process has not
-// started yet. Caller must hold 'mu'.
-func (l *Loader) threadGroupFromIDLocked(key execID) (*kernel.ThreadGroup, *host.TTYFileOperations, error) {
-	ep := l.processes[key]
-	if ep == nil {
-		return nil, nil, fmt.Errorf("container not found")
-	}
-	if ep.tg == nil {
-		return nil, nil, fmt.Errorf("container not started")
-	}
-	return ep.tg, ep.tty, nil
 }

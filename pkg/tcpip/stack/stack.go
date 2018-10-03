@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -200,17 +200,9 @@ type TCPSenderState struct {
 
 // TCPSACKInfo holds TCP SACK related information for a given TCP endpoint.
 type TCPSACKInfo struct {
-	// Blocks is the list of SACK Blocks that identify the out of order segments
-	// held by a given TCP endpoint.
+	// Blocks is the list of SACK block currently received by the
+	// TCP endpoint.
 	Blocks []header.SACKBlock
-
-	// ReceivedBlocks are the SACK blocks received by this endpoint
-	// from the peer endpoint.
-	ReceivedBlocks []header.SACKBlock
-
-	// MaxSACKED is the highest sequence number that has been SACKED
-	// by the peer.
-	MaxSACKED seqnum.Value
 }
 
 // TCPEndpointState is a copy of the internal state of a TCP endpoint.
@@ -716,31 +708,11 @@ func (s *Stack) GetMainNICAddress(id tcpip.NICID, protocol tcpip.NetworkProtocol
 	return "", tcpip.Subnet{}, tcpip.ErrUnknownNICID
 }
 
-func (s *Stack) getRefEP(nic *NIC, localAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber) (ref *referencedNetworkEndpoint) {
-	if len(localAddr) == 0 {
-		return nic.primaryEndpoint(netProto)
-	}
-	return nic.findEndpoint(netProto, localAddr, CanBePrimaryEndpoint)
-}
-
 // FindRoute creates a route to the given destination address, leaving through
 // the given nic and local address (if provided).
 func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber) (Route, *tcpip.Error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	// We don't require a route in the table to send a broadcast, multicast or
-	// IPv6 link-local packet out on a NIC.
-	isBroadcast := remoteAddr == header.IPv4Broadcast
-	isMulticast := header.IsV4MulticastAddress(remoteAddr) || header.IsV6MulticastAddress(remoteAddr)
-	if id != 0 && (isBroadcast || isMulticast || header.IsV6LinkLocalAddress(remoteAddr)) {
-		if nic, ok := s.nics[id]; ok {
-			if ref := s.getRefEP(nic, localAddr, netProto); ref != nil {
-				return makeRoute(netProto, ref.ep.ID().LocalAddress, remoteAddr, nic.linkEP.LinkAddress(), ref), nil
-			}
-		}
-		return Route{}, tcpip.ErrNoRoute
-	}
 
 	for i := range s.routeTable {
 		if (id != 0 && id != s.routeTable[i].NIC) || (len(remoteAddr) != 0 && !s.routeTable[i].Match(remoteAddr)) {
@@ -752,7 +724,12 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 			continue
 		}
 
-		ref := s.getRefEP(nic, localAddr, netProto)
+		var ref *referencedNetworkEndpoint
+		if len(localAddr) != 0 {
+			ref = nic.findEndpoint(netProto, localAddr, CanBePrimaryEndpoint)
+		} else {
+			ref = nic.primaryEndpoint(netProto)
+		}
 		if ref == nil {
 			continue
 		}
@@ -883,9 +860,9 @@ func (s *Stack) RemoveWaker(nicid tcpip.NICID, addr tcpip.Address, waker *sleep.
 // transport dispatcher. Received packets that match the provided id will be
 // delivered to the given endpoint; specifying a nic is optional, but
 // nic-specific IDs have precedence over global ones.
-func (s *Stack) RegisterTransportEndpoint(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, protocol tcpip.TransportProtocolNumber, id TransportEndpointID, ep TransportEndpoint, reusePort bool) *tcpip.Error {
+func (s *Stack) RegisterTransportEndpoint(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, protocol tcpip.TransportProtocolNumber, id TransportEndpointID, ep TransportEndpoint) *tcpip.Error {
 	if nicID == 0 {
-		return s.demux.registerEndpoint(netProtos, protocol, id, ep, reusePort)
+		return s.demux.registerEndpoint(netProtos, protocol, id, ep)
 	}
 
 	s.mu.RLock()
@@ -896,14 +873,14 @@ func (s *Stack) RegisterTransportEndpoint(nicID tcpip.NICID, netProtos []tcpip.N
 		return tcpip.ErrUnknownNICID
 	}
 
-	return nic.demux.registerEndpoint(netProtos, protocol, id, ep, reusePort)
+	return nic.demux.registerEndpoint(netProtos, protocol, id, ep)
 }
 
 // UnregisterTransportEndpoint removes the endpoint with the given id from the
 // stack transport dispatcher.
-func (s *Stack) UnregisterTransportEndpoint(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, protocol tcpip.TransportProtocolNumber, id TransportEndpointID, ep TransportEndpoint) {
+func (s *Stack) UnregisterTransportEndpoint(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, protocol tcpip.TransportProtocolNumber, id TransportEndpointID) {
 	if nicID == 0 {
-		s.demux.unregisterEndpoint(netProtos, protocol, id, ep)
+		s.demux.unregisterEndpoint(netProtos, protocol, id)
 		return
 	}
 
@@ -912,7 +889,7 @@ func (s *Stack) UnregisterTransportEndpoint(nicID tcpip.NICID, netProtos []tcpip
 
 	nic := s.nics[nicID]
 	if nic != nil {
-		nic.demux.unregisterEndpoint(netProtos, protocol, id, ep)
+		nic.demux.unregisterEndpoint(netProtos, protocol, id)
 	}
 }
 

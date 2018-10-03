@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@ package cmd
 
 import (
 	"context"
-
 	"flag"
 	"github.com/google/subcommands"
 	"gvisor.googlesource.com/gvisor/runsc/boot"
@@ -56,10 +55,10 @@ func (*Start) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) s
 
 	c, err := container.Load(conf.RootDir, id)
 	if err != nil {
-		Fatalf("loading container: %v", err)
+		Fatalf("error loading container: %v", err)
 	}
 	if err := c.Start(conf); err != nil {
-		Fatalf("starting container: %v", err)
+		Fatalf("error starting container: %v", err)
 	}
 	return subcommands.ExitSuccess
 }

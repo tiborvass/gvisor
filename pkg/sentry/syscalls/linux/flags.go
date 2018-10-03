@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,9 +22,6 @@ import (
 // flagsToPermissions returns a Permissions object from Linux flags.
 // This includes truncate permission if O_TRUNC is set in the mask.
 func flagsToPermissions(mask uint) (p fs.PermMask) {
-	if mask&linux.O_TRUNC != 0 {
-		p.Write = true
-	}
 	switch mask & linux.O_ACCMODE {
 	case linux.O_WRONLY:
 		p.Write = true

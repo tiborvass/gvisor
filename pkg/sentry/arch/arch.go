@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -114,12 +114,6 @@ type Context interface {
 
 	// SetStack sets the current stack pointer.
 	SetStack(value uintptr)
-
-	// TLS returns the current TLS pointer.
-	TLS() uintptr
-
-	// SetTLS sets the current TLS pointer. Returns false if value is invalid.
-	SetTLS(value uintptr) bool
 
 	// SetRSEQInterruptedIP sets the register that contains the old IP when a
 	// restartable sequence is interrupted.

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -366,9 +366,6 @@ func (tg *ThreadGroup) CreateProcessGroup() error {
 	})
 	tg.processGroup.decRefWithParent(oldParentPG)
 	tg.processGroup = pg
-
-	// Add the new process group to the session.
-	pg.session.processGroups.PushBack(pg)
 
 	// Ensure this translation is added to all namespaces.
 	for ns := tg.pidns; ns != nil; ns = ns.parent {

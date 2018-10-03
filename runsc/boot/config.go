@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -157,14 +157,12 @@ type Config struct {
 	// LogFilename is the filename to log to, if not empty.
 	LogFilename string
 
-	// LogFormat is the log format.
+	// LogFormat is the log format, "text" or "json".
 	LogFormat string
 
-	// DebugLog is the path to log debug information to, if not empty.
-	DebugLog string
-
-	// DebugLogFormat is the log format for debug.
-	DebugLogFormat string
+	// DebugLogDir is the directory to log debug information to, if not
+	// empty.
+	DebugLogDir string
 
 	// FileAccess indicates how the filesystem is accessed.
 	FileAccess FileAccessType
@@ -195,10 +193,13 @@ type Config struct {
 	// disabled. Pardon the double negation, but default to enabled is important.
 	DisableSeccomp bool
 
+	// SpecFile is the file containing the OCI spec.
+	SpecFile string
+
 	// WatchdogAction sets what action the watchdog takes when triggered.
 	WatchdogAction watchdog.Action
 
-	// PanicSignal registers signal handling that panics. Usually set to
+	// PanicSignal register signal handling that panics. Usually set to
 	// SIGUSR2(12) to troubleshoot hangs. -1 disables it.
 	PanicSignal int
 
@@ -211,13 +212,12 @@ type Config struct {
 
 // ToFlags returns a slice of flags that correspond to the given Config.
 func (c *Config) ToFlags() []string {
-	f := []string{
+	return []string{
 		"--root=" + c.RootDir,
 		"--debug=" + strconv.FormatBool(c.Debug),
 		"--log=" + c.LogFilename,
 		"--log-format=" + c.LogFormat,
-		"--debug-log=" + c.DebugLog,
-		"--debug-log-format=" + c.DebugLogFormat,
+		"--debug-log-dir=" + c.DebugLogDir,
 		"--file-access=" + c.FileAccess.String(),
 		"--overlay=" + strconv.FormatBool(c.Overlay),
 		"--network=" + c.Network.String(),
@@ -229,9 +229,4 @@ func (c *Config) ToFlags() []string {
 		"--watchdog-action=" + c.WatchdogAction.String(),
 		"--panic-signal=" + strconv.Itoa(c.PanicSignal),
 	}
-	if c.TestOnlyAllowRunAsCurrentUserWithoutChroot {
-		// Only include if set since it is never to be used by users.
-		f = append(f, "-TESTONLY-unsafe-nonroot=true")
-	}
-	return f
 }

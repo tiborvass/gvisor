@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,13 +17,13 @@
 package main
 
 import (
-	"context"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 
+	"context"
 	"flag"
 
 	"github.com/google/subcommands"
@@ -38,18 +38,17 @@ var (
 	// Docker, and thus should not be changed.
 	rootDir     = flag.String("root", "", "root directory for storage of container state")
 	logFilename = flag.String("log", "", "file path where internal debug information is written, default is stdout")
-	logFormat   = flag.String("log-format", "text", "log format: text (default), json, or json-k8s")
+	logFormat   = flag.String("log-format", "text", "log format: text (default) or json")
 	debug       = flag.Bool("debug", false, "enable debug logging")
 
 	// These flags are unique to runsc, and are used to configure parts of the
 	// system that are not covered by the runtime spec.
 
 	// Debugging flags.
-	debugLog       = flag.String("debug-log", "", "additional location for logs. If it ends with '/', log files are created inside the directory with default names. The following variables are available: %TIMESTAMP%, %COMMAND%.")
-	logPackets     = flag.Bool("log-packets", false, "enable network packet logging")
-	logFD          = flag.Int("log-fd", -1, "file descriptor to log to.  If set, the 'log' flag is ignored.")
-	debugLogFD     = flag.Int("debug-log-fd", -1, "file descriptor to write debug logs to.  If set, the 'debug-log-dir' flag is ignored.")
-	debugLogFormat = flag.String("debug-log-format", "text", "log format: text (default), json, or json-k8s")
+	debugLogDir = flag.String("debug-log-dir", "", "additional location for logs. It creates individual log files per command")
+	logPackets  = flag.Bool("log-packets", false, "enable network packet logging")
+	logFD       = flag.Int("log-fd", -1, "file descriptor to log to.  If set, the 'log' flag is ignored.")
+	debugLogFD  = flag.Int("debug-log-fd", -1, "file descriptor to write debug logs to.  If set, the 'debug-log-dir' flag is ignored.")
 
 	// Debugging flags: strace related
 	strace         = flag.Bool("strace", false, "enable strace")
@@ -63,8 +62,6 @@ var (
 	overlay        = flag.Bool("overlay", false, "wrap filesystem mounts with writable overlay. All modifications are stored in memory inside the sandbox.")
 	watchdogAction = flag.String("watchdog-action", "log", "sets what action the watchdog takes when triggered: log (default), panic.")
 	panicSignal    = flag.Int("panic-signal", -1, "register signal handling that panics. Usually set to SIGUSR2(12) to troubleshoot hangs. -1 disables it.")
-
-	testOnlyAllowRunAsCurrentUserWithoutChroot = flag.Bool("TESTONLY-unsafe-nonroot", false, "TEST ONLY; do not ever use! This skips many security measures that isolate the host from the sandbox.")
 )
 
 // gitRevision is set during linking.
@@ -89,7 +86,6 @@ func main() {
 	subcommands.Register(new(cmd.Restore), "")
 	subcommands.Register(new(cmd.Resume), "")
 	subcommands.Register(new(cmd.Run), "")
-	subcommands.Register(new(cmd.Spec), "")
 	subcommands.Register(new(cmd.Start), "")
 	subcommands.Register(new(cmd.State), "")
 	subcommands.Register(new(cmd.Wait), "")
@@ -135,8 +131,7 @@ func main() {
 		Debug:          *debug,
 		LogFilename:    *logFilename,
 		LogFormat:      *logFormat,
-		DebugLog:       *debugLog,
-		DebugLogFormat: *debugLogFormat,
+		DebugLogDir:    *debugLogDir,
 		FileAccess:     fsAccess,
 		Overlay:        *overlay,
 		Network:        netType,
@@ -146,7 +141,6 @@ func main() {
 		StraceLogSize:  *straceLogSize,
 		WatchdogAction: wa,
 		PanicSignal:    *panicSignal,
-		TestOnlyAllowRunAsCurrentUserWithoutChroot: *testOnlyAllowRunAsCurrentUserWithoutChroot,
 	}
 	if len(*straceSyscalls) != 0 {
 		conf.StraceSyscalls = strings.Split(*straceSyscalls, ",")
@@ -171,34 +165,29 @@ func main() {
 		logFile = f
 	}
 
-	e := newEmitter(*logFormat, logFile)
+	var e log.Emitter
+	switch *logFormat {
+	case "text":
+		e = log.GoogleEmitter{&log.Writer{Next: logFile}}
+	case "json":
+		e = log.JSONEmitter{log.Writer{Next: logFile}}
+	default:
+		cmd.Fatalf("invalid log format %q, must be 'json' or 'text'", *logFormat)
+	}
 
-	subcommand := flag.CommandLine.Arg(0)
 	if *debugLogFD > -1 {
 		f := os.NewFile(uintptr(*debugLogFD), "debug log file")
-
-		// Quick sanity check to make sure no other commands get passed
-		// a log fd (they should use log dir instead).
-		if subcommand != "boot" {
-			cmd.Fatalf("flag --debug-log-fd should only be passed to 'boot' command, but was passed to %q", subcommand)
+		e = log.MultiEmitter{e, log.GoogleEmitter{&log.Writer{Next: f}}}
+	} else if *debugLogDir != "" {
+		if err := os.MkdirAll(*debugLogDir, 0775); err != nil {
+			cmd.Fatalf("error creating dir %q: %v", *debugLogDir, err)
 		}
-
-		// If we are the boot process, then we own our stdio FDs and
-		// can do what we want with them. Since Docker and Containerd
-		// both eat boot's stderr, we dup our stderr to the provided
-		// log FD so that panics will appear in the logs, rather than
-		// just disappear.
-		if err := syscall.Dup2(int(f.Fd()), int(os.Stderr.Fd())); err != nil {
-			cmd.Fatalf("error dup'ing fd %d to stderr: %v", f.Fd(), err)
-		}
-
-		e = log.MultiEmitter{e, newEmitter(*debugLogFormat, f)}
-	} else if *debugLog != "" {
-		f, err := specutils.DebugLogFile(*debugLog, subcommand)
+		subcommand := flag.CommandLine.Arg(0)
+		f, err := specutils.DebugLogFile(*debugLogDir, subcommand)
 		if err != nil {
-			cmd.Fatalf("error opening debug log file in %q: %v", *debugLog, err)
+			cmd.Fatalf("error opening debug log file in %q: %v", *debugLogDir, err)
 		}
-		e = log.MultiEmitter{e, newEmitter(*debugLogFormat, f)}
+		e = log.MultiEmitter{e, log.GoogleEmitter{&log.Writer{Next: f}}}
 	}
 
 	log.SetTarget(e)
@@ -231,19 +220,6 @@ func main() {
 	// Return an error that is unlikely to be used by the application.
 	log.Warningf("Failure to execute command, err: %v", subcmdCode)
 	os.Exit(128)
-}
-
-func newEmitter(format string, logFile io.Writer) log.Emitter {
-	switch format {
-	case "text":
-		return &log.GoogleEmitter{&log.Writer{Next: logFile}}
-	case "json":
-		return &log.JSONEmitter{log.Writer{Next: logFile}}
-	case "json-k8s":
-		return &log.K8sJSONEmitter{log.Writer{Next: logFile}}
-	}
-	cmd.Fatalf("invalid log format %q, must be 'text', 'json', or 'json-k8s'", format)
-	panic("unreachable")
 }
 
 func init() {

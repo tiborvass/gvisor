@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,29 +46,32 @@ const (
 	buckets = 2048
 )
 
+type address [header.IPv4AddressSize]byte
+
 type endpoint struct {
 	nicid         tcpip.NICID
 	id            stack.NetworkEndpointID
+	address       address
 	linkEP        stack.LinkEndpoint
 	dispatcher    stack.TransportDispatcher
 	echoRequests  chan echoRequest
 	fragmentation *fragmentation.Fragmentation
 }
 
-// NewEndpoint creates a new ipv4 endpoint.
-func (p *protocol) NewEndpoint(nicid tcpip.NICID, addr tcpip.Address, linkAddrCache stack.LinkAddressCache, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint) (stack.NetworkEndpoint, *tcpip.Error) {
+func newEndpoint(nicid tcpip.NICID, addr tcpip.Address, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint) *endpoint {
 	e := &endpoint{
 		nicid:         nicid,
-		id:            stack.NetworkEndpointID{LocalAddress: addr},
 		linkEP:        linkEP,
 		dispatcher:    dispatcher,
 		echoRequests:  make(chan echoRequest, 10),
 		fragmentation: fragmentation.NewFragmentation(fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout),
 	}
+	copy(e.address[:], addr)
+	e.id = stack.NetworkEndpointID{LocalAddress: tcpip.Address(e.address[:])}
 
 	go e.echoReplier()
 
-	return e, nil
+	return e
 }
 
 // DefaultTTL is the default time-to-live value for this endpoint.
@@ -119,7 +122,7 @@ func (e *endpoint) WritePacket(r *stack.Route, hdr buffer.Prependable, payload b
 		ID:          uint16(id),
 		TTL:         ttl,
 		Protocol:    uint8(protocol),
-		SrcAddr:     r.LocalAddress,
+		SrcAddr:     tcpip.Address(e.address[:]),
 		DstAddr:     r.RemoteAddress,
 	})
 	ip.SetChecksum(^ip.CalculateChecksum())
@@ -189,6 +192,11 @@ func (p *protocol) MinimumPacketSize() int {
 func (*protocol) ParseAddresses(v buffer.View) (src, dst tcpip.Address) {
 	h := header.IPv4(v)
 	return h.SourceAddress(), h.DestinationAddress()
+}
+
+// NewEndpoint creates a new ipv4 endpoint.
+func (p *protocol) NewEndpoint(nicid tcpip.NICID, addr tcpip.Address, linkAddrCache stack.LinkAddressCache, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint) (stack.NetworkEndpoint, *tcpip.Error) {
+	return newEndpoint(nicid, addr, dispatcher, linkEP), nil
 }
 
 // SetOption implements NetworkProtocol.SetOption.

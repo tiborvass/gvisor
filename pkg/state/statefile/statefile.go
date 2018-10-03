@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,8 +46,6 @@ package statefile
 import (
 	"bytes"
 	"compress/flate"
-	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"hash"
@@ -55,6 +53,8 @@ import (
 	"strings"
 	"time"
 
+	"crypto/hmac"
+	"crypto/sha256"
 	"gvisor.googlesource.com/gvisor/pkg/binary"
 	"gvisor.googlesource.com/gvisor/pkg/compressio"
 )

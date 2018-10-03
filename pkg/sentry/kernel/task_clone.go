@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -200,7 +200,7 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 		ipcns = NewIPCNamespace(userns)
 	}
 
-	tc, err := t.tc.Fork(t, t.k, !opts.NewAddressSpace)
+	tc, err := t.tc.Fork(t, !opts.NewAddressSpace)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -210,9 +210,7 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 		tc.Arch.SetStack(uintptr(opts.Stack))
 	}
 	if opts.SetTLS {
-		if !tc.Arch.SetTLS(uintptr(opts.TLS)) {
-			return 0, nil, syserror.EPERM
-		}
+		tc.Arch.StateData().Regs.Fs_base = uint64(opts.TLS)
 	}
 
 	var fsc *FSContext
@@ -243,7 +241,7 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 		if opts.NewSignalHandlers {
 			sh = sh.Fork()
 		}
-		tg = t.k.newThreadGroup(pidns, sh, opts.TerminationSignal, tg.limits.GetCopy(), t.k.monotonicClock)
+		tg = NewThreadGroup(pidns, sh, opts.TerminationSignal, tg.limits.GetCopy(), t.k.monotonicClock)
 	}
 
 	cfg := &TaskConfig{

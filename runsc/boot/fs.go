@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -81,11 +81,9 @@ func (f *fdDispenser) empty() bool {
 	return len(f.fds) == 0
 }
 
-// setupRootContainerFS creates a mount namespace containing the root filesystem
+// createMountNamespace creates a mount namespace containing the root filesystem
 // and all mounts. 'rootCtx' is used to walk directories to find mount points.
-// 'setMountNS' is called after namespace is created. It must set the mount NS
-// to 'rootCtx'.
-func setupRootContainerFS(userCtx context.Context, rootCtx context.Context, spec *specs.Spec, conf *Config, goferFDs []int, setMountNS func(*fs.MountNamespace)) error {
+func createMountNamespace(userCtx context.Context, rootCtx context.Context, spec *specs.Spec, conf *Config, goferFDs []int) (*fs.MountNamespace, error) {
 	mounts := compileMounts(spec)
 
 	// Create a tmpfs mount where we create and mount a root filesystem for
@@ -98,24 +96,27 @@ func setupRootContainerFS(userCtx context.Context, rootCtx context.Context, spec
 	fds := &fdDispenser{fds: goferFDs}
 	rootInode, err := createRootMount(rootCtx, spec, conf, fds, mounts)
 	if err != nil {
-		return fmt.Errorf("creating root mount: %v", err)
+		return nil, fmt.Errorf("failed to create root mount: %v", err)
 	}
 	mns, err := fs.NewMountNamespace(userCtx, rootInode)
 	if err != nil {
-		return fmt.Errorf("creating root mount namespace: %v", err)
+		return nil, fmt.Errorf("failed to create root mount namespace: %v", err)
 	}
-	setMountNS(mns)
 
-	root := mns.Root()
-	defer root.DecRef()
-	return mountSubmounts(rootCtx, conf, mns, root, mounts, fds)
+	if err := setMounts(rootCtx, conf, mns, fds, mounts); err != nil {
+		return nil, fmt.Errorf("failed to configure mounts: %v", err)
+	}
+	if !fds.empty() {
+		return nil, fmt.Errorf("not all mount points were consumed, remaining: %v", fds)
+	}
+	return mns, nil
 }
 
 // compileMounts returns the supported mounts from the mount spec, adding any
 // mandatory mounts that are required by the OCI specification.
 func compileMounts(spec *specs.Spec) []specs.Mount {
-	// Keep track of whether proc and sys were mounted.
-	var procMounted, sysMounted bool
+	// Keep track of whether proc, sys, and tmp were mounted.
+	var procMounted, sysMounted, tmpMounted bool
 	var mounts []specs.Mount
 
 	// Always mount /dev.
@@ -141,6 +142,8 @@ func compileMounts(spec *specs.Spec) []specs.Mount {
 			procMounted = true
 		case "/sys":
 			sysMounted = true
+		case "/tmp":
+			tmpMounted = true
 		}
 	}
 
@@ -160,11 +163,36 @@ func compileMounts(spec *specs.Spec) []specs.Mount {
 		})
 	}
 
+	// Technically we don't have to mount tmpfs at /tmp, as we could just
+	// rely on the host /tmp, but this is a nice optimization, and fixes
+	// some apps that call mknod in /tmp.
+	if !tmpMounted {
+		// TODO: If the host /tmp (or a mount at /tmp) has
+		// files in it, we should overlay our tmpfs implementation over
+		// that. Until then, the /tmp mount will always appear empty at
+		// container creation.
+		mandatoryMounts = append(mandatoryMounts, specs.Mount{
+			Type:        tmpfs,
+			Destination: "/tmp",
+		})
+	}
+
 	// The mandatory mounts should be ordered right after the root, in case
 	// there are submounts of these mandatory mounts already in the spec.
 	mounts = append(mounts[:0], append(mandatoryMounts, mounts[0:]...)...)
 
 	return mounts
+}
+
+// setMounts iterates over mounts and mounts them in the specified
+// mount namespace.
+func setMounts(ctx context.Context, conf *Config, mns *fs.MountNamespace, fds *fdDispenser, mounts []specs.Mount) error {
+	for _, m := range mounts {
+		if err := mountSubmount(ctx, conf, mns, fds, m, mounts, m.Destination); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // createRootMount creates the root filesystem.
@@ -179,11 +207,11 @@ func createRootMount(ctx context.Context, spec *specs.Spec, conf *Config, fds *f
 
 	fd := fds.remove()
 	log.Infof("Mounting root over 9P, ioFD: %d", fd)
-	p9FS := mustFindFilesystem("9p")
+	hostFS := mustFindFilesystem("9p")
 	opts := p9MountOptions(fd, conf.FileAccess)
-	rootInode, err = p9FS.Mount(ctx, rootDevice, mf, strings.Join(opts, ","))
+	rootInode, err = hostFS.Mount(ctx, rootDevice, mf, strings.Join(opts, ","))
 	if err != nil {
-		return nil, fmt.Errorf("creating root mount point: %v", err)
+		return nil, fmt.Errorf("failed to generate root mount point: %v", err)
 	}
 
 	// We need to overlay the root on top of a ramfs with stub directories
@@ -192,7 +220,7 @@ func createRootMount(ctx context.Context, spec *specs.Spec, conf *Config, fds *f
 	submounts := append(subtargets("/", mounts), "/dev", "/sys", "/proc", "/tmp")
 	rootInode, err = addSubmountOverlay(ctx, rootInode, submounts)
 	if err != nil {
-		return nil, fmt.Errorf("adding submount overlay: %v", err)
+		return nil, fmt.Errorf("error adding submount overlay: %v", err)
 	}
 
 	if conf.Overlay && !spec.Root.Readonly {
@@ -204,7 +232,7 @@ func createRootMount(ctx context.Context, spec *specs.Spec, conf *Config, fds *f
 		}
 	}
 
-	log.Infof("Mounted %q to %q type root", spec.Root.Path, "/")
+	log.Infof("Mounted %q to \"/\" type root", spec.Root.Path)
 	return rootInode, nil
 }
 
@@ -222,7 +250,7 @@ func addOverlay(ctx context.Context, conf *Config, lower *fs.Inode, name string,
 	// Create overlay on top of mount dir.
 	upper, err := tmpFS.Mount(ctx, name+"-upper", lowerFlags, "")
 	if err != nil {
-		return nil, fmt.Errorf("creating tmpfs overlay: %v", err)
+		return nil, fmt.Errorf("failed to create tmpfs overlay: %v", err)
 	}
 	return fs.NewOverlayRoot(ctx, upper, lower, lowerFlags)
 }
@@ -266,28 +294,7 @@ func getMountNameAndOptions(conf *Config, m specs.Mount, fds *fdDispenser) (stri
 	return fsName, opts, useOverlay, err
 }
 
-func mountSubmounts(ctx context.Context, conf *Config, mns *fs.MountNamespace, root *fs.Dirent, mounts []specs.Mount, fds *fdDispenser) error {
-	for _, m := range mounts {
-		if err := mountSubmount(ctx, conf, mns, root, fds, m, mounts); err != nil {
-			return fmt.Errorf("mount submount %q: %v", m.Destination, err)
-		}
-	}
-
-	if err := mountTmp(ctx, conf, mns, root, fds, mounts); err != nil {
-		return fmt.Errorf("mount submount %q: %v", "tmp", err)
-	}
-
-	if !fds.empty() {
-		return fmt.Errorf("not all mount points were consumed, remaining: %v", fds)
-	}
-	return nil
-}
-
-// mountSubmount mounts volumes inside the container's root. Because mounts may
-// be readonly, a lower ramfs overlay is added to create the mount point dir.
-// Another overlay is added with tmpfs on top if Config.Overlay is true.
-// 'm.Destination' must be an absolute path with '..' and symlinks resolved.
-func mountSubmount(ctx context.Context, conf *Config, mns *fs.MountNamespace, root *fs.Dirent, fds *fdDispenser, m specs.Mount, mounts []specs.Mount) error {
+func mountSubmount(ctx context.Context, conf *Config, mns *fs.MountNamespace, fds *fdDispenser, m specs.Mount, mounts []specs.Mount, dest string) error {
 	// Map mount type to filesystem name, and parse out the options that we are
 	// capable of dealing with.
 	fsName, opts, useOverlay, err := getMountNameAndOptions(conf, m, fds)
@@ -311,7 +318,7 @@ func mountSubmount(ctx context.Context, conf *Config, mns *fs.MountNamespace, ro
 
 	inode, err := filesystem.Mount(ctx, mountDevice(m), mf, strings.Join(opts, ","))
 	if err != nil {
-		return fmt.Errorf("creating mount with source %q: %v", m.Source, err)
+		return fmt.Errorf("failed to create mount with source %q: %v", m.Source, err)
 	}
 
 	// If there are submounts, we need to overlay the mount on top of a
@@ -321,7 +328,7 @@ func mountSubmount(ctx context.Context, conf *Config, mns *fs.MountNamespace, ro
 		log.Infof("Adding submount overlay over %q", m.Destination)
 		inode, err = addSubmountOverlay(ctx, inode, submounts)
 		if err != nil {
-			return fmt.Errorf("adding submount overlay: %v", err)
+			return fmt.Errorf("error adding submount overlay: %v", err)
 		}
 	}
 
@@ -333,17 +340,60 @@ func mountSubmount(ctx context.Context, conf *Config, mns *fs.MountNamespace, ro
 		}
 	}
 
-	maxTraversals := uint(0)
-	dirent, err := mns.FindInode(ctx, root, root, m.Destination, &maxTraversals)
+	// Create destination in case it doesn't exist. This is required, in addition
+	// to 'addSubmountOverlay', in case there are symlinks to create directories
+	// in the right location, e.g.
+	//   mount: /var/run/secrets, may be created in '/run/secrets' if
+	//   '/var/run' => '/var'.
+	if err := mkdirAll(ctx, mns, dest); err != nil {
+		return err
+	}
+
+	root := mns.Root()
+	defer root.DecRef()
+	dirent, err := mns.FindInode(ctx, root, nil, dest, linux.MaxSymlinkTraversals)
 	if err != nil {
-		return fmt.Errorf("can't find mount destination %q: %v", m.Destination, err)
+		return fmt.Errorf("failed to find mount destination %q: %v", dest, err)
 	}
 	defer dirent.DecRef()
 	if err := mns.Mount(ctx, dirent, inode); err != nil {
-		return fmt.Errorf("mount %q error: %v", m.Destination, err)
+		return fmt.Errorf("failed to mount at destination %q: %v", dest, err)
 	}
 
-	log.Infof("Mounted %q to %q type %s", m.Source, m.Destination, m.Type)
+	log.Infof("Mounted %q to %q type %s", m.Source, dest, m.Type)
+	return nil
+}
+
+func mkdirAll(ctx context.Context, mns *fs.MountNamespace, path string) error {
+	log.Infof("mkdirAll called with path %s", path)
+	root := mns.Root()
+	defer root.DecRef()
+
+	// Starting at the root, walk the path.
+	parent := root
+	ps := strings.Split(filepath.Clean(path), string(filepath.Separator))
+	for _, pathElem := range ps {
+		if pathElem == "" {
+			// This will be case for the first and last element, if the path
+			// begins or ends with '/'. Note that we always treat the path as
+			// absolute, regardless of what the first character contains.
+			continue
+		}
+		d, err := mns.FindInode(ctx, root, parent, pathElem, fs.DefaultTraversalLimit)
+		if err == syserror.ENOENT {
+			// If we encounter a path that does not exist, then
+			// create it.
+			if err := parent.CreateDirectory(ctx, root, pathElem, fs.FilePermsFromMode(0755)); err != nil {
+				return fmt.Errorf("failed to create directory %q: %v", pathElem, err)
+			}
+			if d, err = parent.Walk(ctx, root, pathElem); err != nil {
+				return fmt.Errorf("walk to %q failed: %v", pathElem, err)
+			}
+		} else if err != nil {
+			return fmt.Errorf("failed to find inode %q: %v", pathElem, err)
+		}
+		parent = d
+	}
 	return nil
 }
 
@@ -385,6 +435,14 @@ func parseAndFilterOptions(opts []string, allowedKeys ...string) ([]string, erro
 		}
 	}
 	return out, nil
+}
+
+func destinations(mounts []specs.Mount, extra ...string) []string {
+	var ds []string
+	for _, m := range mounts {
+		ds = append(ds, m.Destination)
+	}
+	return append(ds, extra...)
 }
 
 // mountDevice returns a device string based on the fs type and target
@@ -448,27 +506,11 @@ func createRestoreEnvironment(spec *specs.Spec, conf *Config, fds *fdDispenser) 
 	renv.MountSources[rootFsName] = append(renv.MountSources[rootFsName], rootMount)
 
 	// Add submounts.
-	var tmpMounted bool
 	for _, m := range compileMounts(spec) {
 		if err := addRestoreMount(conf, renv, m, fds); err != nil {
 			return nil, err
 		}
-		if filepath.Clean(m.Destination) == "/tmp" {
-			tmpMounted = true
-		}
 	}
-
-	// TODO: handle '/tmp' properly (see mountTmp()).
-	if !tmpMounted {
-		tmpMount := specs.Mount{
-			Type:        tmpfs,
-			Destination: "/tmp",
-		}
-		if err := addRestoreMount(conf, renv, tmpMount, fds); err != nil {
-			return nil, err
-		}
-	}
-
 	return renv, nil
 }
 
@@ -500,14 +542,15 @@ func mustFindFilesystem(name string) fs.Filesystem {
 // addSubmountOverlay overlays the inode over a ramfs tree containing the given
 // paths.
 func addSubmountOverlay(ctx context.Context, inode *fs.Inode, submounts []string) (*fs.Inode, error) {
-	msrc := fs.NewPseudoMountSource()
-	mountTree, err := ramfs.MakeDirectoryTree(ctx, msrc, submounts)
+	// There is no real filesystem backing this ramfs tree, so we pass in
+	// "nil" here.
+	mountTree, err := ramfs.MakeDirectoryTree(ctx, fs.NewNonCachingMountSource(nil, fs.MountSourceFlags{}), submounts)
 	if err != nil {
-		return nil, fmt.Errorf("creating mount tree: %v", err)
+		return nil, fmt.Errorf("error creating mount tree: %v", err)
 	}
 	overlayInode, err := fs.NewOverlayRoot(ctx, inode, mountTree, fs.MountSourceFlags{})
 	if err != nil {
-		return nil, fmt.Errorf("adding mount overlay: %v", err)
+		return nil, fmt.Errorf("failed to make mount overlay: %v", err)
 	}
 	return overlayInode, err
 }
@@ -544,7 +587,7 @@ func setupContainerFS(procArgs *kernel.CreateProcessArgs, spec *specs.Spec, conf
 	// fd.
 	fdm, err := createFDMap(ctx, k, ls, console, stdioFDs)
 	if err != nil {
-		return fmt.Errorf("importing fds: %v", err)
+		return fmt.Errorf("error importing fds: %v", err)
 	}
 
 	// CreateProcess takes a reference on FDMap if successful. We
@@ -565,64 +608,61 @@ func setupContainerFS(procArgs *kernel.CreateProcessArgs, spec *specs.Spec, conf
 	// namespace.
 	mns := k.RootMountNamespace()
 	if mns == nil {
-		// Setup the root container.
-		return setupRootContainerFS(ctx, rootCtx, spec, conf, goferFDs, func(mns *fs.MountNamespace) {
-			k.SetRootMountNamespace(mns)
-		})
+		// Create the virtual filesystem.
+		mns, err := createMountNamespace(ctx, rootCtx, spec, conf, goferFDs)
+		if err != nil {
+			return fmt.Errorf("error creating mounts: %v", err)
+		}
+		k.SetRootMountNamespace(mns)
+		return nil
 	}
 
 	// Setup a child container.
-	log.Infof("Creating new process in child container.")
-	globalRoot := mns.Root()
-	defer globalRoot.DecRef()
-
-	// Create mount point for the container's rootfs.
-	maxTraversals := uint(0)
-	contDir, err := mns.FindInode(ctx, globalRoot, nil, ChildContainersDir, &maxTraversals)
-	if err != nil {
-		return fmt.Errorf("couldn't find child container dir %q: %v", ChildContainersDir, err)
-	}
-	if err := contDir.CreateDirectory(ctx, globalRoot, cid, fs.FilePermsFromMode(0755)); err != nil {
-		return fmt.Errorf("create directory %q: %v", cid, err)
-	}
-	containerRoot, err := contDir.Walk(ctx, globalRoot, cid)
-	if err != nil {
-		return fmt.Errorf("walk to %q failed: %v", cid, err)
-	}
-	defer containerRoot.DecRef()
 
 	// Create the container's root filesystem mount.
-	fds := &fdDispenser{fds: goferFDs}
+	log.Infof("Creating new process in child container.")
+	fds := &fdDispenser{fds: append([]int{}, goferFDs...)}
 	rootInode, err := createRootMount(rootCtx, spec, conf, fds, nil)
 	if err != nil {
-		return fmt.Errorf("creating filesystem for container: %v", err)
+		return fmt.Errorf("error creating filesystem for container: %v", err)
 	}
 
-	// Mount the container's root filesystem to the newly created mount point.
-	if err := mns.Mount(ctx, containerRoot, rootInode); err != nil {
-		return fmt.Errorf("mount container root: %v", err)
+	// Make directories for submounts within the container.
+	rootDir := mns.Root()
+	defer rootDir.DecRef()
+	containerRoot := filepath.Join(ChildContainersDir, cid)
+	mkdirAll(ctx, mns, containerRoot)
+
+	// Mount the container's root filesystem to the newly created
+	// mount point.
+	containerRootDirent, err := mns.FindInode(ctx, rootDir, nil, containerRoot, linux.MaxSymlinkTraversals)
+	if err != nil {
+		return fmt.Errorf("failed to find mount destination: %q: %v", containerRoot, err)
 	}
+	if err := mns.Mount(ctx, containerRootDirent, rootInode); err != nil {
+		return fmt.Errorf("failed to mount at destination %q: %v", containerRoot, err)
+	}
+	containerRootDirent.DecRef()
 
 	// We have to re-walk to the dirent to find the mounted
 	// directory. The old dirent is invalid at this point.
-	containerRoot, err = contDir.Walk(ctx, globalRoot, cid)
+	containerRootDirent, err = mns.FindInode(ctx, rootDir, nil, containerRoot, linux.MaxSymlinkTraversals)
 	if err != nil {
-		return fmt.Errorf("find container mount point %q: %v", cid, err)
+		return fmt.Errorf("failed to find mount destination2: %q: %v", containerRoot, err)
 	}
-	cu := specutils.MakeCleanup(func() { containerRoot.DecRef() })
-	defer cu.Clean()
-
-	log.Infof("Mounted child's root fs to %q", filepath.Join(ChildContainersDir, cid))
-
-	// Set process root here, so 'rootCtx.Value(CtxRoot)' will return it.
-	procArgs.Root = containerRoot
+	log.Infof("Mounted child's root fs to %q", containerRoot)
 
 	// Mount all submounts.
 	mounts := compileMounts(spec)
-	if err := mountSubmounts(rootCtx, conf, mns, containerRoot, mounts, fds); err != nil {
-		return err
+	for _, m := range mounts {
+		dest := filepath.Join(containerRoot, m.Destination)
+		if err := mountSubmount(rootCtx, conf, k.RootMountNamespace(), fds, m, mounts, dest); err != nil {
+			return fmt.Errorf("error mounting filesystem for container: %v", err)
+		}
 	}
-	cu.Release()
+
+	// Set the procArgs root directory.
+	procArgs.Root = containerRootDirent
 	return nil
 }
 
@@ -630,10 +670,9 @@ func setupContainerFS(procArgs *kernel.CreateProcessArgs, spec *specs.Spec, conf
 // executable matching the procArgs.Argv[0].
 func setExecutablePath(ctx context.Context, mns *fs.MountNamespace, procArgs *kernel.CreateProcessArgs) error {
 	paths := fs.GetPath(procArgs.Envv)
-	exe := procArgs.Argv[0]
-	f, err := mns.ResolveExecutablePath(ctx, procArgs.WorkingDirectory, exe, paths)
+	f, err := mns.ResolveExecutablePath(ctx, procArgs.WorkingDirectory, procArgs.Argv[0], paths)
 	if err != nil {
-		return fmt.Errorf("searching for executable %q, cwd: %q, $PATH=%q: %v", exe, procArgs.WorkingDirectory, strings.Join(paths, ":"), err)
+		return err
 	}
 	procArgs.Filename = f
 	return nil
@@ -642,32 +681,18 @@ func setExecutablePath(ctx context.Context, mns *fs.MountNamespace, procArgs *ke
 // destroyContainerFS cleans up the filesystem by unmounting all mounts for the
 // given container and deleting the container root directory.
 func destroyContainerFS(ctx context.Context, cid string, k *kernel.Kernel) error {
-	defer func() {
-		// Flushing dirent references triggers many async close
-		// operations. We must wait for those to complete before
-		// returning, otherwise the caller may kill the gofer before
-		// they complete, causing a cascade of failing RPCs.
-		//
-		// This must take place in the first deferred function, so that
-		// it runs after all the other deferred DecRef() calls in this
-		// function.
-		log.Infof("Waiting for async filesystem operations to complete")
-		fs.AsyncBarrier()
-	}()
-
 	// First get a reference to the container root directory.
 	mns := k.RootMountNamespace()
 	mnsRoot := mns.Root()
 	defer mnsRoot.DecRef()
 	containerRoot := path.Join(ChildContainersDir, cid)
-	maxTraversals := uint(0)
-	containerRootDirent, err := mns.FindInode(ctx, mnsRoot, nil, containerRoot, &maxTraversals)
+	containerRootDirent, err := mns.FindInode(ctx, mnsRoot, nil, containerRoot, linux.MaxSymlinkTraversals)
 	if err == syserror.ENOENT {
 		// Container must have been destroyed already. That's fine.
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("finding container root directory %q: %v", containerRoot, err)
+		return fmt.Errorf("error finding container root directory %q: %v", containerRoot, err)
 	}
 	defer containerRootDirent.DecRef()
 
@@ -678,12 +703,11 @@ func destroyContainerFS(ctx context.Context, cid string, k *kernel.Kernel) error
 		defer root.DecRef()
 
 		// Do a best-effort unmount by flushing the refs and unmount
-		// with "detach only = true". Unmount returns EINVAL when the mount point
-		// doesn't exist, i.e. it has already been unmounted.
+		// with "detach only = true".
 		log.Debugf("Unmounting container submount %q", root.BaseName())
 		m.FlushDirentRefs()
-		if err := mns.Unmount(ctx, root, true /* detach only */); err != nil && err != syserror.EINVAL {
-			return fmt.Errorf("unmounting container submount %q: %v", root.BaseName(), err)
+		if err := mns.Unmount(ctx, root, true /* detach only */); err != nil {
+			return fmt.Errorf("error unmounting container submount %q: %v", root.BaseName(), err)
 		}
 	}
 
@@ -691,76 +715,27 @@ func destroyContainerFS(ctx context.Context, cid string, k *kernel.Kernel) error
 	log.Debugf("Unmounting container root %q", containerRoot)
 	containerRootDirent.Inode.MountSource.FlushDirentRefs()
 	if err := mns.Unmount(ctx, containerRootDirent, true /* detach only */); err != nil {
-		return fmt.Errorf("unmounting container root mount %q: %v", containerRootDirent.BaseName(), err)
+		return fmt.Errorf("error unmounting container root mount %q: %v", containerRootDirent.BaseName(), err)
 	}
 
 	// Get a reference to the parent directory and remove the root
 	// container directory.
-	maxTraversals = 0
-	containersDirDirent, err := mns.FindInode(ctx, mnsRoot, nil, ChildContainersDir, &maxTraversals)
+	containersDirDirent, err := mns.FindInode(ctx, mnsRoot, nil, ChildContainersDir, linux.MaxSymlinkTraversals)
 	if err != nil {
-		return fmt.Errorf("finding containers directory %q: %v", ChildContainersDir, err)
+		return fmt.Errorf("error finding containers directory %q: %v", ChildContainersDir, err)
 	}
 	defer containersDirDirent.DecRef()
 	log.Debugf("Deleting container root %q", containerRoot)
 	if err := containersDirDirent.RemoveDirectory(ctx, mnsRoot, cid); err != nil {
-		return fmt.Errorf("removing directory %q: %v", containerRoot, err)
+		return fmt.Errorf("error removing directory %q: %v", containerRoot, err)
 	}
+
+	// Flushing dirent references triggers many async close operations. We
+	// must wait for those to complete before returning, otherwise the
+	// caller may kill the gofer before they complete, causing a cascade of
+	// failing RPCs.
+	log.Infof("Waiting for async filesystem operations to complete")
+	fs.AsyncBarrier()
 
 	return nil
-}
-
-// mountTmp mounts an internal tmpfs at '/tmp' if it's safe to do so.
-// Technically we don't have to mount tmpfs at /tmp, as we could just rely on
-// the host /tmp, but this is a nice optimization, and fixes some apps that call
-// mknod in /tmp. It's unsafe to mount tmpfs if:
-//   1. /tmp is mounted explictly: we should not override user's wish
-//   2. /tmp is not empty: mounting tmpfs would hide existing files in /tmp
-//
-// Note that when there are submounts inside of '/tmp', directories for the
-// mount points must be present, making '/tmp' not empty anymore.
-func mountTmp(ctx context.Context, conf *Config, mns *fs.MountNamespace, root *fs.Dirent, fds *fdDispenser, mounts []specs.Mount) error {
-	for _, m := range mounts {
-		if filepath.Clean(m.Destination) == "/tmp" {
-			log.Debugf("Explict %q mount found, skipping internal tmpfs, mount: %+v", "/tmp", m)
-			return nil
-		}
-	}
-
-	maxTraversals := uint(0)
-	tmp, err := mns.FindInode(ctx, root, root, "tmp", &maxTraversals)
-	switch err {
-	case nil:
-		// Found '/tmp' in filesystem, check if it's empty.
-		defer tmp.DecRef()
-		f, err := tmp.Inode.GetFile(ctx, tmp, fs.FileFlags{Read: true, Directory: true})
-		if err != nil {
-			return err
-		}
-		defer f.DecRef()
-		serializer := &fs.CollectEntriesSerializer{}
-		if err := f.Readdir(ctx, serializer); err != nil {
-			return err
-		}
-		// If more than "." and ".." is found, skip internal tmpfs to prevent hiding
-		// existing files.
-		if len(serializer.Order) > 2 {
-			log.Infof("Skipping internal tmpfs on top %q, because it's not empty", "/tmp")
-			return nil
-		}
-		log.Infof("Mounting internal tmpfs on top of empty %q", "/tmp")
-		fallthrough
-
-	case syserror.ENOENT:
-		// No '/tmp' found (or fallthrough from above). Safe to mount internal
-		// tmpfs.
-		tmpMount := specs.Mount{
-			Type:        tmpfs,
-			Destination: "/tmp",
-		}
-		return mountSubmount(ctx, conf, mns, root, fds, tmpMount, mounts)
-
-	default:
-		return err
-	}
 }

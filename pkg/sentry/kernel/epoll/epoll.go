@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -99,12 +99,12 @@ func (p *pollEntry) WeakRefGone() {
 //
 // +stateify savable
 type EventPoll struct {
-	fsutil.FilePipeSeek      `state:"zerovalue"`
-	fsutil.FileNotDirReaddir `state:"zerovalue"`
-	fsutil.FileNoFsync       `state:"zerovalue"`
-	fsutil.FileNoopFlush     `state:"zerovalue"`
-	fsutil.FileNoMMap        `state:"zerovalue"`
-	fsutil.FileNoIoctl       `state:"zerovalue"`
+	fsutil.PipeSeek      `state:"zerovalue"`
+	fsutil.NotDirReaddir `state:"zerovalue"`
+	fsutil.NoFsync       `state:"zerovalue"`
+	fsutil.NoopFlush     `state:"zerovalue"`
+	fsutil.NoMMap        `state:"zerovalue"`
+	fsutil.NoIoctl       `state:"zerovalue"`
 
 	// Wait queue is used to notify interested parties when the event poll
 	// object itself becomes readable or writable.

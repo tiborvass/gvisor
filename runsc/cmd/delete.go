@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"os"
 
+	"context"
 	"flag"
 	"github.com/google/subcommands"
 	"gvisor.googlesource.com/gvisor/pkg/log"
@@ -74,13 +74,13 @@ func (d *Delete) execute(ids []string, conf *boot.Config) error {
 				log.Warningf("couldn't find container %q: %v", id, err)
 				return nil
 			}
-			return fmt.Errorf("loading container %q: %v", id, err)
+			return fmt.Errorf("error loading container %q: %v", id, err)
 		}
 		if !d.force && c.Status != container.Created && c.Status != container.Stopped {
 			return fmt.Errorf("cannot delete container that is not stopped without --force flag")
 		}
 		if err := c.Destroy(); err != nil {
-			return fmt.Errorf("destroying container: %v", err)
+			return fmt.Errorf("error destroying container: %v", err)
 		}
 	}
 	return nil

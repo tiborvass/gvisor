@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -247,7 +247,7 @@ func (*runExitMain) execute(t *Task) taskRunState {
 		t.tg.signalHandlers.mu.Unlock()
 		if !signaled {
 			if _, err := t.CopyOut(t.cleartid, ThreadID(0)); err == nil {
-				t.Futex().Wake(t, t.cleartid, false, ^uint32(0), 1)
+				t.Futex().Wake(uintptr(t.cleartid), ^uint32(0), 1)
 			}
 			// If the CopyOut fails, there's nothing we can do.
 		}
@@ -675,6 +675,9 @@ func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 		t.tg.ioUsage.Accumulate(t.ioUsage)
 		t.tg.signalHandlers.mu.Lock()
 		t.tg.tasks.Remove(t)
+		if t.tg.lastTimerSignalTask == t {
+			t.tg.lastTimerSignalTask = nil
+		}
 		t.tg.tasksCount--
 		tc := t.tg.tasksCount
 		t.tg.signalHandlers.mu.Unlock()

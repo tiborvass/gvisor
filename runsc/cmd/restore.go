@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@
 package cmd
 
 import (
-	"context"
 	"path/filepath"
 	"syscall"
 
+	"context"
 	"flag"
 	"github.com/google/subcommands"
 	"gvisor.googlesource.com/gvisor/runsc/boot"
@@ -84,7 +84,7 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...interface{
 	}
 	spec, err := specutils.ReadSpec(bundleDir)
 	if err != nil {
-		Fatalf("reading spec: %v", err)
+		Fatalf("error reading spec: %v", err)
 	}
 	specutils.LogSpec(spec)
 
@@ -96,15 +96,15 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...interface{
 
 	c, err := container.Load(conf.RootDir, id)
 	if err != nil {
-		Fatalf("loading container: %v", err)
+		Fatalf("error loading container: %v", err)
 	}
 	if err := c.Restore(spec, conf, restoreFile); err != nil {
-		Fatalf("restoring container: %v", err)
+		Fatalf("error restoring container: %v", err)
 	}
 
 	ws, err := c.Wait()
 	if err != nil {
-		Fatalf("running container: %v", err)
+		Fatalf("error running container: %v", err)
 	}
 	*waitStatus = ws
 

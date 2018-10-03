@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,13 +35,6 @@ func vCPUPtr(addr uintptr) *vCPU {
 //go:nosplit
 func bytePtr(addr uintptr) *byte {
 	return (*byte)(unsafe.Pointer(addr))
-}
-
-// uintptrValue returns a uintptr for the given address.
-//
-//go:nosplit
-func uintptrValue(addr *byte) uintptr {
-	return (uintptr)(unsafe.Pointer(addr))
 }
 
 // bluepillHandler is called from the signal stub.
@@ -120,11 +113,9 @@ func bluepillHandler(context unsafe.Pointer) {
 
 		switch c.runData.exitReason {
 		case _KVM_EXIT_EXCEPTION:
-			c.die(bluepillArchContext(context), "exception")
-			return
+			throw("exception")
 		case _KVM_EXIT_IO:
-			c.die(bluepillArchContext(context), "I/O")
-			return
+			throw("I/O")
 		case _KVM_EXIT_INTERNAL_ERROR:
 			// An internal error is typically thrown when emulation
 			// fails. This can occur via the MMIO path below (and
@@ -132,11 +123,9 @@ func bluepillHandler(context unsafe.Pointer) {
 			// are not mapped). We would actually prefer that no
 			// emulation occur, and don't mind at all if it fails.
 		case _KVM_EXIT_HYPERCALL:
-			c.die(bluepillArchContext(context), "hypercall")
-			return
+			throw("hypercall")
 		case _KVM_EXIT_DEBUG:
-			c.die(bluepillArchContext(context), "debug")
-			return
+			throw("debug")
 		case _KVM_EXIT_HLT:
 			// Copy out registers.
 			bluepillArchExit(c, bluepillArchContext(context))
@@ -156,11 +145,9 @@ func bluepillHandler(context unsafe.Pointer) {
 			atomic.AddUint32(&c.faults, 1)
 
 			// For MMIO, the physical address is the first data item.
-			physical := uintptr(c.runData.data[0])
-			virtual, ok := handleBluepillFault(c.machine, physical)
+			virtual, ok := handleBluepillFault(c.machine, uintptr(c.runData.data[0]))
 			if !ok {
-				c.die(bluepillArchContext(context), "invalid physical address")
-				return
+				throw("physical address not valid")
 			}
 
 			// We now need to fill in the data appropriately. KVM
@@ -171,7 +158,7 @@ func bluepillHandler(context unsafe.Pointer) {
 			// not create invalid page table mappings.
 			data := (*[8]byte)(unsafe.Pointer(&c.runData.data[1]))
 			length := (uintptr)((uint32)(c.runData.data[2]))
-			write := (uint8)(((c.runData.data[2] >> 32) & 0xff)) != 0
+			write := (uint8)((c.runData.data[2] >> 32 & 0xff)) != 0
 			for i := uintptr(0); i < length; i++ {
 				b := bytePtr(uintptr(virtual) + i)
 				if write {
@@ -195,14 +182,11 @@ func bluepillHandler(context unsafe.Pointer) {
 			// Clear previous injection request.
 			c.runData.requestInterruptWindow = 0
 		case _KVM_EXIT_SHUTDOWN:
-			c.die(bluepillArchContext(context), "shutdown")
-			return
+			throw("shutdown")
 		case _KVM_EXIT_FAIL_ENTRY:
-			c.die(bluepillArchContext(context), "entry failed")
-			return
+			throw("entry failed")
 		default:
-			c.die(bluepillArchContext(context), "unknown")
-			return
+			throw("unknown failure")
 		}
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 Google Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -75,19 +75,17 @@ var (
 	// ErrNoTransport is returned when there is no 'trans' option.
 	ErrNoTransport = errors.New("missing required option: 'trans='")
 
-	// ErrFileNoReadFD is returned when there is no 'rfdno' option.
-	ErrFileNoReadFD = errors.New("missing required option: 'rfdno='")
+	// ErrNoReadFD is returned when there is no 'rfdno' option.
+	ErrNoReadFD = errors.New("missing required option: 'rfdno='")
 
-	// ErrFileNoWriteFD is returned when there is no 'wfdno' option.
-	ErrFileNoWriteFD = errors.New("missing required option: 'wfdno='")
+	// ErrNoWriteFD is returned when there is no 'wfdno' option.
+	ErrNoWriteFD = errors.New("missing required option: 'wfdno='")
 )
 
 // filesystem is a 9p client.
 //
 // +stateify savable
 type filesystem struct{}
-
-var _ fs.Filesystem = (*filesystem)(nil)
 
 func init() {
 	fs.RegisterFilesystem(&filesystem{})
@@ -162,14 +160,14 @@ func options(data string) (opts, error) {
 	// Check for the required 'rfdno=' option.
 	srfd, ok := options[readFDKey]
 	if !ok {
-		return o, ErrFileNoReadFD
+		return o, ErrNoReadFD
 	}
 	delete(options, readFDKey)
 
 	// Check for the required 'wfdno=' option.
 	swfd, ok := options[writeFDKey]
 	if !ok {
-		return o, ErrFileNoWriteFD
+		return o, ErrNoWriteFD
 	}
 	delete(options, writeFDKey)
 
