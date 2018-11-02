@@ -6,7 +6,7 @@ go_library(
     name = "context",
     srcs = ["context.go"],
     importpath = "gvisor.googlesource.com/gvisor/pkg/sentry/context",
-    visibility = ["//pkg/sentry:internal"],
+    visibility = ["//visibility:public"],
     deps = [
         "//pkg/amutex",
         "//pkg/log",

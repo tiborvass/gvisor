@@ -6,6 +6,7 @@ go_binary(
     name = "hellorootless",
     srcs = [
         "main.go",
+	"kernel.go",
     ],
     pure = "on",
     visibility = [
@@ -18,6 +19,8 @@ go_binary(
 	"//pkg/rand",
 	"//pkg/abi/linux",
 	"//pkg/cpuid",
+	"//pkg/sentry/context",
+	"//pkg/sentry/fs",
 	"//pkg/sentry/kernel",
 	"//pkg/sentry/usage",
 	"//pkg/sentry/platform/ptrace",

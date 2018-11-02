@@ -42,7 +42,7 @@ go_library(
         "sync.go",
     ],
     importpath = "gvisor.googlesource.com/gvisor/pkg/sentry/fs",
-    visibility = ["//pkg/sentry:internal"],
+    visibility = ["//visibility:public"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/amutex",
