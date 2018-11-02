@@ -10,11 +10,11 @@ import (
 	"strconv"
 	"syscall"
 
+	"gvisor.googlesource.com/gvisor/pkg/abi/linux"
 	"gvisor.googlesource.com/gvisor/pkg/rand"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/kernel"
 	"gvisor.googlesource.com/gvisor/pkg/cpuid"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/loader"
-	"gvisor.googlesource.com/gvisor/pkg/sentry/inet"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/platform/ptrace"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/usage"
 	"gvisor.googlesource.com/gvisor/pkg/sentry/time"
@@ -142,10 +142,7 @@ func main() {
 		// this point. Netns is configured before Run() is called. Netstack is
 		// configured using a control uRPC message. Host network is configured inside
 		// Run().
-		networkStack, err := newEmptyNetworkStack()
-		if err != nil {
-			return fmt.Errorf("failed to create network: %v", err)
-		}
+		networkStack := hostinet.NewStack()
 
 		// Create capabilities.
 		/*
@@ -205,7 +202,42 @@ func main() {
 			fmt.Errorf("error initializing kernel: %v", err)
 		}
 
-		return nil
+		// run
+
+		if err := networkStack.Configure(); err != nil {
+			return err
+		}
+
+		cwd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+
+	procArgs := kernel.CreateProcessArgs{
+		Argv:                    os.Args,
+		Envv:                    os.Environ(),
+		WorkingDirectory:        cwd, // Defaults to '/' if empty.
+		Credentials:             creds,
+		Umask:                   0022,
+		//Limits:                  ls,
+		MaxSymlinkTraversals:    linux.MaxSymlinkTraversals,
+		UTSNamespace:            k.RootUTSNamespace(),
+		IPCNamespace:            k.RootIPCNamespace(),
+		AbstractSocketNamespace: k.RootAbstractSocketNamespace(),
+		ContainerID:             "1234567890",
+	}
+
+		// Create the root container init task.
+		_, _, err = k.CreateProcess(procArgs)
+		if err != nil {
+			return fmt.Errorf("failed to create init process: %v", err)
+		}
+
+		// CreateProcess takes a reference on FDMap if successful.
+		procArgs.FDMap.DecRef()
+
+		//watchdog.Start()
+		return k.Start()
 	}(); err != nil {
 		log.Fatal(err)
 	}
@@ -245,10 +277,3 @@ func showmounts() {
 	}
 	fmt.Println(string(b))
 }
-
-//func newEmptyNetworkStack(conf *Config, clock tcpip.Clock) (inet.Stack, error) {
-func newEmptyNetworkStack() (inet.Stack, error) {
-	return hostinet.NewStack(), nil
-}
-
-
