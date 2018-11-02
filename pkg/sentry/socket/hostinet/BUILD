@@ -13,7 +13,7 @@ go_library(
         "stack.go",
     ],
     importpath = "gvisor.googlesource.com/gvisor/pkg/sentry/socket/hostinet",
-    visibility = ["//pkg/sentry:internal"],
+    visibility = ["//visibility:public"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/binary",

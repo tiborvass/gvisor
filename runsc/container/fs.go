@@ -75,7 +75,7 @@ var optionsMap = map[string]mapping{
 // compromised.
 // Returns list of mounts equivalent to 'spec.Mounts' with all destination paths
 // cleaned and with symlinks resolved.
-func setupFS(spec *specs.Spec, conf *boot.Config, bundleDir string) ([]specs.Mount, error) {
+func SetupFS(spec *specs.Spec, conf *boot.Config, bundleDir string) ([]specs.Mount, error) {
 	rv := make([]specs.Mount, 0, len(spec.Mounts))
 	for _, m := range spec.Mounts {
 		if m.Type != "bind" || !specutils.IsSupportedDevMount(m) {

@@ -277,7 +277,7 @@ func Create(id string, spec *specs.Spec, conf *boot.Config, bundleDir, consoleSo
 		// Setup rootfs and mounts. It returns a new mount list with destination
 		// paths resolved. Since the spec for the root container is read from disk,
 		// Write the new spec to a new file that will be used by the sandbox.
-		cleanMounts, err := setupFS(spec, conf, bundleDir)
+		cleanMounts, err := SetupFS(spec, conf, bundleDir)
 		if err != nil {
 			return nil, fmt.Errorf("setup mounts: %v", err)
 		}
@@ -369,7 +369,7 @@ func (c *Container) Start(conf *boot.Config) error {
 		// Setup rootfs and mounts. It returns a new mount list with destination
 		// paths resolved. Replace the original spec with new mount list and start
 		// container.
-		cleanMounts, err := setupFS(c.Spec, conf, c.BundleDir)
+		cleanMounts, err := SetupFS(c.Spec, conf, c.BundleDir)
 		if err != nil {
 			return fmt.Errorf("setup mounts: %v", err)
 		}

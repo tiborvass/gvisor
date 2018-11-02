@@ -20,7 +20,8 @@ go_library(
     ],
     importpath = "gvisor.googlesource.com/gvisor/runsc/boot",
     visibility = [
-        "//runsc:__subpackages__",
+        #"//runsc:__subpackages__",
+        "//visibility:public",
     ],
     deps = [
         "//pkg/abi",

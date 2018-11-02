@@ -46,7 +46,7 @@ go_library(
         "user_namespace.go",
     ],
     importpath = "gvisor.googlesource.com/gvisor/pkg/sentry/kernel/auth",
-    visibility = ["//pkg/sentry:internal"],
+    visibility = ["//visibility:public"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/bits",

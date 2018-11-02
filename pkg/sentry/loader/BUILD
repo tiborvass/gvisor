@@ -22,7 +22,10 @@ go_library(
         ":vdso_bin",
     ],
     importpath = "gvisor.googlesource.com/gvisor/pkg/sentry/loader",
-    visibility = ["//pkg/sentry:internal"],
+    visibility = [
+	#"//pkg/sentry:internal"],
+        "//visibility:public",
+    ],
     deps = [
         "//pkg/abi",
         "//pkg/abi/linux",

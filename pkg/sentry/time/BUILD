@@ -29,7 +29,7 @@ go_library(
         "tsc_amd64.s",
     ],
     importpath = "gvisor.googlesource.com/gvisor/pkg/sentry/time",
-    visibility = ["//pkg/sentry:internal"],
+    visibility = ["//visibility:public"],
     deps = [
         "//pkg/log",
         "//pkg/metric",

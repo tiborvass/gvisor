@@ -13,7 +13,8 @@ go_library(
     ],
     importpath = "gvisor.googlesource.com/gvisor/pkg/sentry/usage",
     visibility = [
-        "//pkg/sentry:internal",
+        "//visibility:public",
+        #"//pkg/sentry:internal",
     ],
     deps = [
         "//pkg/bits",
