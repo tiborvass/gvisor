@@ -33,6 +33,7 @@
 #define CONTEXT_FP  0xe0
 
 // CLI is the literal byte for the disable interrupts instruction.
+// Causes host kernel to signal SIGSEGV which is handled by sighandler.
 //
 // This is checked as the source of the fault.
 #define CLI $0xfa
